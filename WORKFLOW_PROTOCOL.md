@@ -6,7 +6,7 @@
 
 | 用户输入 | 执行路径 |
 |---|---|
-| PLC 源码路径、变量模式、可选 Trace、可选人工表 | predict → 两类批次 → complete |
+| PLC 源码路径、变量模式、可选 Trace、可选人工表 | predict → status → 两类批次 → complete |
 | 已有运行目录、继续/检查进度 | status；仅继续该清单尚未完成的批次 |
 | 冻结预测 CSV、人工 xls/xlsx | coverage；只读预测和人工表 |
 | 冻结预测 CSV、GT 文本表，可选源码/迁移图 | evaluate；严格单对匹配与分支诊断 |
@@ -15,11 +15,13 @@
 
 路径包含空格时分别加引号。自然语言输入由 Agent 解释为参数，不将四个位置当作源码字符串。保留用户给定的变量模式；省略模式表示全量范围，不擅自缩窄。复用目录前检查清单中的 source、pattern、trace、manual 是否与本次意图相同；输入改变时使用新运行目录。不要用 --force 掩盖新旧任务混用。
 
+业务上保持预测与只读评价两个独立模式；续作、查询和重渲染是已有任务的操作。Trace 与人工表分别可选。--manual 在 predict 中只登记路径，准备和模型批次不读取其内容；complete 先冻结最终预测，再自动衔接独立的 coverage 阶段。评价不得回流候选、边界或描述。人工 Excel 与 GT 文本分别采用 coverage 和 evaluate，不混用分数。
+
 ## 指引分工与能力加载
 
 - `.opencode/agents/plc-sequence.md`：主 Agent 的能力索引、路由和执行闭环。
-- `AGENTS.md`：全局证据规则及版本演进约束；原有内容完整保留。
-- `AGENT_PROMPT.md`：工艺判断、证据引用与事件处理协议。
+- `AGENTS.md`：当前两个模式、全局证据与交付要求；仍适用的历史规则已合并，版本演进查 CHANGELOG 和 Git 历史。
+- `AGENT_PROMPT.md`：工艺判断、证据引用、事件处理和 B 档逐行描述协议。
 - 本文件：阶段顺序、两类结果协议、断点续作与完成定义。
 - `plc_cli.py status`：根据实际清单给出进度、错误、下一项输入及其 SHA256。
 

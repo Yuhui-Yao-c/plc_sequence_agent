@@ -16,13 +16,24 @@ Python 引擎已演进到 v9.25，主 Agent、README 和 VERSION 仍主要介绍
 
 `predict → status → 全部工艺批次 + 全部 B 档描述批次 → complete`
 
-- 同步主 Agent、AGENTS.md、AGENT_PROMPT.md、README 和 VERSION，新增 WORKFLOW_PROTOCOL.md。保留历史规则正文及全部已有边界能力。
+- 同步主 Agent、AGENTS.md、AGENT_PROMPT.md、README 和 VERSION，新增 WORKFLOW_PROTOCOL.md。将仍适用的历史约束整理为当前正文，保留全部已有边界能力；版本演进由 CHANGELOG 和 Git 历史保存。
 - 为工位身份、Trace、覆盖评价三个 Skill 补元数据；七项已有 Skill 均显式 allow。保持原权限模式、模型和运行时配置格式。
 - predict 仅新增 workflow_execution.json，记录源码、可选 Trace、准备证据及两类批次输入的 SHA256。准备与状态检查均不读取人工表内容。
 - status 只读返回两类进度、下一批输入、指纹和错误。检查批次 ID、输入变化、证据变化、漏行、越批引用及多余旧结果。新结果必须回填处理过的当前输入指纹；指纹不证明结果由模型生成。
 - complete 先检查两类批次，调用原 finish 引擎，再检查原子表、完整归档、证据关联、复核、描述、Excel 及用户请求的 Trace/coverage。组装期间结果变化也不确认完成。
 - 输出区分 WAITING_FOR_BATCHES、INVALID_RESULTS、DELIVERY_INCOMPLETE、COMPLETED_WITH_REVIEW 与 COMPLETED。缺证据仍可明确进入复核；交付齐全不等于全部物理动作已证实。
 - finish、evaluate、coverage 兼容保留；旧目录可标记 legacy_unsealed 继续核验，不追认历史输入绑定。补充现有 .xls 评价器所需的 xlrd 依赖。
+
+## 同版指引正文修订（2026-11-04）
+
+首个草稿提交只在三份指引开头新增入口，正文仍含旧的两项输入形式，以及 finish 生成描述批次、不自动评价、12 列交付表等不同历史阶段的说明。仅声明顶部优先不能消除实际调用歧义。本次将 AGENTS.md、AGENT_PROMPT.md、.opencode/agents/plc-sequence.md 全文整理为当前规范，并同步 WORKFLOW_PROTOCOL.md：
+
+- 预测输入明确为“源码 + 模式 + 可选 Trace + 可选人工表”；两个可选项分别生效。只读评价输入为冻结预测 + Excel/GT，分别调用 coverage/evaluate。
+- --manual 仅登记路径，预测和两类模型批次不读人工表；complete 冻结最终预测后自动衔接只读 coverage，不将评价答案反馈预测。
+- AGENT_PROMPT.md 同时规定工艺与 B 档描述的职责、实际结果结构、指纹、行/事件完整性与无法判断的表达方式；主 Agent 全程执行同一闭环。
+- 源码适配、边界、跨 FB、信号收尾、反馈后继、工位身份、中文描述、Trace、评价、七列交付与复核约束合并到当前章节，不用历史增量段落叠加执行。
+
+本次正文修订未修改任何 Python、配置、词典或源码资源。先前 325 项代码测试和转接片产物对比仍属于同一引擎版本的验证；本次另核对了路由、CLI 参数、两类 JSON 示例、领域指引引用及正文中的完成条件。真实 OpenCode 模型端验收仍未执行。
 
 ## 能力保留范围
 
