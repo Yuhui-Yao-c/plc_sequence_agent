@@ -1,3 +1,8 @@
+---
+name: plc-station-identity
+description: 从源码变量文档与候选控制器建立工位身份，处理数组线程、命名空间和交付表分组。
+---
+
 # Skill: plc-station-identity
 
 # 工位身份映射（predict 阶段建立，展示层只读）
@@ -54,3 +59,8 @@ predict 自动生成 run 目录 `station_identity.json`：
 - 子工位粒度（构成要素后缀）是展示增强，不替代主工位身份。
 
 Base directory: E:\users\yaoyuhui\步序采集汇总\工程优化\plc-sequence-opencode-v9.13\.opencode\skills\plc-station-identity
+
+
+## v9.25.1 执行路径补充
+
+相对资源路径均以当前项目目录为准。上文 Base directory 是历史来源记录，不作为用户机器或当前运行的固定工作目录。编排和续作检查见 WORKFLOW_PROTOCOL.md 与 plc_cli.py status。

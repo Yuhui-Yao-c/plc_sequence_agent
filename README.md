@@ -1,3 +1,23 @@
+# PLC Sequence Agent v9.25.1
+
+当前功能引擎为v9.25；本补丁只整理OpenCode编排、能力发现和交付检查。完整协议见[WORKFLOW_PROTOCOL.md](WORKFLOW_PROTOCOL.md)，变更和验证见[CHANGELOG_V9.25.1.md](CHANGELOG_V9.25.1.md)。下方保留历史版本说明，当前Agent执行入口以本节和WORKFLOW_PROTOCOL.md为准。
+
+```powershell
+python -m pip install -r requirements.txt
+opencode
+```
+
+Agent顺序：`predict → status → 工艺批次 + B档描述批次 → complete`。新结果须带本批`input_sha256`。只在完整交付检查通过后报告完成；缺证据可明确进入复核。原`finish/evaluate/coverage`兼容保留。
+
+```powershell
+python plc_cli.py status --run "outputs/运行目录"
+python plc_cli.py complete --run "outputs/运行目录"
+```
+
+`status`只读；`--all`列出所有待处理批次。`complete`不会在漏批次或输入变化时覆盖已有交付物。旧运行无输入指纹时明确标为`legacy_unsealed`。`xlrd`用于已有的人工`.xls`读取能力，其余解析及表格依赖保持原有要求。
+
+---
+
 # v9.13 到位反馈→逻辑后继（2026-10-26）
 
 本版重点补充：现有预测是状态对，人工或工艺草表是“状态 AND 到位”时，如何找到源码支持的直接后继。

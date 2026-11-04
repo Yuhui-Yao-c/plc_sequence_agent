@@ -136,12 +136,12 @@ def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=
  (out/'RESULT_SCHEMA.md').write_text('''# 每批结果JSON协议\n```json\n{"batch_id":"B00001","steps":[{"构成要素":"...","动作":"...","动作描述":"...","开始标签":"...","结束标签":"...","核验状态":"confirmed_or_candidate","证据候选ID":["C0000001"],"证据事件ID":["E0000001"],"说明":"..."}],"unresolved_events":[{"event_id":"E0000002","reason":"无法确定使能或反馈"}],"notes":"..."}\n```\n\n要求：开始标签必须来自候选开始标签（或明确写出证据候选ID）；结束标签必须来自候选结束标签；特殊的新条件只能标记 `source_review_required` 并注明源码位置，不能无证据认定已验证。每个事件ID必须出现在某个steps.证据事件ID或unresolved_events中；不可只凭同网络共现证明因果。每条step还要填写：过程类型（机械动作/加工保持/检测测量/工艺等待/交接数据/周期汇总/内部辅助/未分类）、统计对象、起点含义、终点含义、工艺依据、边界依据。缺字段仅进入复核队列，不能删主候选。\n''',encoding='utf-8')
  return meta
 
-def validate(out,write=False):
+def validate(out,write=False,source_fallback=True):
  out=Path(out);manifest=json.loads((out/'workflow_manifest.json').read_text(encoding='utf-8'))
  # v9.22: fallback — if step_comments.json is missing (e.g. predict ran on
  # an older version without step-comment extraction), extract it now from
  # the source XML so A-tier descriptions work on re-runs.
- if not (out/'step_comments.json').exists():
+ if source_fallback and not (out/'step_comments.json').exists():
   src=manifest.get('source','')
   if src and Path(src).is_file():
    try:
