@@ -79,16 +79,31 @@ def predict(args):
   cmd_build(str(out))
  except Exception as exc:
   print(f'动作描述A档/B档批次生成失败（不影响预测）：{exc}',file=sys.stderr)
+ from workflow_control import seal_run
+ execution=seal_run(out)
  audit=json.loads((out/'candidate_audit.json').read_text(encoding='utf-8'))
  with (out/'prediction_candidate_pairs.csv').open(encoding='utf-8-sig',newline='') as f:
   import csv
   complete_pairs=sum(1 for _ in csv.DictReader(f))
- print(json.dumps({'mode':'predict','source_format':audit['format'],'output':str(out),'complete_candidate_pairs':complete_pairs,'main_prediction':str(out/'prediction_collection_pairs.csv'),'full_recall_archive':str(out/'prediction_candidate_pairs.csv'),'atomic_projection':json.loads((out/'prediction_atomic_summary.json').read_text(encoding='utf-8')),'batch_count':len(manifest['batches']),'next':'OpenCode逐批写result.json后运行 python plc_cli.py finish --run "目录"'},ensure_ascii=False,indent=2))
+ print(json.dumps({'mode':'predict','source_format':audit['format'],'output':str(out),'complete_candidate_pairs':complete_pairs,'main_prediction':str(out/'prediction_collection_pairs.csv'),'full_recall_archive':str(out/'prediction_candidate_pairs.csv'),'atomic_projection':json.loads((out/'prediction_atomic_summary.json').read_text(encoding='utf-8')),'batch_count':len(manifest['batches']),'description_batch_count':sum(b['kind']=='description' for b in execution['batches']),'execution_contract':'workflow_execution.json','next':'先运行 python plc_cli.py status --run "目录"；处理两类批次并填写输入指纹，再运行 python plc_cli.py complete --run "目录"'},ensure_ascii=False,indent=2))
 
 def finish(args):
  r=validate(args.run,write=True)
  print(json.dumps(r,ensure_ascii=False,indent=2))
  if not r['success']:sys.exit(2)
+
+def status(args):
+ from workflow_control import audit_run
+ r=audit_run(args.run,all_batches=args.all)
+ print(json.dumps(r,ensure_ascii=False,indent=2))
+ if r['errors'] or r['state']=='DELIVERY_INCOMPLETE':sys.exit(2)
+
+def complete(args):
+ from workflow_control import complete_run
+ r=complete_run(args.run)
+ print(json.dumps(r,ensure_ascii=False,indent=2))
+ if not r['completed']:sys.exit(2)
+
 
 def coverage(args):
  """v9.19: coverage evaluation against a manual collection workbook.
@@ -176,5 +191,7 @@ def main():
  x=sub.add_parser('finish',help='组装所有OpenCode批次+自动A档动作描述+交付表');x.add_argument('--run',required=True);x.set_defaults(func=finish)
  x=sub.add_parser('coverage',help='覆盖对比评价（有人工表时用gen_coverage_eval）')
  x.add_argument('--prediction',required=True);x.add_argument('--manual',required=True);x.add_argument('--out',required=True);x.add_argument('--proc-name',default=None);x.add_argument('--var-desc',default=None);x.add_argument('--kind',default=None);x.set_defaults(func=coverage)
+ x=sub.add_parser('status',help='只读核查两类批次、输入指纹与下一项工作');x.add_argument('--run',required=True);x.add_argument('--all',action='store_true',help='列出全部待处理批次');x.set_defaults(func=status)
+ x=sub.add_parser('complete',help='核验两类批次与请求的交付能力后完成；兼容保留finish');x.add_argument('--run',required=True);x.set_defaults(func=complete)
  a=p.parse_args();a.func(a)
 if __name__=='__main__':main()

@@ -1,4 +1,17 @@
-# PLC Agent v9.15 — 本文件替代旧版路由与交付说明
+# PLC Agent v9.25.1 — 本文件替代旧版路由与交付说明
+
+
+## 当前编排约定（优先入口）
+
+当前能力引擎为v9.25，编排补丁为v9.25.1。先读WORKFLOW_PROTOCOL.md；本文件下方全部历史证据、隔离和交付约束继续适用。新增status/complete作为默认Agent闭环，原predict/finish/evaluate/coverage入口兼容保留。
+
+预测→status→全部工艺批次与B档描述批次→complete→报告。新执行清单workflow_execution.json只增加输入指纹，不修改原候选、证据或批次输入。每个新结果填写status给出的input_sha256；禁止给旧结果补指纹冒充处理。断点续作由status列出待处理项，不重复prepare覆盖进度。只有completed=true表示编排完成；保留COMPLETED_WITH_REVIEW及全部复核记录。
+
+主Agent完整能力索引在.opencode/agents/plc-sequence.md。领域Skill按WORKFLOW_PROTOCOL.md和status.required_skills加载，包含工位身份、Trace与人工表覆盖评价。人工Excel走coverage，GT文本走evaluate；两种分数口径分开，后文“覆盖评价”要求适用于人工Excel输入。
+
+本次编排调整不更改源码适配、候选保全、边界规则、工艺判断自由度、描述词典、Trace匹配、评价计分或Excel内容。不得因新编排删除原池、减少真实处理批次或抹除未解决项。
+
+以下保留的能力规则中，finish指引擎内部组装步骤；Agent完整执行以本节status/complete闭环为准。
 
 ## 两个独立模式
 - `源码路径 | 变量模式`：预测。不读取GT、旧评价、答案诊断或validation目录。模式默认glob，`re:`前缀为变量全匹配正则。

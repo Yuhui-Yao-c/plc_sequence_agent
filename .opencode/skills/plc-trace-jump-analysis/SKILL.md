@@ -1,3 +1,8 @@
+---
+name: plc-trace-jump-analysis
+description: 在提供运行时Trace时分析状态跳变与exact、via_zero、loose匹配，回填时长并保留未观测和跨变量复核项。
+---
+
 # Skill: plc-trace-jump-analysis
 
 # PLC 运行时 Trace 跳变分析与预测步序时长回填
@@ -114,3 +119,8 @@ python plc_cli.py finish --run "outputs/X"
 trace 时长是运行时实测，不改变原子化、合并、跨 FB、反馈后继的边界规则。
 合并区间（signal_merge）的时长 = 合并后起止状态段的 start_ts 差，
 包含内部信号/数据收尾耗时，与合并语义一致。
+
+
+## v9.25.1 实现口径补充
+
+当前 trace_jump_analyzer.py 还保留 loose 匹配：起止之间可存在其他状态，作为宽松候选记录并进入时长映射。exact 包含现有时间容差，via_zero 与 loose 也不自动证明同一生产循环或物理因果。报告应分别列出 exact/via_zero/loose，不能将全部 matched_pairs 称为严格运行验证。跨变量和 BOOL 端点继续按现有实现进入复核。

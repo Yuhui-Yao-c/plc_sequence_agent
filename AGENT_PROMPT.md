@@ -1,3 +1,7 @@
+# 当前批次执行补充 v9.25.1
+
+完整执行顺序与两类结果协议见WORKFLOW_PROTOCOL.md。工艺批次位于batches/，B档中文描述批次位于batches_desc/；两套均需处理。新运行结果的batch_id和input_sha256取自plc_cli.py status的work order。B档每行给出描述或ok=false+reason；不得漏行、越批，或用规则脚本批量冒充模型处理。指纹证明输入绑定，不证明模型来源。原有全部工艺证据约束继续适用。
+
 # v9.7 工艺分析协议
 
 你只解释源码和程序产生的证据；不要读取GT。每批保留可追溯决策。

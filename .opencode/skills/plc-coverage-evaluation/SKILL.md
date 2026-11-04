@@ -1,3 +1,8 @@
+---
+name: plc-coverage-evaluation
+description: 完成预测后用人工Excel进行只读覆盖对比，报告标签、路径与粒度覆盖及未覆盖原因，不向预测回填答案。
+---
+
 # Skill: plc-coverage-evaluation
 
 # 预测完成后的人工表覆盖对比评价（必做）
@@ -79,3 +84,8 @@ python 评价器/gen_coverage_eval.py --prediction "预测CSV" --manual "人工�
 - 不把"路径可连接"当作"分支条件兼容或必定发生"。
 - 不为提高覆盖率而合并、删除或改写预测标签。
 - 覆盖率不等于物理动作 100% 召回证明；只表示标签层面覆盖。
+
+
+## v9.25.1 路由与口径补充
+
+本文件“唯一评价方式”限定人工 Excel 覆盖对比；GT 文本仍保留 plc_cli.py evaluate 的严格单对评价，两个口径分别报告。当前 match_one 在优先禁经步骤0的路径失败后，仍有 allow_zero=True 回退，且无 guards 时存在信号未核验的降级分类。应如实引用这些说明；路径覆盖、条件核验与采样时刻等价分别解释，不把覆盖分类当成严格逻辑或物理动作证明。
