@@ -1,15 +1,21 @@
 ---
-description: PLC源码步序预测与GT独立评价全流程：predict全量候选→名称过滤→原子投影→信号合并→工艺批次→finish交付；支持omron原生IEC61131-10/CODESYS/SMC2、跨FB输送、反馈后继、工位身份、trace时长回填、覆盖评价、动作描述A档步注释+B档LLM强制环节、步序变量清单提取(-t短路)、STCode状态比较补充轨道、trace步序采集模式(trace子命令)；交付非复合状态对及完整审计
+description: PLC 源码步序预测、独立评价与 Trace 步序采集。支持 TwinCAT Scope 与 Sysmac 多次采集，依据源码证据生成 A 档步注释和 B 档工艺描述并交付工作簿。
 mode: primary
 ---
 
 ## 规则权威源
 
-首先遵循根目录 AGENTS.md。它是自动注入的工作区级规则，含 v9.1–v9.28 全部规则正文（含 v9.11 信号合并、v9.12 跨FB输送、v9.13 反馈后继、v9.14 omron ST 解析、v9.15–v9.22 交付表与动作描述、v9.23 trace、v9.24 工作流重构、v9.25 动作描述质量增强、v9.26 步序变量提取、v9.27 STCode补充轨道、v9.28 trace步序采集模式），是唯一权威源。本文件不重复其正文，仅声明 agent 专有内容：路由、skill 加载、批次填写协议与交付物清单。
+遵循根目录 `AGENTS.md` 的路由、Trace 输入和执行规则。本文件提供主 Agent 的执行要点、工艺批次协议和交付物清单。
 
 ## 四个使用入口
 
 用户在 OpenCode 对话中输入简写，agent 按下列规则识别入口并组装对应 `plc_cli.py` 命令。可选项缺省时正常执行，不报错。
+
+### 路由优先级
+
+- 入口四的对话简写固定为 `源码路径 Trace路径 -t`，优先于其他简写。第 2 项须为可识别的 Trace 文件或采集目录。`-t` 只用于选路，生成 `trace` 命令时移除该标记。
+- 完整 CLI 命令以子命令为准。`predict --tagvars` 和显式 `predict -t` 都是步序变量清单模式。
+- 其他简写按输入顺序和类型匹配入口。带 `-t` 却提供变量模式，或路径和输入用途无法区分时，先确认用途。路径含空格时整段加引号。
 
 ### 入口一：预测（predict → 处理批次 → finish）
 
@@ -17,9 +23,9 @@ mode: primary
 
 识别规则：
 - 第1段扩展名 `.xml/.smc2/.txt` → `--source`
-- 第2段含 `*` 或 `re:` 前缀且非文件路径 → `--pattern`；模式默认glob，`re:`前缀为变量全匹配正则
-- 第3段（可选）扩展名 `.trace` → `--trace`
-- 第4段（可选）扩展名 `.xls/.xlsx` → `--manual`
+- 第2段是变量模式 → `--pattern`。支持完整变量名、通配符 `*`/`?` 或以 `re:` 开头的全匹配正则。
+- 后续可选的单个 TwinCAT Scope `.trace` 文件 → `--trace`，由 `finish` 匹配预测对并回填时长。Sysmac 导出表或目录走入口四。
+- 后续可选的 `.xls/.xlsx` 人工表 → `--manual`。
 - 输出目录：默认 `outputs/源码名`，或用户显式指定
 
 命令：`python plc_cli.py predict --source "XML" --pattern "格式" --out "outputs/目录" [--trace "trace文件"] [--manual "人工表"]`
@@ -28,12 +34,9 @@ mode: primary
 
 续接（必须）：predict 生成候选+批次+动作描述A/B档 → agent 逐批处理 `batches/*.result.json`（工艺批次）与 `batches_desc/*.result.json`（B档动作描述批次）→ `python plc_cli.py finish --run "outputs/目录"` 合并+交付表。B档动作描述是强制环节（见 plc-action-description skill），result.json 缺失时 finish 标记 `b_tier_incomplete`，交付表备注列标【B档未处理】。manifest 含 `trace` 时 finish 自动分析跳变回填时长；含 `manual` 时 finish 自动运行覆盖评价。
 
-**特殊模式（-t 步序变量提取）**：
-当用户输入第3段为 `-t` 时，工作流切换为步序变量提取模式，复用 predict 的候选生成管线，跳过批次/动作描述/交付表/trace/coverage。
-命令：`python plc_cli.py predict --source "XML" --pattern "格式" --out "outputs/目录" --tagvars`
-输出：`<工序名>_步序变量表.xlsx`（2列：工位名 | 步序变量）+ `step_variables.json` / `step_variables.csv` 审计。
-原理：predict 的候选生成（全量解析→名称过滤→冻结候选）已从 XML 找全所有 `var[idx]=value` 状态比较；步序变量符号即开始/结束标签去掉 `=value` 后缀，从 `indexed_candidates.csv` 提取即可，不重新解析 XML。
-通用提取，不限变量名（含 `adiAutoStep`/`AutoStep`/`Process_steps`/`iCmdStep` 等）；不读取GT，不做工艺分析，不生成候选对。`-t` 优先于 `--manual`/`--trace`，不混用。
+**步序变量清单**
+
+通过 `python plc_cli.py predict --source "XML" --pattern "格式" --out "outputs/目录" --tagvars` 调用。从 `indexed_candidates.csv` 的起止标签提取符号，输出 `<工序名>_步序变量表.xlsx` 和 `step_variables.json`、`step_variables.csv`。
 
 ### 入口二：GT评价（evaluate）
 
@@ -60,25 +63,13 @@ mode: primary
 
 通常由入口一带 `--manual` 时 finish 自动触发，也可独立运行。
 
-### 入口四：trace步序采集（trace）
+### 入口四：Trace 步序采集（`trace`）
 
-简写：`XML地址 trace地址 [匹配格式]`
+简写 `源码路径 Trace路径 -t`。将 `-t` 作为对话标记，传 `--source`、`--trace`、`--out` 给 `python plc_cli.py trace`。接受 TwinCAT Scope `.trace`、Sysmac 导出表（`.csv/.tsv/.txt`）或 Sysmac 采集目录。Sysmac 目录保留原始分卷名，按采集独立解析。默认处理所有可解析变量，用户指定范围时传 `--pattern`。
 
-识别规则：
-- 第1段扩展名 `.xml/.smc2/.txt` → `--source`
-- 第2段 `.trace` 文件 / `.csv` 文件 / 目录 → `--trace`（自动识别 TwinCAT .trace 或 Sysmac CSV/目录）
-- 第3段（可选）含 `*` 或 `re:` 前缀且非文件路径 → `--pattern`；模式默认glob，`re:`前缀为变量全匹配正则
-- 输出目录：默认 `outputs/源码名`，或用户显式指定
+执行输入校验、分卷和时长规则见根目录 `AGENTS.md` 的入口四。`trace_collection_pairs.csv` 是本模式的状态对，`trace_pairs_summary.json` 记录输入分组和时间依据。预测侧 `predict --trace` 的匹配回填走入口一。
 
-命令：`python plc_cli.py trace --source "XML" --trace "trace输入" --out "outputs/目录" [--pattern "格式"] [--sample-interval-ms 毫秒] [--force]`
-
-支持两种 trace 格式（自动识别）：
-- **TwinCAT Scope**（`.trace` 文件，UTF-16 XML）：转接片等 CODESYS 工程
-- **Sysmac Studio**（`.csv` 表或采集目录）：包mylar等欧姆龙工程。目录可含多次采集，保留原始文件名 `YYYYMMDDhhmmss_00001.csv`。按时间戳前缀分组，按卷号拼接并校验组内 Index。每组独立提取跳变和时长，同一变量的同一跳变合并取时长中位数。
-
-以 trace 输入为主要处理对象，提取所有采样变量的跳变序列，形成 `var[idx]=from值 → var[idx]=to值` 状态对。复用 predict 候选管线获取动作变量映射/步注释/工位身份，复用 action_describe 生成 A/B 档动作描述，复用 gen_workstation_xlsx 渲染交付表。时长列填同一跳变的观测时长中位数。复位跳变(var→0)保留并标注。输出 `<工序名>_trace步序采集表.xlsx` + `trace_collection_pairs.csv` + 审计文件。不读GT/人工表。
-
-续接（必须）：trace 生成候选+trace状态对+动作描述A/B档批次 → agent 逐批写 `batches_desc/*.result.json`（B档动作描述，强制环节）→ 重跑 `python plc_cli.py trace ...` 完成合并+完整交付表。首次运行若 result.json 缺失，trace 命令渲染A档兜底交付表（备注列标【B档未处理】）并停止，status 为 `prepared_b_tier_pending`；agent 写 result.json 后重跑同一命令即完成 B+A 合并。详见 plc-action-description skill。
+如生成 `batches_desc/*.input.json`，加载 `plc-action-description`，逐批生成同名 `*.result.json` 并确认覆盖全部输入行。随后用同一 Trace 运行的参数和目录执行 `plc_cli.py trace ... --force`，核验 `status=done`、交付工作簿和复核项。`prepared_b_tier_pending` 表示 A 档预览，后续还需处理 B 档。若无待处理批次则核验首跑产物。
 
 ### 通用规则
 - 预测与评价建议在独立会话执行；提示词隔离不是操作系统沙箱。
@@ -88,7 +79,9 @@ mode: primary
 - 局部后继不等于全局退出等价或CT时间戳相等。
 - 实际执行工具，不只给操作建议；未完成批次和未转换边界如实报告。
 
-## 必加载 skill（8个）
+## 按入口加载 Skill
+
+按 `AGENTS.md` 的触发条件从下列规则中选用。
 
 1. `plc-boundary-normalization` — 基线：起止标签、OR/AND/NOT、最近后继、非复合输出（v9.10+，串联 v9.11/9.12/9.13 扩展）
 2. `plc-signal-tail-merge` — 动作后信号/数据收尾合并（v9.11）
@@ -96,7 +89,7 @@ mode: primary
 4. `plc-feedback-successor` — 反馈条件转直接后继（v9.13）
 5. `plc-station-identity` — 工位身份映射（v9.17）
 6. `plc-coverage-evaluation` — 人工表覆盖对比评价（v9.19）
-7. `plc-trace-jump-analysis` — 运行时trace跳变分析与时长回填（v9.23 predict --trace）；入口四 trace步序采集复用其 parse_trace/detect_cycles 能力（v9.28）
+7. `plc-trace-jump-analysis` 提供两种 Trace 的格式、跳变与审计说明。预测匹配和平均时长回填用于 `predict --trace`，入口四的命令和续跑按根目录 `AGENTS.md` 执行。
 8. `plc-action-description` — 动作描述A档(源码步注释)+B档(LLM工艺语义)统一协议；B档是强制环节，agent必须逐批写result.json（v9.29）
 
 若 skill 工具不可用，直接读取对应 `.opencode/skills/<name>/SKILL.md`。
@@ -145,8 +138,8 @@ mode: primary
 - 动作描述：`action_desc_a.csv`（A档步注释）→ `batches_desc/*.input.json`（B档批次）→ `action_desc_final.csv`（B+A合并）
 - finish 最终表：`final_prediction_pairs.csv` / `final_sequence.csv` / `final_process_steps.csv`（及对应 `_full`/`_raw` 归档）
 - 交付表：`<工序名>_步序采集表.xlsx`
-- 步序变量表（-t 模式）：`<工序名>_步序变量表.xlsx` + `step_variables.json` / `step_variables.csv`
+- 步序变量表（`predict --tagvars`）：`<工序名>_步序变量表.xlsx` + `step_variables.json` / `step_variables.csv`
 - trace步序采集表（trace 模式）：`<工序名>_trace步序采集表.xlsx` + `trace_collection_pairs.csv` + `trace_variables.json` / `trace_jumps.csv` / `trace_segments.csv` / `trace_cycles.json` / `trace_pairs_review.csv` / `trace_pairs_summary.json`
-- trace（若传 --trace）：`trace_analysis/` 下匹配表与时长回填
+- 预测时长回填（`predict --trace`）：`trace_analysis/` 下的匹配表与时长统计
 - coverage（若传 --manual）：`评价/<工序>_覆盖评价.xlsx`
 - 审计：`candidate_audit.json` / `prediction_provenance.json` / `workflow_manifest.json` / `workflow_status.json`
