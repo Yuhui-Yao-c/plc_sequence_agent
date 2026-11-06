@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Two isolated user workflows. Prediction never opens ground truth."""
-import argparse, json, sys, hashlib
+import argparse, json, sys, hashlib, math
 from pathlib import Path
 from workflow import create, validate
 from pair_evaluation import run as evaluate_candidates
@@ -18,13 +18,18 @@ def predict(args):
  out=Path(args.out).resolve()
  # Deliberately no --gt argument or gold-file discovery in prediction.
  if out==src.parent or out==src:raise ValueError('输出必须位于独立目录，不能覆盖源码所在目录')
- # v9.23: optional --trace argument (runtime trace file for duration backfill).
  trace_path=args.trace
+ interval=getattr(args,'trace_sample_interval_ms',None)
  if trace_path:
   tp=Path(trace_path).resolve()
-  if not tp.is_file():raise FileNotFoundError(f'trace文件不存在：{tp}')
+  if not (tp.is_file() or tp.is_dir()):raise FileNotFoundError(f'Trace 文件或目录不存在：{tp}')
   trace_path=str(tp)
- manifest=create(str(src),str(out),batch_size=args.batch_size,pattern=args.pattern,force=args.force,manual=args.manual,trace=trace_path)
+ if interval is not None:
+  from omron_trace import is_omron_trace_input
+  if not trace_path or not is_omron_trace_input(trace_path) or not math.isfinite(interval) or interval<=0:
+   raise ValueError('--trace-sample-interval-ms 要求 Sysmac Trace 输入和有限正间隔')
+ manifest=create(str(src),str(out),batch_size=args.batch_size,pattern=args.pattern,force=args.force,
+                 manual=args.manual,trace=trace_path,trace_sample_interval_ms=interval)
  # v9.16: extract variable documentation (source facts) for workstation naming;
  # failure is non-fatal — it only degrades display names, not predictions.
  try:
@@ -185,7 +190,8 @@ def main():
  p=argparse.ArgumentParser(description='PLC Agent v9.25，候选保全、逻辑后继统一、动作描述纯中文化(A档步注释自动+B档LLM补充/变量文档注入/简短动作重点)、predict生成A档+B档(finish一次完成)、预测评价隔离、trace跳变分析与时长回填(--trace)、覆盖评价(--manual自动触发)')
  sub=p.add_subparsers(dest='mode',required=True)
  x=sub.add_parser('predict',help='源码+变量模式；不接受GT')
- x.add_argument('--source',required=True);x.add_argument('--pattern');x.add_argument('--out',required=True);x.add_argument('--batch-size',type=int,default=120);x.add_argument('--force',action='store_true');x.add_argument('--manual',default=None,help='可选：人工采集表路径，传入后finish自动运行覆盖评价');x.add_argument('--trace',default=None,help='可选：运行时trace文件路径(.trace)，传入后finish自动分析跳变并回填交付表时长列');x.set_defaults(func=predict)
+ x.add_argument('--source',required=True);x.add_argument('--pattern');x.add_argument('--out',required=True);x.add_argument('--batch-size',type=int,default=120);x.add_argument('--force',action='store_true');x.add_argument('--manual',default=None,help='可选：人工采集表路径，传入后finish自动运行覆盖评价');x.add_argument('--trace',default=None,help='TwinCAT .trace、Sysmac 导出表或同次采集的分卷目录')
+ x.add_argument('--trace-sample-interval-ms',type=float,help='Sysmac RawTime 精度不足时使用的采样间隔(ms)');x.set_defaults(func=predict)
  x=sub.add_parser('evaluate',help='已有预测+GT；可读取XML独立核验，不修改预测')
  x.add_argument('--prediction',required=True);x.add_argument('--gt',required=True);x.add_argument('--out',required=True);x.add_argument('--relations');x.add_argument('--transition-graph',help='预测阶段生成的source_transition_graph.json，不接受GT作为证据');x.add_argument('--xml',help='仅评价读取PLCopen/SMC2/欧姆龙原生IEC61131-10 XML文本，生成独立控制流证据，绝不回写预测');x.add_argument('--top-k',type=int,default=5);x.add_argument('--no-excel',action='store_true');x.set_defaults(func=evaluate)
  x=sub.add_parser('finish',help='组装所有OpenCode批次+自动A档动作描述+交付表');x.add_argument('--run',required=True);x.set_defaults(func=finish)

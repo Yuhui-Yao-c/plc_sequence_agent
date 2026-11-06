@@ -8,9 +8,7 @@ description: 在提供运行时Trace时分析状态跳变与exact、via_zero、l
 # PLC 运行时 Trace 跳变分析与预测步序时长回填
 
 ## 何时加载
-用户提供了 PLC 运行时 trace 文件（TwinCAT Scope View 导出的 .trace），
-需要把 trace 里的步序值跳变对应到已提取的预测步序对、用实测时长填入
-交付表时加载本 skill。
+用户提供了 PLC 运行时 Trace，包括 TwinCAT Scope 的 .trace 文件、Sysmac 导出表或同次采集的分卷目录，需要核对运行跳变与预测步序并回填交付表。
 
 不生成预测、不修改预测、不替代覆盖评价；trace 是运行时证据，不是
 GT 答案，也不构成对源码迁移逻辑正确性的证明。
@@ -23,7 +21,13 @@ GT 答案，也不构成对源码迁移逻辑正确性的证明。
    组块尾的"总时长"行求和。
 4. 未匹配的预测对与 trace 独有跳变如实记入 review，不静默丢弃。
 
-## Trace 文件格式
+## Sysmac 导出表或分卷目录
+- `--trace` 可传同一次采集的整个目录。按表内 `Index` 排序，保留完整变量名及数组下标，保留缺号造成的观测断点。
+- 有精度的 `RawTime` 转为相对毫秒。粗化分卷按采样索引估算时间。全组缺乏可靠时间戳时传已核实的 `--trace-sample-interval-ms`。
+- 运行目录产出 `trace_collection_pairs.csv`、`trace_pairs_review.csv`、`trace_pairs_summary.json` 及跳变和恒值段审计。先检查分卷和时间来源。
+- Excel 按完整起止标签回填观测停留时长的中位数。含估算的时长在备注中标明。以下 TwinCAT 的经 0 和松散匹配规则适用于原有 .trace 路径。
+
+## TwinCAT Trace 文件格式
 - TwinCAT Scope View XML 序列化（.NET XmlSerializer），UTF-16 LE with BOM。
 - 每个变量是一个 `<TraceVariable VarName="..." VariableIndex="..." Type="System.Double">` 块。
 - 每块包含 `<Values>v0,v1,v2,...,vN</Values>` 与 `<Timestamps>t0,t1,...,tN</Timestamps>`。

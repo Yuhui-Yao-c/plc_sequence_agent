@@ -11,7 +11,7 @@
 
 预测模式的源码也可以是 `.smc2` 或同内容的 `.txt` 导出。将自然语言输入映射为具名参数；路径有空格时分别加引号。用户提供的变量模式原样保留：默认 glob，数组方括号按下标字面字符处理；`re:` 表示变量名全匹配正则。开始或结束任一端点匹配即可保留。未给模式时执行全量范围，不能按项目名、目标数量或评价结果擅自缩窄。
 
-Trace 和人工表是两个独立可选项，不要求同时提供。预测的 `--manual` 只登记人工表路径，预测准备、工艺判断和描述生成不读取其内容；complete 内部先冻结最终预测，再调用只读覆盖评价。这是预测完成后衔接评价，仍须遵守两个模式的数据隔离。未提供人工表时不要求评价；未提供 Trace 时不编造时长。
+Trace 和人工表是两个独立可选项，不要求同时提供。--trace 接收 TwinCAT .trace 文件、Sysmac CSV/TSV/TXT 表或同一次采集的分卷目录。Sysmac RawTime 整组精度不足时，可传已核实的 --trace-sample-interval-ms。预测的 `--manual` 只登记人工表路径，预测准备、工艺判断和描述生成不读取其内容；complete 内部先冻结最终预测，再调用只读覆盖评价。这是预测完成后衔接评价，仍须遵守两个模式的数据隔离。未提供人工表时不要求评价；未提供 Trace 时不编造时长。
 
 已有运行目录的继续、进度查询和交付重渲染属于上述模式的续作操作，不另起一套预测。输入不变时先 status；输入改变时使用新目录，不用 `--force` 混入历史结果。
 
@@ -39,7 +39,7 @@ Trace 和人工表是两个独立可选项，不要求同时提供。预测的 `
 
 ## 预测、两类批次与完成
 
-1. 检查输入和输出目录。运行 `python plc_cli.py predict --source "源码.xml" --pattern "变量模式" --out "outputs/新目录"`，有需要再加入 `--trace "运行.trace"`、`--manual "人工表.xlsx"`。省略模式时省略整个 `--pattern` 参数。
+1. 检查输入和输出目录。运行 `python plc_cli.py predict --source "源码.xml" --pattern "变量模式" --out "outputs/新目录"`。按输入选择 `--trace "运行.trace"` 或 `--trace "Sysmac分卷目录"`，有人工表时加入 `--manual "人工表.xlsx"`。省略模式时省略整个 `--pattern` 参数。
 2. 保持原引擎顺序：全量源码解析及跨 FB 关联 → 名称过滤 → 完整候选保全 → 非复合投影与收尾组合 → 工艺判断。检查 source_format、native_parse_audit、candidate_audit、文档和工位身份警告。predict 已生成 A 档描述和 B 档输入，不能把准备完成当作模型判断完成。
 3. 运行 `python plc_cli.py status --run "outputs/新目录"`。读取错误、两类进度、next_work 和输入 SHA256；`--all` 可列出全部待处理项。status 只读，不为缺失文件自动补答案。
 4. 按 `AGENT_PROMPT.md` 处理全部 `batches/*.input.json` 工艺批次，逐事件引用 steps 或写 unresolved_events；同时处理全部 `batches_desc/*.input.json` 描述批次，逐行给出可用描述或 `ok=false` 和原因。默认批量大小分别为 120 和 40，以本次实际清单为准，不能只处理前几批。

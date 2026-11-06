@@ -255,6 +255,37 @@ class ControlTests(unittest.TestCase):
         self.assertFalse(result['completed'])
         self.assertTrue(any('trace_analysis' in e for e in result['errors']))
 
+    def test_sysmac_trace_directory_is_sealed_and_fills_the_workbook(self):
+        from openpyxl import load_workbook
+
+        trace = self.root / 'trace folder'
+        trace.mkdir()
+        header = 'TraceType,Continuous\nIndex,RawTime,Cell.Phase:INT\n'
+        first = trace / 'z.csv'
+        first.write_text(header + '0,1700000000000000000,10\n1,1700000000012000000,10\n')
+        later = trace / 'a.csv'
+        later.write_text(header + '2,1.7E+18,20\n3,1.7E+18,30\n4,1.7E+18,10\n')
+        manifest = read_json(self.run / 'workflow_manifest.json')
+        manifest['trace'] = str(trace)
+        write_json(self.run / 'workflow_manifest.json', manifest)
+        self.contract = seal_run(self.run)
+        self.emit()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = complete_run(self.run)
+        self.assertTrue(result['completed'], result.get('errors'))
+        delivery = read_json(self.run / 'workflow_status.json')
+        self.assertEqual(delivery['trace_analysis']['trace_input']['samples_total'], 5)
+        book = load_workbook(delivery['workstation_xlsx']['out'], read_only=True)
+        try:
+            rows = list(book.active.iter_rows(min_row=4, max_col=8, values_only=True))
+        finally:
+            book.close()
+        pair = next(row for row in rows if row[5:7] == ('Cell.Phase=10', 'Cell.Phase=20'))
+        self.assertEqual(pair[3], 24)
+        self.assertIn('Trace 含估算时长', pair[7])
+        later.write_text(header + '2,1.7E+18,60\n')
+        self.assertTrue(any('Trace文件或目录' in e for e in audit_run(self.run)['errors']))
+
     def test_missing_trace_outputs_are_not_reported_as_complete(self):
         trace = self.root / 'input.trace'; trace.write_bytes(b'fixture')
         manifest = read_json(self.run / 'workflow_manifest.json'); manifest['trace'] = str(trace)

@@ -339,7 +339,8 @@ def step_text(row, amap) -> str:
     return txt
 
 
-def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sheet='步序采集表'):
+def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sheet='步序采集表',
+             *, trace_mode='legacy'):
     """Build the workstation delivery xlsx. Inputs are read-only; returns stats dict.
     group_by='auto' picks 构成要素 for SC04 naming, else 证据POU when available.
     out/proc_name default like the CLI: <proc_name>_步序采集表.xlsx beside the prediction.
@@ -483,13 +484,23 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         for blk in iter(lambda: f.read(1 << 20), b''):
             digest.update(blk)
     sha16 = digest.hexdigest()[:16]
-    # v9.23: load trace runtime map early so note + row fill can both use it.
-    trace_rt = load_trace_runtime(run)
+    trace_estimated = set()
+    if trace_mode == 'sysmac':
+        from trace_to_pairs import load_trace_timing
+        trace_rt, trace_estimated = load_trace_timing(run)
+    else:
+        trace_rt = load_trace_runtime(run) if trace_mode == 'legacy' else {}
+    if trace_mode == 'sysmac' and trace_rt:
+        timing_note = ' Sysmac Trace 按完整起止标签回填中位时长，含估算的行在备注列标记。'
+    elif trace_rt:
+        timing_note = ' 时长(ms)与总时长由运行时trace跳变分析自动回填。'
+    else:
+        timing_note = ' 时长列为现场实测项，预测侧不填。'
     note = (f'工序: {proc_name} | 来源: {os.path.basename(prediction)} | 行数: {len(df)} | 分组: {group_by} | '
             + (f'动作描述: B档(LLM工艺语义) {desc_stats.get("B档(LLM工艺语义)", 0)}条/A档(源码步注释) {desc_stats.get("A档(源码步注释)", 0)}条 | ' if desc_stats else '')
             + f'SHA256: {sha16}… | 排序仅为展示查找便利，不代表执行顺序或工艺路径；'
               '步序/标签/描述内容完全来自同一行预测记录与源码证据文件，无推断文本。'
-              + (f' 时长(ms)与总时长由运行时trace跳变分析自动回填。' if trace_rt else ' 时长列为现场实测项，预测侧不填。')
+              + timing_note
               + (f' 备注列标记【待复核】=动作描述待完善(A={blind_counts["A"]})。'
                  if (blind_counts["A"]) else ''))
     ws.cell(row=1, column=2, value=f'{proc_name} 步序采集表（预测交付）').font = hfont
@@ -543,6 +554,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         b0 = r
         block_dur_sum = 0
         has_trace_dur = False
+        block_estimated = False
         for _, row in g.iterrows():
             ws.cell(row=r, column=2, value=wsname)
             # 动作描述（干净文本，不含标注）
@@ -562,6 +574,9 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             ws.cell(row=r, column=7, value=row['结束标签'])
             # 备注：网络注释（取最具体的1条）+ 待复核标记
             remark_parts = []
+            if rt_dur is not None and rt_key in trace_estimated:
+                remark_parts.append('Trace 含估算时长')
+                block_estimated = True
             if nc_map:
                 comp = str(row.get('构成要素', '') or '')
                 best_nc = ''
@@ -599,6 +614,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         # v9.23: 有trace数据时填入该工位组时长合计
         if has_trace_dur:
             ws.cell(row=r, column=4, value=block_dur_sum)
+            if block_estimated:
+                ws.cell(row=r, column=8, value='Trace 合计含估算时长')
         for j in range(2, 9):
             c = ws.cell(row=r, column=j)
             c.font = total_font

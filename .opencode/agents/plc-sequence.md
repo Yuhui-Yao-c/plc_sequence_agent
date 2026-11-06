@@ -25,7 +25,7 @@ Trace 和人工表分别可选。--manual 仅登记路径：预测和两类模�
 
 ## 预测模式执行闭环
 
-1. 运行 `python plc_cli.py predict --source "..." --pattern "..." --out "outputs/新目录"`，按用户输入加入 --trace 和 --manual；未给模式则不传 --pattern。检查格式、主体解析、候选、文档和工位身份审计。原顺序为全量解析及结构关联、名称过滤、完整候选保全、非复合投影与收尾组合、最后工艺判断。
+1. 运行 `python plc_cli.py predict --source "..." --pattern "..." --out "outputs/新目录"`，按用户输入加入 --trace 和 --manual；Trace 可以是文件或同次 Sysmac 采集的分卷目录。未给模式则不传 --pattern。检查格式、主体解析、候选、文档和工位身份审计。原顺序为全量解析及结构关联、名称过滤、完整候选保全、非复合投影与收尾组合、最后工艺判断。
 2. 运行 `python plc_cli.py status --run "..."`，按 required_skills 加载能力，按 next_work 读具体输入。predict 已准备 A 档描述与 B 档输入，不能再次重建批次覆盖续作进度。
 3. 按 AGENT_PROMPT.md 实际判断全部 batches/*.input.json：引用本批候选和事件，每个事件进入 steps 或 unresolved_events；填写过程类型、统计对象、起终点含义和工艺/边界依据。没有真实模型判断不能伪造精选。
 4. 逐行处理全部 batches_desc/*.input.json：利用具体变量文档、源码步注释和前后源码上下文，一句纯中文表达主要动作；refs 只取本行 token。每行给描述或 ok=false+reason，不能漏行、越批或用规则脚本冒充模型。以实际清单为准，零批时不制造结果。

@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 
+from omron_trace import trace_input_digest
+
 VERSION = '9.25.1'
 CONTRACT = 'workflow_execution.json'
 COMPLETION = 'workflow_completion.json'
@@ -85,7 +87,7 @@ def seal_run(out):
     trace = Path(manifest['trace']) if manifest.get('trace') else None
     contract = {'schema': SCHEMA, 'orchestration_version': VERSION,
                 'source': str(source), 'source_sha256': digest(source),
-                'trace_sha256': digest(trace) if trace and trace.is_file() else None,
+                'trace_sha256': trace_input_digest(trace) if trace else None,
                 'frozen_artifacts': frozen, 'batches': batches,
                 'manual_contents_read': False}
     write_json(run / CONTRACT, contract)
@@ -217,14 +219,21 @@ def audit_run(out, all_batches=False):
             if not source.is_file() or digest(source) != contract['source_sha256']:
                 errors.append('源码文件与本次准备阶段不一致')
             if contract.get('trace_sha256'):
-                trace = Path(manifest.get('trace', ''))
-                if not trace.is_file() or digest(trace) != contract['trace_sha256']:
-                    errors.append('Trace文件与本次准备阶段不一致')
+                trace = Path(manifest['trace'])
+                try:
+                    current_trace_sha = trace_input_digest(trace)
+                except (OSError, ValueError):
+                    current_trace_sha = None
+                if current_trace_sha != contract['trace_sha256']:
+                    errors.append('Trace文件或目录与本次准备阶段不一致')
         else:
             expected_map = {}
-        for key in ('trace', 'manual'):
-            if manifest.get(key) and not Path(manifest[key]).is_file():
-                errors.append('请求的输入文件不存在: ' + key)
+        if manifest.get('trace'):
+            trace = Path(manifest['trace'])
+            if not (trace.is_file() or trace.is_dir()):
+                errors.append('请求的 Trace 文件或目录不存在')
+        if manifest.get('manual') and not Path(manifest['manual']).is_file():
+            errors.append('请求的输入文件不存在: manual')
         if not (run / 'action_desc_a.csv').is_file():
             errors.append('动作描述准备未完成: action_desc_a.csv')
         pending = []
