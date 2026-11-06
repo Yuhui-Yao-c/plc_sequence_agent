@@ -135,6 +135,7 @@ def _run_trace_mode(src,out,args):
  _check_isolation(out,args,'trace')
  # 1) Run the normal candidate pipeline (parse → filter → freeze candidates).
  #    Produces plcopen_action_trace.csv (action-variable mapping) + indexed_candidates.csv.
+ print('Trace [1/4] 解析 PLC 源码并准备候选批次', file=sys.stderr, flush=True)
  manifest=create(str(src),str(out),batch_size=args.batch_size,
                  pattern=args.pattern,force=True,manual=None,trace=None)
  # Restore agent's B-tier results (create's --force cleared batches_desc).
@@ -145,8 +146,10 @@ def _run_trace_mode(src,out,args):
  stats['candidate_count']=manifest.get('candidate_count',0)
  # 2) Extract source-derived evidence (workstation naming + step comments +
  #    action-variable mapping).  trace mode needs all four evidence files.
+ print('Trace [2/4] 提取变量文档、步注释和工位身份', file=sys.stderr, flush=True)
  _extract_source_evidence(src,out,include_comments=True)
  # 3) trace → pairs (reuses trace_jump_analyzer.parse_trace).
+ print('Trace [3/4] 解析采集数据并汇总状态对', file=sys.stderr, flush=True)
  try:
   from trace_to_pairs import generate as gen_trace_pairs
   trace_stats=gen_trace_pairs(str(args.trace),str(out),source=str(src),pattern=args.pattern,
@@ -160,6 +163,7 @@ def _run_trace_mode(src,out,args):
   stats['error']=str(exc);stats['status']='failed'
   print(json.dumps(stats,ensure_ascii=False,indent=2));sys.exit(2)
  # 4) A-tier + B-tier action descriptions (reads trace_collection_pairs.csv via fallback).
+ print('Trace [4/4] 准备动作描述和交付表', file=sys.stderr, flush=True)
  # v9.29: B-tier is a mandatory LLM step.  cmd_build generates batches_desc/*.input.json;
  # agent must write *.result.json before cmd_validate can merge B+A.  If result.json is
  # absent (first run / agent hasn't processed yet), render an A-tier fallback xlsx marked

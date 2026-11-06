@@ -89,6 +89,11 @@ def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=
  # Group first by controller; non-state events remain in a separate auditable bucket.
  groups=defaultdict(lambda:{'c':[],'e':[]})
  controllers=list(dict.fromkeys(r['控制器'].strip() for r in rows if r['控制器'].strip()))
+ # A large controller set can exceed the regular-expression cache.
+ guard_patterns = [
+  (controller, re.compile(r'(?<![\w.\[\]])' + re.escape(controller) + r'\s*='))
+  for controller in controllers
+ ]
  for r in rows:groups[r['控制器'].strip() or '__ungrouped__']['c'].append(r)
  # Associate events to controllers using exact symbol boundaries in guards; may match more than one.
  # Events without any state guard still need their own batches and must not be silently dropped.
@@ -97,7 +102,9 @@ def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=
   # Source-backed cross-FB intervals start at a BOOL, so attach evidence to the
   # receiver controller named in the endpoint instead of orphaning it.
   if e.get('command')=='cross_fb_transport':guard=guard+' OR '+e.get('next_state','')
-  matches=[c for c in controllers if re.search(r'(?<![\w.\[\]])'+re.escape(c)+r'\s*=',guard)] if guard else []
+  matches = [
+   controller for controller, pattern in guard_patterns if pattern.search(guard)
+  ] if guard else []
   if matches:
    for c in matches:groups[c]['e'].append(e)
   else:groups['__ungrouped_events__']['e'].append(e)
