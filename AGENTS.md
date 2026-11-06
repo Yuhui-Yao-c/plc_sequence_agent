@@ -111,13 +111,13 @@
 - 第3段（可选）含 `*` 或 `re:` 前缀且非文件路径 → `--pattern`；模式默认glob，`re:`前缀为变量全匹配正则
 - 输出目录：默认 `outputs/源码名`，或用户显式指定
 
-命令：`python plc_cli.py trace --source "XML" --trace "trace输入" --out "outputs/目录" [--pattern "格式"] [--force]`
+命令：`python plc_cli.py trace --source "XML" --trace "trace输入" --out "outputs/目录" [--pattern "格式"] [--sample-interval-ms 毫秒] [--force]`
 
 支持两种 trace 格式（自动识别）：
 - **TwinCAT Scope**（`.trace` 文件，UTF-16 XML）：转接片等 CODESYS 工程
-- **Sysmac Studio**（`.csv` 表或采集目录）：包mylar等 omron 工程；目录可含多次独立采集（Index 重启），按多循环合并取中位数
+- **Sysmac Studio**（`.csv` 表或采集目录）：包mylar等欧姆龙工程。目录可含多次采集，保留原始文件名 `YYYYMMDDhhmmss_00001.csv`。按时间戳前缀分组，按卷号拼接并校验组内 Index。每组独立提取跳变和时长，同一变量的同一跳变合并取时长中位数。
 
-以 trace 文件为主要处理对象，提取所有采样变量的跳变序列，形成 `var[idx]=from值 → var[idx]=to值` 状态对。复用 predict 候选管线获取动作变量映射/步注释/工位身份，复用 action_describe 生成 A/B 档动作描述，复用 gen_workstation_xlsx 渲染交付表。时长列填 trace 中位数（多周期去重合并）。复位跳变(var→0)保留并标注。输出 `<工序名>_trace步序采集表.xlsx` + `trace_collection_pairs.csv` + 审计文件。不读GT/人工表。
+以 trace 文件为主要处理对象，提取所有采样变量的跳变序列，形成 `var[idx]=from值 → var[idx]=to值` 状态对。复用 predict 候选管线获取动作变量映射/步注释/工位身份，复用 action_describe 生成 A/B 档动作描述，复用 gen_workstation_xlsx 渲染交付表。时长列填同一跳变的观测时长中位数。复位跳变(var→0)保留并标注。输出 `<工序名>_trace步序采集表.xlsx` + `trace_collection_pairs.csv` + 审计文件。不读GT/人工表。
 
 续接（必须）：trace 生成候选+trace状态对+动作描述A/B档批次 → agent 逐批写 `batches_desc/*.result.json`（B档动作描述，强制环节）→ 重跑 `python plc_cli.py trace ...` 完成合并+完整交付表。首次运行若 result.json 缺失，trace 命令渲染A档兜底交付表（备注列标【B档未处理】）并停止，status 为 `prepared_b_tier_pending`；agent 写 result.json 后重跑同一命令即完成 B+A 合并。详见 plc-action-description skill。
 
@@ -288,9 +288,9 @@ gen_workstation_xlsx.py load_trace_runtime 扩展：优先读 trace_collection_p
 **问题**：trace 子命令仅支持 TwinCAT Scope `.trace`（UTF-16 XML），不支持 omron Sysmac Studio 导出的 CSV 表/采集目录。现场包mylar等 omron 工程的 trace 是 CSV 格式，且一个目录常含多次独立采集（Index 重启），原 `parse_omron_trace` 把多次采集的 Index 重叠当错误拒绝。
 **修复**：
 1. `trace_to_pairs.py` 新增 omron Sysmac 支持：`is_omron_trace_input()` 识别目录/CSV，`parse_omron_trace()` 解析 Sysmac CSV 表（含多分卷合并、RawTime 时间戳重建、估算时长标注）。`generate()` 自动分派：omron 走 `parse_omron_trace`，TwinCAT 走原 `parse_trace`。
-2. `trace_to_pairs.py` `_prepare_parts` 改为按 index 重叠自动分组多次采集；`parse_omron_trace` 多组独立解析后按时间偏移合并 jumps，下游 `generate()` 的多周期聚合（取中位数）把多次采集当作多循环处理。
+2. `trace_to_pairs.py` 按 Sysmac 原始文件名前缀分组并校验同次采集的分卷。每组独立识别跳变和计算时长，审计表保留采集 ID 和原始采样索引。
 3. `trace_to_pairs.py` 新增 `估算时长次数` 列：omron RawTime 精度不足时估算时长的标记，`load_trace_timing()` 返回估算时长集合供交付表标注。
 4. `plc_cli.py _run_trace_mode`：传 `pattern` 给 `gen_trace_pairs`（omron 变量名过滤）；`--trace` 参数描述适配 omron 目录/CSV。
 5. 入口四简写识别规则适配：第2段 `.trace/.csv/目录` → `--trace`（自动识别格式）。
-**多循环语义**：多次独立采集 = 多循环，`generate()` 按 (var,from,to) 去重合并，时长取中位数（多周期抗异常），与 TwinCAT 单文件多循环口径一致。
+**时长汇总**按 `(变量, 起始步, 结束步)` 汇总各次采集中的实际观测。周期检测仍以采集内部的空闲段为依据。
 **零退化**：TwinCAT trace 路径（`parse_trace`）不动；转接片 trace 验证 unique_pairs/variables/jumps/cycles 全部一致。

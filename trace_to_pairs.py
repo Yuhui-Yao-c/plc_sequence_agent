@@ -48,6 +48,7 @@ import json
 import os
 import re
 import statistics
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -63,6 +64,7 @@ INTEGER_TYPES = {
 }
 NS_PER_MS = 1_000_000
 CAPTURE_SETTINGS = ('tracetype', 'sampletimingtype', 'taskname', 'samplinginterval', 'samplerate')
+SYSMAC_PART_NAME = re.compile(r'([0-9]{14})_([0-9]{5})')
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,13 @@ class TablePart:
     row_count: int
     raw_range: tuple | None
     interval_ns: int | None
+
+
+@dataclass(frozen=True)
+class Recording:
+    recording_id: str
+    grouping_source: str
+    parts: list[TablePart]
 
 
 def _table_format(path):
@@ -227,53 +236,104 @@ def _scan_part(path, encoding, delimiter):
                      count, (first_time, last_time) if precise else None, interval_ns)
 
 
-def _prepare_parts(tables):
-    """Group table parts into recordings.
+def _part_config(part):
+    channels = tuple(sorted((name, kind) for name, (_, kind) in part.channels.items()))
+    return part.settings, channels
 
-    A recording is a set of parts with the same settings + channel layout whose
-    Index ranges are contiguous and non-overlapping (split by MaxSamplesPerFile).
-    Multiple recordings (Index restarting from 0) in one directory are kept as
-    separate groups — they are independent cycles of the same process and their
-    jumps are merged later by the multi-cycle aggregation in ``generate()``.
 
-    Returns (recordings, duplicates) where recordings is a list of part-lists
-    sorted by the first file's name.
-    """
-    parts = sorted((_scan_part(path, *fmt) for path, fmt in tables),
-                   key=lambda part: (part.path.name,))
-    # Group by (settings, channel layout) — different channel counts are separate.
-    by_config = {}
-    duplicates = []
+def _start_bounds(value):
+    """A rounded decimal is compatible with any start in its rounding interval."""
+    exponent = value.as_tuple().exponent
+    half_unit = Decimal(10) ** exponent / 2 if exponent > 0 else Decimal(0)
+    return value - half_unit, value + half_unit
+
+
+def _unnamed_recordings(parts):
+    """Use exact starts for renamed exports and require an unambiguous fallback."""
+    by_config = defaultdict(list)
     for part in parts:
-        config_key = (part.settings, tuple(sorted(
-            (name, kind) for name, (_, kind) in part.channels.items())))
-        by_config.setdefault(config_key, []).append(part)
+        by_config[_part_config(part)].append(part)
 
     recordings = []
-    for config_key, group_parts in by_config.items():
-        # Sort by first_index then name; parts of one recording have contiguous Index.
-        group_parts.sort(key=lambda p: (p.first_index, p.path.name))
-        current = []
-        for part in group_parts:
-            if current and part.first_index <= current[-1].last_index:
-                # Index overlap — either a duplicate file or a new recording.
-                if (part.first_index, part.last_index) == (
-                        current[-1].first_index, current[-1].last_index) and (
-                        _file_digest(part.path) == _file_digest(current[-1].path)):
+    for group in by_config.values():
+        by_start = defaultdict(list)
+        uncertain = []
+        for part in group:
+            start = part.capture_start
+            if start and start.as_tuple().exponent <= 0:
+                by_start[start].append(part)
+            else:
+                uncertain.append(part)
+        if not by_start:
+            recordings.append(Recording(group[0].path.name, 'single_directory', group))
+            continue
+        for part in uncertain:
+            if part.capture_start:
+                lower, upper = _start_bounds(part.capture_start)
+                candidates = [start for start in by_start if lower <= start <= upper]
+            else:
+                candidates = list(by_start)
+            if len(candidates) != 1:
+                raise ValueError(f'{part.path}: 无法唯一确定所属采集，请保留 Sysmac 原始文件名或分目录运行')
+            by_start[candidates[0]].append(part)
+        for group in by_start.values():
+            recordings.append(Recording(group[0].path.name, 'start_raw_time', group))
+    return recordings
+
+
+def _validate_recording(recording, duplicates):
+    named = recording.grouping_source == 'filename'
+    if named:
+        parts = sorted(recording.parts, key=lambda p: p.path.name)
+    else:
+        parts = sorted(recording.parts, key=lambda p: (p.first_index, p.path.name))
+    reference = parts[0]
+    config = _part_config(reference)
+    bounds = [_start_bounds(p.capture_start) for p in parts if p.capture_start]
+    if bounds and max(lo for lo, _ in bounds) > min(hi for _, hi in bounds):
+        files = ', '.join(p.path.name for p in parts)
+        raise ValueError(f'采集 {recording.recording_id} 的 StartRawTime 互相冲突：{files}')
+
+    accepted = []
+    for part in parts:
+        if _part_config(part) != config:
+            raise ValueError(f'{part.path}: 采样配置或通道与同次采集的 {reference.path.name} 不一致')
+        if accepted:
+            prev = accepted[-1]
+            if part.first_index <= prev.last_index:
+                same_range = (part.first_index, part.last_index) == (prev.first_index, prev.last_index)
+                if same_range and _file_digest(part.path) == _file_digest(prev.path):
                     duplicates.append(part.path.name)
                     continue
-                # New recording starts here (Index restarts from a lower value).
-                recordings.append(current)
-                current = []
-            current.append(part)
-        if current:
-            recordings.append(current)
+                raise ValueError(f'{part.path}: 与 {prev.path.name} 的 Index 重叠或顺序冲突，请检查原始分卷')
+            if named and part.path.stem == prev.path.stem:
+                raise ValueError(f'{part.path}: 与 {prev.path.name} 的分卷号重复')
+        accepted.append(part)
+    return Recording(recording.recording_id, recording.grouping_source, accepted)
 
-    if not recordings:
-        raise ValueError('未找到任何有效的 Sysmac Trace 表')
-    # Sort recordings by first file name for deterministic ordering.
-    recordings.sort(key=lambda rec: rec[0].path.name)
-    return recordings, duplicates
+
+def _prepare_parts(tables):
+    """Identify the recording before validating or ordering its sample ranges."""
+    named = defaultdict(list)
+    unnamed = []
+    for path, fmt in tables:
+        part = _scan_part(path, *fmt)
+        match = SYSMAC_PART_NAME.fullmatch(path.stem)
+        if match:
+            named[match[1]].append(part)
+        else:
+            unnamed.append(part)
+
+    duplicates = []
+    if named and unnamed:
+        named_hashes = {_file_digest(p.path) for group in named.values() for p in group}
+        for part in unnamed:
+            if _file_digest(part.path) not in named_hashes:
+                raise ValueError(f'{part.path}: 与原名分卷混用时无法确认采集归属，请恢复原文件名')
+            duplicates.append(part.path.name)
+    recordings = ([Recording(stamp, 'filename', group) for stamp, group in sorted(named.items())]
+                  if named else _unnamed_recordings(unnamed))
+    return [_validate_recording(rec, duplicates) for rec in recordings], duplicates
 
 
 def _sample_period(parts, sample_interval_ms):
@@ -355,12 +415,8 @@ class _Channel:
         }
 
 
-def _parse_one_recording(parts, channels, interval_ns, sample_interval_ms):
-    """Parse one recording (a list of contiguous parts) into per-channel series.
-
-    Returns (channel_results, file_audit, gaps) where channel_results maps
-    variable name → _Channel.result() dict.
-    """
+def _parse_one_recording(parts, channels, interval_ns):
+    """Parse one recording in its own time and sample-index coordinate system."""
     right_anchors = [None] * len(parts)
     next_anchor = None
     for pos in reversed(range(len(parts))):
@@ -373,7 +429,7 @@ def _parse_one_recording(parts, channels, interval_ns, sample_interval_ms):
     origin = parts[0].raw_range[0] if parts[0].raw_range is not None else (
         _estimate_time(first_index, None, right_anchors[0], interval_ns, first_index))
     previous_index = previous_ns = left_anchor = None
-    file_audit, gaps = [], []
+    gaps = []
     for part, right_anchor in zip(parts, right_anchors):
         estimated = part.raw_range is None
         with part.path.open(encoding=part.encoding, newline='') as stream:
@@ -406,60 +462,66 @@ def _parse_one_recording(parts, channels, interval_ns, sample_interval_ms):
                 raise ValueError(f'{part.path}: 解析期间分卷范围变化，请在导出完成后重试')
         if not estimated:
             left_anchor = (part.last_index, part.raw_range[1])
-        file_audit.append({'file': part.path.name, 'first_index': part.first_index,
-                           'last_index': part.last_index, 'samples': part.row_count,
-                           'time_basis': 'estimated_by_index' if estimated else 'raw_time_ns'})
-    return {name: channel for name, channel in channels.items()}, file_audit, gaps
+    return {name: channel.result() for name, channel in channels.items()}, gaps, ts
 
 
 def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
-    """Return variable series and the input audit for Sysmac trace tables.
-
-    A directory may contain multiple independent recordings (each recording's
-    Index restarts from 0).  Each recording is parsed independently with its own
-    time origin; recordings are then concatenated with a time offset so all
-    jumps share a globally increasing timeline.  This turns multiple recordings
-    into multiple cycles — the downstream multi-cycle aggregation in
-    ``generate()`` collapses them into median/min/max per (var, from, to) pair.
-    """
+    """Parse recordings independently and aggregate the selected channel union."""
     path = Path(path)
     tables, ignored = _find_tables(path)
     recordings, duplicates = _prepare_parts(tables)
 
-    # Use the first recording's channel layout as the reference.
-    ref_channels = recordings[0][0].channels
-    channel_names = [name for name in ref_channels if matches is None or matches(name)]
+    channel_names = {name for rec in recordings for name in rec.parts[0].channels
+                     if matches is None or matches(name)}
     if not channel_names:
         raise ValueError(f'{path}: 找不到符合范围的整型步序变量列')
 
-    interval_ns, interval_source = _sample_period(
-        [p for rec in recordings for p in rec], sample_interval_ms)
-    # Check RawTime precision across all parts.
-    all_parts = [p for rec in recordings for p in rec]
-    if any(part.raw_range is None for part in all_parts):
-        if recordings[0][0].settings[1] not in ('', 'interval', 'cyclic', 'time'):
-            raise ValueError(f'{path}: 非固定间隔采集的 RawTime 精度不足，请重新导出原始 CSV')
-        if interval_ns is None:
-            raise ValueError(f'{path}: RawTime 精度不足。请加入精确时间分卷，或指定 --sample-interval-ms')
-
     all_channel_results = {}
+    recording_details = []
     all_file_audit = []
     all_gaps = []
+    timing_methods = set()
     time_offset_ms = 0
-    total_samples = 0
+    next_index = None
 
-    for rec_idx, parts in enumerate(recordings):
-        # Fresh channels for this recording.  Different recordings may have
-        # different channel subsets (e.g. 30 vs 28 channels); only process
-        # channels that exist in this recording AND are in our target set.
-        rec_channel_names = [n for n in channel_names if n in parts[0].channels]
-        channels = {name: _Channel() for name in rec_channel_names}
-        ch_results, file_audit, gaps = _parse_one_recording(
-            parts, channels, interval_ns, sample_interval_ms)
-        # Shift this recording's timestamps by time_offset_ms so jumps across
-        # recordings share a globally increasing timeline.
-        for name, ch in ch_results.items():
-            result = ch.result()
+    for rec in recordings:
+        parts = rec.parts
+        channels = {name: _Channel() for name in parts[0].channels if name in channel_names}
+        detail = {
+            'recording_id': rec.recording_id, 'grouping_source': rec.grouping_source,
+            'files': [p.path.name for p in parts], 'samples': sum(p.row_count for p in parts),
+            'channels_total': len(parts[0].channels), 'channels_selected': len(channels),
+            'first_index': parts[0].first_index, 'last_index': parts[-1].last_index,
+        }
+        recording_details.append(detail)
+        for part in parts:
+            basis = 'estimated_by_index' if part.raw_range is None else 'raw_time_ns'
+            all_file_audit.append({'file': part.path.name, 'recording_id': rec.recording_id,
+                                   'first_index': part.first_index, 'last_index': part.last_index,
+                                   'samples': part.row_count,
+                                   'time_basis': basis if channels else 'not_selected'})
+        if not channels:
+            continue
+
+        interval_ns, interval_source = _sample_period(parts, sample_interval_ms)
+        if any(p.raw_range is None for p in parts):
+            if parts[0].settings[1] not in ('', 'interval', 'cyclic', 'time'):
+                raise ValueError(f'采集 {rec.recording_id}: 非固定间隔采集的 RawTime 精度不足，请重新导出原始 CSV')
+            if interval_ns is None:
+                raise ValueError(f'采集 {rec.recording_id}: RawTime 精度不足。请加入本次采集的精确时间分卷，'
+                                 '或指定 --sample-interval-ms')
+        ch_results, gaps, end_ts = _parse_one_recording(parts, channels, interval_ns)
+        index_offset = 0 if next_index is None else next_index - parts[0].first_index
+        detail.update(sample_interval_ms=interval_ns / NS_PER_MS if interval_ns is not None else None,
+                      interval_source=interval_source, index_offset=index_offset,
+                      time_offset_ms=time_offset_ms, duration_ms=end_ts,
+                      active_channels=[name for name, result in ch_results.items() if not result['inactive']])
+        timing_methods.add((interval_ns, interval_source))
+        all_gaps.extend(dict(gap, recording_id=rec.recording_id) for gap in gaps)
+
+        # Offsets preserve unique internal indices and display order. Every dwell
+        # is still computed between samples within the same recording.
+        for name, result in ch_results.items():
             if name not in all_channel_results:
                 all_channel_results[name] = {
                     'jumps': [], 'segments': [], 'dwell_starts': {},
@@ -468,50 +530,39 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
                     'unique_values': set(),
                 }
             acc = all_channel_results[name]
-            for idx, from_v, to_v, ts in result['jumps']:
-                acc['jumps'].append((idx, from_v, to_v, ts + time_offset_ms))
-            for value, s_ts, e_ts, dur in result['segments']:
-                acc['segments'].append((value, s_ts + time_offset_ms,
-                                        e_ts + time_offset_ms, dur))
-            for idx, dts in result['dwell_starts'].items():
-                acc['dwell_starts'][idx] = dts + time_offset_ms
-            acc['estimated_dwells'] |= result['estimated_dwells']
+            acc['jumps'].extend((idx + index_offset, a, b, ts + time_offset_ms)
+                                for idx, a, b, ts in result['jumps'])
+            acc['segments'].extend((value, start + time_offset_ms, end + time_offset_ms, dur)
+                                   for value, start, end, dur in result['segments'])
+            acc['dwell_starts'].update((idx + index_offset, ts + time_offset_ms)
+                                       for idx, ts in result['dwell_starts'].items())
+            acc['estimated_dwells'].update(idx + index_offset for idx in result['estimated_dwells'])
             acc['sample_count'] += result['sample_count']
-            r_start, r_end = result['time_range']
-            if r_start is not None:
-                g_start = r_start + time_offset_ms
-                g_end = r_end + time_offset_ms
+            if result['sample_count']:
+                r_start, r_end = result['time_range']
                 if acc['time_range'][0] is None:
-                    acc['time_range'] = [g_start, g_end]
-                else:
-                    acc['time_range'][1] = max(acc['time_range'][1], g_end)
+                    acc['time_range'][0] = r_start + time_offset_ms
+                acc['time_range'][1] = r_end + time_offset_ms
             acc['inactive'] = acc['inactive'] and result['inactive']
-            acc['unique_values'] |= set(result['unique_values'])
-        # Advance time offset past this recording's end.
-        max_ts = 0
-        for name, ch in ch_results.items():
-            r = ch.result()
-            if r['time_range'][1] is not None:
-                max_ts = max(max_ts, r['time_range'][1])
-        time_offset_ms = max_ts + time_offset_ms + 1  # +1ms gap between recordings
-        total_samples += sum(p.row_count for p in parts)
-        all_file_audit.extend(file_audit)
-        all_gaps.extend(gaps)
+            acc['unique_values'].update(result['unique_values'])
+        next_index = parts[-1].last_index + index_offset + 1
+        time_offset_ms += end_ts + 1
 
     # Finalize: convert sets to sorted lists for JSON.
-    for name in all_channel_results:
-        acc = all_channel_results[name]
+    for acc in all_channel_results.values():
         acc['unique_values'] = sorted(acc['unique_values'])
-        acc['estimated_dwells'] = acc['estimated_dwells']  # keep as set for now
-        acc['time_range'] = tuple(acc['time_range']) if isinstance(acc['time_range'], list) else acc['time_range']
+        acc['time_range'] = tuple(ts if ts is not None else 0 for ts in acc['time_range'])
 
+    interval_ns, interval_source = (next(iter(timing_methods)) if len(timing_methods) == 1
+                                    else (None, 'per_recording'))
     audit = {
         'format': 'omron_sysmac_table',
         'time_basis': 'relative_ms',
         'sample_interval_ms': interval_ns / NS_PER_MS if interval_ns is not None else None,
         'interval_source': interval_source,
-        'samples_total': total_samples,
+        'samples_total': sum(d['samples'] for d in recording_details),
         'recordings': len(recordings),
+        'recording_details': recording_details,
         'files': all_file_audit,
         'duplicate_files': duplicates,
         'ignored_tables': ignored,
@@ -636,7 +687,7 @@ def generate(trace_path, run, source=None, proc_name=None,
     ----------
     trace_path : str
         TwinCAT Scope .trace file, Sysmac CSV/TSV/TXT table, or a directory
-        of Sysmac tables from one recording.
+        of Sysmac recording parts named YYYYMMDDhhmmss_NNNNN.
     run : str
         Run output directory (must already contain source-derived evidence
         files from a prior workflow.create() call: plcopen_action_trace.csv,
@@ -687,6 +738,9 @@ def generate(trace_path, run, source=None, proc_name=None,
     run.mkdir(parents=True, exist_ok=True)
     active_count = sum(1 for v in variables.values() if not v['inactive'])
     inactive_count = sum(1 for v in variables.values() if v['inactive'])
+    captures = [r for r in trace_input.get('recording_details', []) if 'index_offset' in r]
+    index_starts = [r['first_index'] + r['index_offset'] for r in captures]
+    time_starts = [r['time_offset_ms'] for r in captures]
 
     # ---- 2. Write trace metadata (audit, same as trace_jump_analyzer) ----
     var_meta = {}
@@ -703,50 +757,62 @@ def generate(trace_path, run, source=None, proc_name=None,
 
     # ---- 3. Write raw jumps + segments (audit) ----
     jump_fields = ['变量', 'from值', 'to值', '时间戳ms', '样本索引']
+    if captures:
+        jump_fields.append('采集ID')
     jump_rows = []
     for name, vd in variables.items():
         for idx, from_v, to_v, ts in vd['jumps']:
-            jump_rows.append({
+            row = {
                 '变量': name,
                 'from值': _val_to_int(from_v),
                 'to值': _val_to_int(to_v),
                 '时间戳ms': int(ts),
                 '样本索引': idx,
-            })
+            }
+            if captures:
+                capture = captures[bisect_right(index_starts, idx) - 1]
+                row['样本索引'] = idx - capture['index_offset']
+                row['采集ID'] = capture['recording_id']
+            jump_rows.append(row)
     _write_csv(run / 'trace_jumps.csv', jump_rows, jump_fields)
 
     seg_fields = ['变量', '值', '起始ms', '结束ms', '时长ms']
+    if captures:
+        seg_fields.append('采集ID')
     seg_rows = []
     for name, vd in variables.items():
         for value, s_ts, e_ts, dur in vd['segments']:
-            seg_rows.append({
+            row = {
                 '变量': name,
                 '值': _val_to_int(value),
                 '起始ms': int(s_ts),
                 '结束ms': int(e_ts),
                 '时长ms': int(dur),
-            })
+            }
+            if captures:
+                row['采集ID'] = captures[bisect_right(time_starts, s_ts) - 1]['recording_id']
+            seg_rows.append(row)
     _write_csv(run / 'trace_segments.csv', seg_rows, seg_fields)
 
     # ---- 4. Detect cycles ----
     cycles = detect_cycles(variables, idle_threshold_ms=idle_threshold_ms)
     cycle_data = [{'boundary_ts': int(ts), 'var': name} for ts, name in cycles]
+    if captures:
+        active_channels = [set(r['active_channels']) for r in captures]
+        cycle_data = []
+        for ts, name in cycles:
+            index = bisect_right(time_starts, ts) - 1
+            if name in active_channels[index]:
+                cycle_data.append({'boundary_ts': int(ts), 'var': name,
+                                   'recording_id': captures[index]['recording_id']})
     (run / 'trace_cycles.json').write_text(
         json.dumps(cycle_data, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    # Assign each jump to a cycle index (0 = before first boundary, etc.).
-    # A jump at timestamp ts belongs to cycle i if boundary[i-1] <= ts < boundary[i].
+    # Recording starts separate observed intervals without counting them as
+    # idle-detected boundaries in trace_cycles.json.
     boundaries = [c['boundary_ts'] for c in cycle_data]
-
-    def _cycle_of(ts):
-        lo, hi = 0, len(boundaries)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if boundaries[mid] <= ts:
-                lo = mid + 1
-            else:
-                hi = mid
-        return lo
+    if captures:
+        boundaries = sorted(set(boundaries) | set(time_starts[1:]))
 
     # ---- 5. Build adjacent-jump pairs per variable ----
     # pair_key = (var_name, from_val, to_val) -> list of duration_ms
@@ -791,7 +857,7 @@ def generate(trace_path, run, source=None, proc_name=None,
             if key not in pair_first_ts:
                 pair_first_ts[key] = int(prev_ts)
             pair_last_ts[key] = int(ts)
-            pair_cycles[key].add(_cycle_of(ts))
+            pair_cycles[key].add(bisect_right(boundaries, ts))
 
     # ---- 6. Load source-derived evidence (action map, step comments, identity) ----
     amap = _load_action_map(str(run))

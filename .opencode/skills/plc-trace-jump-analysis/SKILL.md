@@ -32,9 +32,9 @@ GT 答案，也不构成对源码迁移逻辑正确性的证明。
 ### Sysmac Studio（`.csv` 表或采集目录）
 - CSV 表格：每个变量是一列 `m_nNextAutoStep[N]:INT`，每行是一个采样点。
 - 表头含元数据（TraceType/SamplePeriod/SampleRate/StartRawTime）+ 列定义（Index,Date,ClockTime,RawTime,TraceSampID,变量列...）。
-- 一个目录可含多次独立采集（不同时间戳前缀），每次采集分多个分卷文件（`_00001/_00002/_00003`，Index 连续递增）。
-- 多次采集 = 多循环，`_prepare_parts` 按 Index 重叠自动分组，每组独立解析后按时间偏移合并 jumps。
-- RawTime 是纳秒级时间戳，精度不足时用 SampleInterval 估算（标注 `估算时长次数`）。
+- 保留 `YYYYMMDDhhmmss_00001.csv` 等原始文件名。前缀标识采集，后缀为卷号。每次采集内校验通道、配置、StartRawTime 和 Index，索引缺口写入审计。
+- 每次采集独立识别跳变和时长，再按 `(变量, 起始步, 结束步)` 汇总。周期检测依据采集内的空闲段。审计表含采集 ID，跳变表保留原始 Index。
+- RawTime 是纳秒级时间戳。精度不足时，使用同次采集的精确分卷重建时间，或用已知的 `--sample-interval-ms` 估算。汇总表记录 `估算时长次数`。
 - `parse_omron_trace()` 处理多分卷合并、时间戳重建、估算时长标注。
 
 ### 通用说明

@@ -149,7 +149,8 @@ def _run_trace_mode(src,out,args):
  # 3) trace → pairs (reuses trace_jump_analyzer.parse_trace).
  try:
   from trace_to_pairs import generate as gen_trace_pairs
-  trace_stats=gen_trace_pairs(str(args.trace),str(out),source=str(src),pattern=args.pattern)
+  trace_stats=gen_trace_pairs(str(args.trace),str(out),source=str(src),pattern=args.pattern,
+                            sample_interval_ms=args.sample_interval_ms)
   stats.update({k:trace_stats[k] for k in ('variables_total','variables_active',
       'total_jumps','cycles_detected','unique_pairs','pairs_with_action_vars',
       'pairs_with_step_comment','pairs_reset_exit','review_count')})
@@ -374,6 +375,7 @@ def main():
  x=sub.add_parser('trace',help='trace步序采集模式：trace跳变→状态对→A/B档动作描述→交付表')
  x.add_argument('--source',required=True,help='PLC源码XML路径（用于动作变量映射/步注释/工位身份）')
  x.add_argument('--trace',required=True,help='trace输入：TwinCAT .trace文件 / Sysmac CSV表 / Sysmac采集目录')
+ x.add_argument('--sample-interval-ms',type=float,help='Sysmac 单次采集的 RawTime 精度不足时指定采样间隔(ms)')
  x.add_argument('--out',required=True,help='输出目录')
  x.add_argument('--pattern',default=None,help='可选：变量名称过滤模式（glob或re:前缀正则）')
  x.add_argument('--batch-size',type=int,default=120)
