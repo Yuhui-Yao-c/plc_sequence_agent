@@ -82,6 +82,30 @@ def run(source,out_dir,pattern=None):
     if key in seen:continue
     seen.add(key);flow_appended+=1
     rows.append({'构成要素':rel['source_unit'],'动作':'待确认状态转换','动作描述':'MOVE EN沿显式连线回溯到同变量EQ；扫描时序及反馈完成尚未证明','开始标签':start,'结束标签':end,'状态':'wired_move_guard_local','证据POU':rel['source_unit'],'证据节点':rel['move_id'],'原始条件':rel['other_guards'],'控制器':state,'分支数':0})
+ # v9.27 STCode supplement: LD structural analysis discovers step-variable
+ # names; STCode text may contain additional  var[idx]=value  comparisons
+ # invisible to LD wiring.  Use LD-discovered variable names as the filter
+ # (no hardcoded whitelist) so only real step variables are kept and
+ # communication/speed data (Location_Speed, PcToPlc_INT, ...) is excluded.
+ stcode_appended=0; stcode_summary=None
+ if fmt=='plcopen':
+  import re as _re
+  ld_var_names=set()
+  for r in rows:
+   for col in ('开始标签','结束标签'):
+    v=r.get(col,'')
+    for m_ in _re.finditer(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\[',v):
+     sym=m_.group(0)[:-1]
+     vn=sym.rsplit('.',1)[-1] if '.' in sym else sym
+     if vn and vn not in ('NOT','AND','OR'):ld_var_names.add(vn)
+  from extract_stcode_transitions import generate as stcode_generate
+  stcode_result=stcode_generate(source,out,ld_var_names)
+  stcode_summary=stcode_result['summary']
+  for cand in stcode_result['candidates']:
+   key=(cand['开始标签'],cand['结束标签'],cand['状态'],cand['动作'])
+   if key in seen:continue
+   seen.add(key);stcode_appended+=1
+   rows.append({f:cand.get(f,'') for f in FIELDS})
  # v9.8 retain the exact local comment and guard for the source stage, not a
  # controller-wide comment accidentally copied from an unrelated network.
  for stage in source_graph.get('stage_records',[]):
@@ -116,6 +140,25 @@ def run(source,out_dir,pattern=None):
  for proposal in signal_merge['proposals']:
   row=proposal['row'];key=(row['开始标签'],row['结束标签'],row['状态'],row['动作'])
   if key not in seen:seen.add(key);rows.append({f:row.get(f,'') for f in FIELDS})
+ # v9.27: STCode state-comparison supplement.  LD structural analysis finds
+ # state transitions via MOVE+EQ wiring, but ST code in <STCode> also has
+ # comparisons (gaxActionTrig[N]:=(var[idx]=value)) invisible to LD.  We
+ # extract them with regex, filtered by the array-variable names that LD
+ # already discovered as state controllers — no hardcoded whitelist.
+ stcode_result=None
+ if fmt=="plcopen":
+  from extract_stcode_transitions import generate as stcode_generate
+  import re as _re
+  ld_var_names=set()
+  for r in rows:
+   for lab in (r.get('开始标签',''),r.get('结束标签',''),r.get('控制器','')):
+    for m in _re.finditer(r'([A-Za-z_]\w*)\[',lab):
+     vn=m.group(1)
+     if vn and vn not in ('NOT','AND','OR'):ld_var_names.add(vn)
+  stcode_result=stcode_generate(source,out,ld_var_names)
+  for crow in stcode_result['candidates']:
+   key=(crow['开始标签'],crow['结束标签'],crow['状态'],crow['动作'])
+   if key not in seen:seen.add(key);rows.append({f:crow.get(f,'') for f in FIELDS})
  with (out/'sequence_candidates.csv').open('w',newline='',encoding='utf-8-sig') as f:
   w=csv.DictWriter(f,fieldnames=FIELDS);w.writeheader();w.writerows(rows)
  if pattern:
@@ -139,7 +182,7 @@ def run(source,out_dir,pattern=None):
  (out/'source_stage_preservation.json').write_text(json.dumps({'source_stage_rows_in_scope':stage_count,
   'stage_rows_with_pair_in_filtered_candidates':covered,'no_source_stage_pair_lost':covered==stage_count,
   'not_physical_action_coverage':True},ensure_ascii=False,indent=2),encoding='utf-8')
- report2={'boundary_normalization':normalization,'source_transition_graph':source_graph['summary'],'filter':filtered,'format':fmt,'controller_count':len({r.get('控制器') for r in rows if r.get('控制器')}),'legacy_controller_count':report['controller_count'],'candidate_count':len(rows),'new_action_boundary_candidates':appended,'event_graph':graph,'plcopen_controlflow':control,'plcopen_action_trace':action_trace,'wired_candidate_additions':flow_appended,'native_parse_audit':native_model.get('native_parse_audit') if native_model else None,'caution':'Co-location hypotheses are not verified action causality or physical completion.'}
+ report2={'boundary_normalization':normalization,'source_transition_graph':source_graph['summary'],'filter':filtered,'format':fmt,'controller_count':len({r.get('控制器') for r in rows if r.get('控制器')}),'legacy_controller_count':report['controller_count'],'candidate_count':len(rows),'new_action_boundary_candidates':appended,'event_graph':graph,'plcopen_controlflow':control,'plcopen_action_trace':action_trace,'wired_candidate_additions':flow_appended,'stcode_transitions':stcode_result['summary'] if stcode_result else None,'native_parse_audit':native_model.get('native_parse_audit') if native_model else None,'caution':'Co-location hypotheses are not verified action causality or physical completion.'}
  from atomic_boundaries import export_atomic
  report2['cross_fb_transport']=transport['summary']
  report2['atomic_projection']=export_atomic(raw_pairs,source_graph,out)

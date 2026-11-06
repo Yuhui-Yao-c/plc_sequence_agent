@@ -1,101 +1,76 @@
-# PLC Sequence Agent v9.25.1
+# PLC Sequence Agent v9.28
 
-当前功能引擎为v9.25；本补丁只整理OpenCode编排、能力发现和交付检查。完整协议见[WORKFLOW_PROTOCOL.md](WORKFLOW_PROTOCOL.md)，变更和验证见[CHANGELOG_V9.25.1.md](CHANGELOG_V9.25.1.md)。下方保留历史版本说明，当前Agent执行入口以本节和WORKFLOW_PROTOCOL.md为准。
+PLC 步序采集 Agent：从 PLC 源码（PLCopen / 欧姆龙 IEC61131-10 / SMC2）和运行时 trace
+中提取状态迁移对，生成步序采集表、动作描述与时长回填。
+
+## 四个使用入口
+
+在 OpenCode 对话中输入简写，Agent 自动识别并组装 `plc_cli.py` 命令：
+
+| 入口 | 简写 | 命令 |
+|---|---|---|
+| 预测 | `XML地址 匹配格式 [trace地址] [人工表地址]` | `python plc_cli.py predict --source ... --pattern ... --out ... [--trace ...] [--manual ...]` |
+| GT评价 | `预测CSV路径 GT路径 [源码XML]` | `python plc_cli.py evaluate --prediction ... --gt ... --out ... [--xml ...]` |
+| 覆盖评价 | `预测CSV路径 人工表路径` | `python plc_cli.py coverage --prediction ... --manual ... --out ...` |
+| trace步序采集 | `XML地址 trace地址 -t` | `python plc_cli.py trace --source ... --trace ... --out ... [--pattern ...] [--force]` |
+
+详见 `AGENTS.md`（权威规则源）。
+
+## 安装
 
 ```powershell
 python -m pip install -r requirements.txt
 opencode
 ```
 
-Agent顺序：`predict → status → 工艺批次 + B档描述批次 → complete`。新结果须带本批`input_sha256`。只在完整交付检查通过后报告完成；缺证据可明确进入复核。原`finish/evaluate/coverage`兼容保留。
+依赖：`lxml` `openpyxl` `pandas`
 
-```powershell
-python plc_cli.py status --run "outputs/运行目录"
-python plc_cli.py complete --run "outputs/运行目录"
+## 工作流
+
+```
+predict  : 源码解析 → 候选冻结 → 原子化 → 信号合并 → 工艺分析 → 批次 → finish → 交付表
+trace    : trace跳变解析 → 状态对 → A/B档动作描述 → 交付表（时长回填）
+evaluate : 预测CSV + GT → 匹配指标（只读，不修改预测）
+coverage : 预测CSV + 人工表 → 覆盖率评价（只读）
 ```
 
-`status`只读；`--all`列出所有待处理批次。`complete`不会在漏批次或输入变化时覆盖已有交付物。旧运行无输入指纹时明确标为`legacy_unsealed`。`xlrd`用于已有的人工`.xls`读取能力，其余解析及表格依赖保持原有要求。
+预测与 trace 不读 GT；评价独立只读。
 
----
+## 主要交付物
 
-# v9.13 到位反馈→逻辑后继（2026-10-26）
-
-本版重点补充：现有预测是状态对，人工或工艺草表是“状态 AND 到位”时，如何找到源码支持的直接后继。
-它不按名字猜反馈，不按步号顺序猜目标；不会把正常运行条件下的替代直接标成严格时间等价。
-
-**主预测与评价用法不变：** 在OpenCode输入 `源码路径 | 变量模式` 预测；输入 `预测CSV路径 | GT路径` 只读评价，可附XML。
-
-- 安装：`python -m pip install -r requirements.txt`
-- 测试：`python -m unittest discover -v`
-- 启动：仓库目录运行 `opencode`。
-- 主表：`prediction_collection_pairs.csv`；全量存档：`prediction_candidate_pairs.csv`。
-- 单条只读查询：见 `USAGE_v9_13.md`；新增Skill：`.opencode/skills/plc-feedback-successor/SKILL.md`。
-- 评价Excel继续整行分类着色；蓝色“有条件的迁移替代”不是绿色严格命中。
-- 不为目标数量删主候选，不向PLC写入任何内容，不让GT回流预测。
-
-本版变更及验证见 `CHANGELOG_v9_13.md` 和 `RELEASE_v9_13.md`。下面保留旧版详细架构说明。
-
----
-
-# PLC Sequence Agent v9.12 — 跨功能块触发与接收阶段
-
-在v9.11上增加PLCopen功能块实例参数关联，修复端口内嵌MOVE目标读取，保留BOOL触发起点。
-预测不接受GT；先全量解析与关联，再按名称模式过滤，再做非复合视图和工艺筛选。完整候选不删。
-
-## 本地使用
-```powershell
-python -m pip install -r requirements.txt
-python -m unittest discover -v
-opencode
-```
-OpenCode预测输入：`D:\PLC\source.xml | ST*.AutoStep[*]`。
-OpenCode评价输入：`D:\PLC\run\prediction_collection_pairs.csv | D:\PLC\gt.tsv`。
-源码内容可存为.txt。glob方括号是数组下标字面字符；`re:`前缀支持变量名全匹配正则。
-只要开始或结束任一侧命中模式就保留，信号起点不需要同时匹配状态变量模式。
-
-命令行：
-```powershell
-python plc_cli.py predict --source "D:\PLC\source.xml" --pattern "ST*.AutoStep[*]" --out "outputs\run912"
-python plc_cli.py evaluate --prediction "outputs\run912\prediction_collection_pairs.csv" --gt "D:\PLC\gt.tsv" --xml "D:\PLC\source.xml" --out "outputs\eval912"
-```
-predict只完成确定性解析和OpenCode批次准备。OpenCode应继续处理全部批次，再执行：
-```powershell
-python plc_cli.py finish --run "outputs\run912"
-```
-没有运行真实LLM批次时，不能宣称最终工艺精选已完成。GT建议放在独立目录/独立会话。
-
-## 主要文件
-| 文件 | 含义 |
+| 文件 | 说明 |
 |---|---|
-| prediction_collection_pairs.csv | 主采集候选视图：非复合端点，支持BOOL→状态，应用动作后收尾合并 |
-| prediction_candidate_pairs.csv | 完整候选对，含证据与不确定性，不受LLM删减 |
-| prediction_atomic_pairs.csv | 不合并的原子视图及原始分段 |
-| cross_fb_transport_candidates.csv | 从源代码实例绑定得到的完整输送/交接候选，未按名称过滤 |
-| cross_fb_transport_links.csv | 发车标志、命令、目的到达、接收状态和行号 |
-| cross_fb_transport_evidence.json | FB生命周期、每个实例实参、完整接收门控与限制 |
-| cross_fb_transport_review.csv | 未识别/有旁路/未知块/非首接收阶段的原因 |
-| source_transition_edges.csv | 局部完整门控支持的状态迁移（不是全局物理证明） |
-| signal_merge_lineage.json | 继续保留v9.11动作后数据/信号收尾规则 |
+| `prediction_collection_pairs.csv` | 预测主表（非复合，应用合并粒度） |
+| `prediction_candidate_pairs.csv` | 完整召回档案（不删） |
+| `final_prediction_pairs.csv` | finish 最终主表 |
+| `<工序名>_步序采集表.xlsx` | 交付表（预测侧） |
+| `<工序名>_trace步序采集表.xlsx` | 交付表（trace 侧） |
+| `评价/<工序>_覆盖评价.xlsx` | 覆盖评价（有人工表时） |
 
-## 本轮修复原理
-- PLCopen数据输出可能在`outputVariables/variable/connectionPointOut/expression`，参数名可以为空。
-  新版恢复读取，输入操作数按位置保留，不把空参数名放入字典后互相覆盖。
-- 跨FB模块从定义中发现“标志与命令同控制点置位、目的到达参与复位”的协议；按每个调用实例的真实实参绑定。
-- 接收侧要求正向到达是MOVE门控的必要项，不能因在同一网络出现就关联。后续加工阶段再次使用到达位不继续当输送终点。
-- 首次接收存在多个出口时每条分支独立保存，不选最小步号、不硬编码焊接50、不将旁路自动认作正常完成。
-- 简单BOOL信号也是非复合端点；不能为了全为步号而删除或替换它。
-- 复杂共享OR前缀有展开预算，超限留缺口与候选，不把截断条件伪装为完整。
+## 模块结构
 
-## 必须理解的边界
-结构化协议关联是源码证据，不是触发→物理到达的运行证明。
-`发车标志→接收状态`包含到达后其他条件等待，不能直接称纯磁驱运动耗时。
-采集器应按本次上升沿锁存，异常取消，多动子时核对ID。标志在到达时复位不代表采集区间已经结束。
-本轮新增自动协议提取只支持PLCopen LD/FBD；原生欧姆龙/SMC2保持旧能力，不假称跨FB模块已全格式覆盖。
-不支持的FB定义、动态参数、未知语义、局部变量歧义、跨任务/实际扫描和全程序可达性仍需审查。
+运行时核心 39 个 .py，按依赖层次组织（详见 `AGENTS.md` 模块概览章节）：
 
-## Excel评价
-评估输出`gt_match.xlsx`，不同类别整行着色；相同预测标签对只能被一条GT计分。
-Excel仍使用既有artifact_tool导出器，安装基础requirements仅含解析依赖；本地缺少Excel组件会提示，CSV/JSON照常生成。
-本次随仓库另提供已经生成的专项Excel，不使用示例标签反向生成预测。
+- **入口/编排**：`plc_cli.py` `workflow.py` `agent.py`
+- **源码解析**：`omron_native.py` `smc2_*.py` `plcopen_*.py` `source_*.py` `extract_*.py`
+- **边界/候选**：`boundary_*.py` `atomic_*.py` `candidate_filter.py` `recall.py` `successor_graph.py`
+- **合并/后继**：`signal_tail_merge.py` `fb_transport.py` `feedback_successor.py`
+- **动作描述/交付**：`action_describe.py` `gen_*_xlsx.py` `station_identity.py`
+- **trace**：`trace_jump_analyzer.py` `trace_to_pairs.py`
+- **评价**：`pair_evaluation.py` `atomic_evaluation.py` `评价器/gen_coverage_*.py`
 
-新增规则见 `.opencode/skills/plc-cross-fb-transport/SKILL.md`；验证见 `RELEASE_v9_12.md`。
+## Skills
+
+7 个 PLC skill 在 `.opencode/skills/`，由 AGENTS.md 按场景加载：
+
+- `plc-boundary-normalization` — 起止标签、OR/AND/NOT、最近后继
+- `plc-signal-tail-merge` — 动作后信号/数据收尾合并
+- `plc-cross-fb-transport` — 跨 FB 触发—到达—接收区间
+- `plc-feedback-successor` — 反馈条件转直接后继
+- `plc-station-identity` — 工位身份映射
+- `plc-coverage-evaluation` — 人工表覆盖对比评价
+- `plc-trace-jump-analysis` — 运行时 trace 跳变分析
+
+## 变更记录
+
+见 `CHANGELOG.md`（v3 ~ v9.28）。

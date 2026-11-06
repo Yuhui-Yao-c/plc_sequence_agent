@@ -7,12 +7,12 @@
     "external_directory": "ask",
     "skill": {
       "plc-boundary-normalization": "allow",
-      "plc-coverage-evaluation": "allow",
-      "plc-trace-jump-analysis": "allow",
-      "plc-station-identity": "allow",
-      "plc-cross-fb-transport": "allow",
       "plc-signal-tail-merge": "allow",
-      "plc-feedback-successor": "allow"
+      "plc-cross-fb-transport": "allow",
+      "plc-feedback-successor": "allow",
+      "plc-station-identity": "allow",
+      "plc-coverage-evaluation": "allow",
+      "plc-trace-jump-analysis": "allow"
     }
   }
 }

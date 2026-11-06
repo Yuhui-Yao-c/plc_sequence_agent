@@ -27,6 +27,8 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+from utils import load_station_identity
+
 
 def clean_doc(text: str) -> str:
     """Documentation may wrap a GrpComment XML fragment with embedded monitor
@@ -58,19 +60,6 @@ def load_var_docs(run: str):
     return docs
 
 
-def load_station_identity(run: str) -> dict:
-    """v9.17: load station_identity.json (root -> {display, code, doc, sort_key, ...}).
-    Returns {} when absent — callers fall back to the v9.16 var_docs path."""
-    if run:
-        p = os.path.join(run, 'station_identity.json')
-        if os.path.exists(p):
-            try:
-                return json.load(open(p, encoding='utf-8'))
-            except Exception:
-                return {}
-    return {}
-
-
 def load_network_comments(run: str) -> dict:
     """v9.18: load network_comments.json (action_name -> [comment, ...]).
     Returns {} when absent."""
@@ -86,25 +75,46 @@ def load_network_comments(run: str) -> dict:
 
 def load_trace_runtime(run: str) -> dict:
     """v9.23: load trace_step_runtime.csv from trace_analysis/ subdirectory.
-    Returns dict: (start_label, end_label) -> avg_duration_ms (int or None).
-    Returns {} when absent (no trace analyzed — duration column stays empty)."""
-    if run:
-        p = os.path.join(run, 'trace_analysis', 'trace_step_runtime.csv')
-        if os.path.exists(p):
-            rt = {}
-            try:
-                import csv as _csv
-                with open(p, encoding='utf-8-sig', newline='') as f:
-                    for row in _csv.DictReader(f):
-                        dur = (row.get('平均时长ms') or '').strip()
-                        key = (row.get('开始标签', ''), row.get('结束标签', ''))
-                        try:
-                            rt[key] = int(dur) if dur else None
-                        except ValueError:
-                            rt[key] = None
+    v9.28: also load trace_collection_pairs.csv (trace mode) with 中位数时长ms.
+    Returns dict: (start_label, end_label) -> duration_ms (int or None).
+    Returns {} when absent (no trace analyzed — duration column stays empty).
+    Priority: trace_collection_pairs.csv (trace mode, median) > trace_analysis/trace_step_runtime.csv (predict mode, avg)."""
+    if not run:
+        return {}
+    rt = {}
+    # v9.28: trace mode — trace_collection_pairs.csv with 中位数时长ms
+    p_trace = os.path.join(run, 'trace_collection_pairs.csv')
+    if os.path.exists(p_trace):
+        try:
+            import csv as _csv
+            with open(p_trace, encoding='utf-8-sig', newline='') as f:
+                for row in _csv.DictReader(f):
+                    dur = (row.get('中位数时长ms') or '').strip()
+                    key = (row.get('开始标签', ''), row.get('结束标签', ''))
+                    try:
+                        rt[key] = int(dur) if dur else None
+                    except ValueError:
+                        rt[key] = None
+            if rt:
                 return rt
-            except Exception:
-                return {}
+        except Exception:
+            pass
+    # v9.23: predict mode — trace_analysis/trace_step_runtime.csv with 平均时长ms
+    p_pred = os.path.join(run, 'trace_analysis', 'trace_step_runtime.csv')
+    if os.path.exists(p_pred):
+        try:
+            import csv as _csv
+            with open(p_pred, encoding='utf-8-sig', newline='') as f:
+                for row in _csv.DictReader(f):
+                    dur = (row.get('平均时长ms') or '').strip()
+                    key = (row.get('开始标签', ''), row.get('结束标签', ''))
+                    try:
+                        rt[key] = int(dur) if dur else None
+                    except ValueError:
+                        rt[key] = None
+            return rt
+        except Exception:
+            return {}
     return {}
 
 
@@ -339,8 +349,7 @@ def step_text(row, amap) -> str:
     return txt
 
 
-def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sheet='步序采集表',
-             *, trace_mode='legacy'):
+def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sheet='步序采集表'):
     """Build the workstation delivery xlsx. Inputs are read-only; returns stats dict.
     group_by='auto' picks 构成要素 for SC04 naming, else 证据POU when available.
     out/proc_name default like the CLI: <proc_name>_步序采集表.xlsx beside the prediction.
@@ -484,25 +493,26 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         for blk in iter(lambda: f.read(1 << 20), b''):
             digest.update(blk)
     sha16 = digest.hexdigest()[:16]
-    trace_estimated = set()
-    if trace_mode == 'sysmac':
-        from trace_to_pairs import load_trace_timing
-        trace_rt, trace_estimated = load_trace_timing(run)
-    else:
-        trace_rt = load_trace_runtime(run) if trace_mode == 'legacy' else {}
-    if trace_mode == 'sysmac' and trace_rt:
-        timing_note = ' Sysmac Trace 按完整起止标签回填中位时长，含估算的行在备注列标记。'
-    elif trace_rt:
-        timing_note = ' 时长(ms)与总时长由运行时trace跳变分析自动回填。'
-    else:
-        timing_note = ' 时长列为现场实测项，预测侧不填。'
+    # v9.23: load trace runtime map early so note + row fill can both use it.
+    trace_rt = load_trace_runtime(run)
+    # v9.29: detect B-tier not processed (input.json exists but no result.json).
+    # When True, rows with empty descriptions get 【B档未处理】 in the remark column.
+    b_tier_pending = False
+    if run:
+        bd = os.path.join(run, 'batches_desc')
+        if os.path.isdir(bd):
+            _bd_files = os.listdir(bd)
+            has_input = any(f.endswith('.input.json') for f in _bd_files)
+            has_result = any(f.endswith('.result.json') for f in _bd_files)
+            b_tier_pending = has_input and not has_result
     note = (f'工序: {proc_name} | 来源: {os.path.basename(prediction)} | 行数: {len(df)} | 分组: {group_by} | '
             + (f'动作描述: B档(LLM工艺语义) {desc_stats.get("B档(LLM工艺语义)", 0)}条/A档(源码步注释) {desc_stats.get("A档(源码步注释)", 0)}条 | ' if desc_stats else '')
             + f'SHA256: {sha16}… | 排序仅为展示查找便利，不代表执行顺序或工艺路径；'
               '步序/标签/描述内容完全来自同一行预测记录与源码证据文件，无推断文本。'
-              + timing_note
+              + (f' 时长(ms)与总时长由运行时trace跳变分析自动回填。' if trace_rt else ' 时长列为现场实测项，预测侧不填。')
               + (f' 备注列标记【待复核】=动作描述待完善(A={blind_counts["A"]})。'
-                 if (blind_counts["A"]) else ''))
+                 if (blind_counts["A"]) else '')
+              + (f' 【B档未处理】=动作描述B档待agent补充，请处理后重跑。' if b_tier_pending else ''))
     ws.cell(row=1, column=2, value=f'{proc_name} 步序采集表（预测交付）').font = hfont
     nc = ws.cell(row=2, column=2, value=note)
     nc.font = nfont
@@ -554,7 +564,6 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         b0 = r
         block_dur_sum = 0
         has_trace_dur = False
-        block_estimated = False
         for _, row in g.iterrows():
             ws.cell(row=r, column=2, value=wsname)
             # 动作描述（干净文本，不含标注）
@@ -574,9 +583,6 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             ws.cell(row=r, column=7, value=row['结束标签'])
             # 备注：网络注释（取最具体的1条）+ 待复核标记
             remark_parts = []
-            if rt_dur is not None and rt_key in trace_estimated:
-                remark_parts.append('Trace 含估算时长')
-                block_estimated = True
             if nc_map:
                 comp = str(row.get('构成要素', '') or '')
                 best_nc = ''
@@ -595,6 +601,9 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             needs_review = 'A' in row['_盲区'] and not str(row['_dtxt']).strip()
             if needs_review:
                 remark_parts.append('【待复核】')
+            # v9.29: B档未处理标记——有动作变量但描述为空且B档待agent补充
+            if b_tier_pending and not str(row['_dtxt']).strip() and str(row['_vtxt']).strip() and str(row['_vtxt']) not in ('nan', 'None'):
+                remark_parts.append('【B档未处理】')
             if remark_parts:
                 ws.cell(row=r, column=8, value=' | '.join(remark_parts))
             # 统一样式
@@ -603,8 +612,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
                 c.font = data_font
                 c.border = border
                 c.alignment = center_align if j == 2 else data_align
-            # 待复核行的备注列用红色字体
-            if needs_review:
+            # 待复核行/B档未处理行的备注列用红色字体
+            if needs_review or (b_tier_pending and not str(row['_dtxt']).strip() and str(row['_vtxt']).strip() and str(row['_vtxt']) not in ('nan', 'None')):
                 ws.cell(row=r, column=8).font = Font(name='Arial', size=9, color='FF0000', bold=True)
             # 统一行高
             ws.row_dimensions[r].height = 18
@@ -614,8 +623,6 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         # v9.23: 有trace数据时填入该工位组时长合计
         if has_trace_dur:
             ws.cell(row=r, column=4, value=block_dur_sum)
-            if block_estimated:
-                ws.cell(row=r, column=8, value='Trace 合计含估算时长')
         for j in range(2, 9):
             c = ws.cell(row=r, column=j)
             c.font = total_font
@@ -642,6 +649,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             'workstation_groups': len(blocks), 'group_by': group_by,
             'b_desc_rows': _bcount if desc_stats else None, 'desc_sources': desc_stats,
             'blind_spot_counts': blind_counts,
+            'b_tier_pending': b_tier_pending,
             'source_sha16': sha16, 'amap_keys': len(amap), 'out': out,
             'trace_duration_backfilled': bool(trace_rt)}
 

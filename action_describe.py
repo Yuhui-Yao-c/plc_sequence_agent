@@ -262,7 +262,11 @@ def cmd_a(run):
     # v9.24: read prediction_collection_pairs.csv (available after predict,
     # before finish) so A-tier can be generated in the predict phase.
     # Fallback to final_prediction_pairs.csv for older runs that only have it.
-    src_csv = os.path.join(run, 'prediction_collection_pairs.csv')
+    # v9.28: trace mode produces trace_collection_pairs.csv — check it FIRST
+    # so trace mode uses its own pairs, not the workflow.create candidate pairs.
+    src_csv = os.path.join(run, 'trace_collection_pairs.csv')
+    if not os.path.exists(src_csv):
+        src_csv = os.path.join(run, 'prediction_collection_pairs.csv')
     if not os.path.exists(src_csv):
         src_csv = os.path.join(run, 'final_prediction_pairs.csv')
     df = pd.read_csv(src_csv, dtype=str, encoding='utf-8-sig')
@@ -350,6 +354,9 @@ def cmd_build(run, batch_size=40):
             rid = str(r['行号'])
             full_idx = full.index[full['行号'] == rid].tolist()
             gi = full_idx[0] if full_idx else 0
+            # v9.29: id uses stable label key "start|||end" so result.json survives
+            # re-runs even if row order shifts.  rid (行号) kept for review display.
+            label_key = f"{r['开始标签']}|||{r['结束标签']}"
             toks = [t.strip() for t in str(r['动作变量']).split(';') if t.strip()]
             tdocs = []
             for t in toks:
@@ -358,7 +365,7 @@ def cmd_build(run, batch_size=40):
             # v9.25: 加入当前行的步注释（start/end 标签对应的源码注释）
             cur_start_sc = sc_map.get(str(r['开始标签']), '')
             cur_end_sc = sc_map.get(str(r['结束标签']), '')
-            rows.append({'id': rid, 'start': r['开始标签'], 'end': r['结束标签'],
+            rows.append({'id': label_key, 'row_id': rid, 'start': r['开始标签'], 'end': r['结束标签'],
                          'a_desc': r['A档描述'], 'kind': r['行性质'], 'tokens': tdocs,
                          'step_comment': cur_start_sc or cur_end_sc,
                          'prev': ctx[gi - 1] if gi > 0 else None,
@@ -417,7 +424,11 @@ def cmd_validate(run):
     docs = load_full_docs(run)
     ascii_id = re.compile(r'[A-Za-z_][A-Za-z0-9_\[\]\.]*')
     # 每行重算机构词/动作词集合（与A档同源），作为子代理可引用词汇
+    # v9.29: row_lex keyed by BOTH label_key "start|||end" (stable) and 行号 (legacy).
+    # Matching prefers label_key so result.json survives row-order changes on re-run.
     row_lex = {}
+    row_lex_by_rid = {}
+    label_to_rid = {}
     for _, r in a.iterrows():
         toks = [t.strip() for t in str(r['动作变量']).split(';') if t.strip()]
         words, actions = [], []
@@ -426,7 +437,12 @@ def cmd_validate(run):
             if d:
                 words.append(d['word'])
                 actions.append(d['action'])
-        row_lex[str(r['行号'])] = (toks, words, actions)
+        rid = str(r['行号'])
+        label_key = f"{r['开始标签']}|||{r['结束标签']}"
+        lex = (toks, words, actions)
+        row_lex[label_key] = lex
+        row_lex_by_rid[rid] = lex
+        label_to_rid[label_key] = rid
     bmap = {}
     issues = []
     for fp in sorted(glob.glob(os.path.join(run, 'batches_desc', '*.result.json'))):
@@ -444,10 +460,16 @@ def cmd_validate(run):
             if len(desc) > 30:
                 issues.append((rid, f'超长{len(desc)}'))
                 continue
-            if rid not in row_lex:
-                issues.append((rid, '行号不存在'))
+            # v9.29: match by label_key first, fall back to 行号 (legacy result.json)
+            if rid in row_lex:
+                toks, words, actions = row_lex[rid]
+                match_rid = label_to_rid.get(rid, rid)
+            elif rid in row_lex_by_rid:
+                toks, words, actions = row_lex_by_rid[rid]
+                match_rid = rid
+            else:
+                issues.append((rid, '行号/标签键不存在'))
                 continue
-            toks, words, actions = row_lex[rid]
             bad = [x for x in refs if x not in toks]
             if bad:
                 issues.append((rid, f'引用超出该行动作变量: {bad[:2]}'))
@@ -463,13 +485,13 @@ def cmd_validate(run):
             zh_segs = re.findall(r'[\u4e00-\u9fff]{2,}', desc)
             row_words = set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(words)))
             row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(actions)))
-            row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', str(a[a['行号'] == rid]['A档描述'].iloc[0])))
+            row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', str(a[a['行号'] == match_rid]['A档描述'].iloc[0])))
             bad_zh = [z for z in zh_segs
                       if not any(z in w or w in z for w in (allowed | row_words))]
             if bad_zh:
                 issues.append((rid, f'编造中文词: {bad_zh[:3]}'))
                 continue
-            bmap[str(rid)] = {'desc': desc, 'refs': refs, 'kind': d.get('kind') or a[a['行号'] == rid]['行性质'].iloc[0]}
+            bmap[match_rid] = {'desc': desc, 'refs': refs, 'kind': d.get('kind') or a[a['行号'] == match_rid]['行性质'].iloc[0]}
     rows = []
     n_b = 0
     n_a = 0

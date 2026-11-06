@@ -50,8 +50,7 @@ def pack_controller_batches(crows,evrows,batch_size):
  for i in range(0,len(unmatched),batch_size):result.append({'c':[],'e':unmatched[i:i+batch_size]})
  return result
 
-def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=None,
-           *,trace_sample_interval_ms=None):
+def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=None):
  out=Path(out).resolve();out.mkdir(parents=True,exist_ok=True)
  manifest=out/'workflow_manifest.json'
  if manifest.exists() and not force:raise SystemExit('已存在 workflow_manifest.json；为保护人工整理进度，请指定新输出目录，或显式 --force。')
@@ -132,19 +131,17 @@ def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=
  (out/'candidate_audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
 
 
- meta={'version':'9.25','collection_projection':collection_stats,'atomic_projection':atomic_stats,'boundary_normalization':boundary_stats,'source':str(Path(source).resolve()),'manual':str(Path(manual).resolve()) if manual else None,'trace':str(Path(trace).resolve()) if trace else None,'extraction':report,'batches':batches,'batch_size':batch_size,'candidate_count':len(rows),'candidate_pairs_count':len(pair_rows),'event_count':len(events),'status':'PREPARED','filter':filter_summary,'process_triage':process_triage,'plcopen_action_trace':report.get('plcopen_action_trace'),'timing_relation_hypotheses':len(time_rows)}
- if trace_sample_interval_ms is not None:
-  meta['trace_sample_interval_ms']=trace_sample_interval_ms
+ meta={'version':'9.28','collection_projection':collection_stats,'atomic_projection':atomic_stats,'boundary_normalization':boundary_stats,'source':str(Path(source).resolve()),'manual':str(Path(manual).resolve()) if manual else None,'trace':str(Path(trace).resolve()) if trace else None,'extraction':report,'batches':batches,'batch_size':batch_size,'candidate_count':len(rows),'candidate_pairs_count':len(pair_rows),'event_count':len(events),'status':'PREPARED','filter':filter_summary,'process_triage':process_triage,'plcopen_action_trace':report.get('plcopen_action_trace'),'timing_relation_hypotheses':len(time_rows)}
  manifest.write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
  (out/'RESULT_SCHEMA.md').write_text('''# 每批结果JSON协议\n```json\n{"batch_id":"B00001","steps":[{"构成要素":"...","动作":"...","动作描述":"...","开始标签":"...","结束标签":"...","核验状态":"confirmed_or_candidate","证据候选ID":["C0000001"],"证据事件ID":["E0000001"],"说明":"..."}],"unresolved_events":[{"event_id":"E0000002","reason":"无法确定使能或反馈"}],"notes":"..."}\n```\n\n要求：开始标签必须来自候选开始标签（或明确写出证据候选ID）；结束标签必须来自候选结束标签；特殊的新条件只能标记 `source_review_required` 并注明源码位置，不能无证据认定已验证。每个事件ID必须出现在某个steps.证据事件ID或unresolved_events中；不可只凭同网络共现证明因果。每条step还要填写：过程类型（机械动作/加工保持/检测测量/工艺等待/交接数据/周期汇总/内部辅助/未分类）、统计对象、起点含义、终点含义、工艺依据、边界依据。缺字段仅进入复核队列，不能删主候选。\n''',encoding='utf-8')
  return meta
 
-def validate(out,write=False,source_fallback=True):
+def validate(out,write=False):
  out=Path(out);manifest=json.loads((out/'workflow_manifest.json').read_text(encoding='utf-8'))
  # v9.22: fallback — if step_comments.json is missing (e.g. predict ran on
  # an older version without step-comment extraction), extract it now from
  # the source XML so A-tier descriptions work on re-runs.
- if source_fallback and not (out/'step_comments.json').exists():
+ if not (out/'step_comments.json').exists():
   src=manifest.get('source','')
   if src and Path(src).is_file():
    try:
@@ -263,6 +260,7 @@ def validate(out,write=False,source_fallback=True):
       _sh.copyfile(a_path, f_path)
     # v9.23:如实报告 B 档状态。b_tier=True 仅表示 agent 已逐批处理；
     # 未处理时 b_tier=False，交付表会有大面积空描述，需 agent 处理后重跑。
+    # v9.29: b_tier_incomplete 强制标记——result.json 缺失时交付表标【B档未处理】。
     b_inputs = glob.glob(str(out/'batches_desc'/'*.input.json'))
     status['action_desc'] = {
      'a_tier': True,
@@ -271,34 +269,32 @@ def validate(out,write=False,source_fallback=True):
      'b_tier_input_count': len(b_inputs),
      'b_tier_result_count': len(desc_files),
      'b_tier_pending': len(b_inputs) - len(desc_files),
+     'b_tier_incomplete': bool(b_inputs) and not desc_files,
     }
     if not desc_files and b_inputs:
-     print(f'B档未处理: {len(b_inputs)}批 input.json 待 agent 逐批处理写 result.json 后重跑 finish；当前交付表动作描述为空（仅 A 档步注释）', file=sys.stderr)
+     print(f'B档未处理: {len(b_inputs)}批 input.json 待 agent 逐批处理写 result.json 后重跑 finish；当前交付表动作描述为空（仅 A 档步注释），备注列标【B档未处理】', file=sys.stderr)
    except Exception as exc:
     status['action_desc'] = {'error': str(exc)}
     print(f'warning: action description not generated ({exc}); CSV deliverables intact', file=sys.stderr)
+   # v9.23: runtime trace jump analysis — parse the .trace file (if provided
+   # in manifest), match predicted pairs to observed jumps, and produce a
+   # runtime map that gen_workstation_xlsx reads to fill the 时长(ms) column.
+   # Reads only trace + prediction; never opens GT/manual tables.
    trace_path = manifest.get('trace')
-   trace_mode = None
-   if trace_path:
+   if trace_path and Path(trace_path).is_file():
     try:
-     from trace_to_pairs import analyze_for_workflow
-     trace_mode, ta_stats = analyze_for_workflow(
-         trace_path, out, source=manifest.get('source'),
-         pattern=manifest.get('filter', {}).get('pattern'),
-         sample_interval_ms=manifest.get('trace_sample_interval_ms'))
-     if trace_mode == 'sysmac':
-      print(f'Sysmac Trace 分析: {ta_stats["unique_pairs"]} 对观测跳变', file=sys.stderr)
-     else:
-      print(f'trace分析: {ta_stats["matched_pairs"]}/{ta_stats["prediction_pairs"]} 预测对在trace中观察到', file=sys.stderr)
+     from trace_jump_analyzer import analyze as trace_analyze
+     ta_out = out/'trace_analysis'
+     ta_stats = trace_analyze(str(trace_path), str(out/'final_prediction_pairs.csv'), str(ta_out))
      status['trace_analysis'] = ta_stats
+     print(f'trace分析: {ta_stats["matched_pairs"]}/{ta_stats["prediction_pairs"]} 预测对在trace中观察到', file=sys.stderr)
     except Exception as exc:
      status['trace_analysis'] = {'error': str(exc)}
      print(f'warning: trace analysis failed ({exc}); CSV deliverables intact', file=sys.stderr)
    # Delivery table: workstation-format xlsx ships with every finished run.
    try:
     from gen_workstation_xlsx import generate as gen_ws
-    status['workstation_xlsx'] = gen_ws(str(out/'final_prediction_pairs.csv'),
-                                       run=str(out), trace_mode=trace_mode)
+    status['workstation_xlsx'] = gen_ws(str(out/'final_prediction_pairs.csv'),run=str(out))
    except Exception as exc:
     status['workstation_xlsx'] = {'error': str(exc)}
     print(f'warning: workstation xlsx not generated ({exc}); CSV deliverables intact', file=sys.stderr)

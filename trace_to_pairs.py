@@ -228,30 +228,52 @@ def _scan_part(path, encoding, delimiter):
 
 
 def _prepare_parts(tables):
+    """Group table parts into recordings.
+
+    A recording is a set of parts with the same settings + channel layout whose
+    Index ranges are contiguous and non-overlapping (split by MaxSamplesPerFile).
+    Multiple recordings (Index restarting from 0) in one directory are kept as
+    separate groups — they are independent cycles of the same process and their
+    jumps are merged later by the multi-cycle aggregation in ``generate()``.
+
+    Returns (recordings, duplicates) where recordings is a list of part-lists
+    sorted by the first file's name.
+    """
     parts = sorted((_scan_part(path, *fmt) for path, fmt in tables),
-                   key=lambda part: (part.first_index, part.path.name))
-    ordered, duplicates = [], []
-    reference = parts[0]
-    starts = [part.capture_start for part in parts if part.capture_start]
-    capture_start = min(starts, key=lambda value: value.as_tuple().exponent) if starts else None
+                   key=lambda part: (part.path.name,))
+    # Group by (settings, channel layout) — different channel counts are separate.
+    by_config = {}
+    duplicates = []
     for part in parts:
-        if (part.settings != reference.settings
-                or {name: kind for name, (_, kind) in part.channels.items()}
-                != {name: kind for name, (_, kind) in reference.channels.items()}):
-            raise ValueError(f'{part.path}: 采样配置或变量列与 {reference.path.name} 不一致，请分开采集运行')
-        if part.capture_start and capture_start:
-            unit = Decimal(10) ** part.capture_start.as_tuple().exponent
-            if abs(part.capture_start - capture_start) > unit / 2:
-                raise ValueError(f'{part.path}: StartRawTime 指向另一轮采集，请分目录运行')
-        if ordered and part.first_index <= ordered[-1].last_index:
-            previous = ordered[-1]
-            if (part.first_index, part.last_index) == (previous.first_index, previous.last_index) and (
-                    _file_digest(part.path) == _file_digest(previous.path)):
-                duplicates.append(part.path.name)
-                continue
-            raise ValueError(f'{part.path}: Index 与 {previous.path.name} 重叠，请检查重复导出或混入其他采集')
-        ordered.append(part)
-    return ordered, duplicates
+        config_key = (part.settings, tuple(sorted(
+            (name, kind) for name, (_, kind) in part.channels.items())))
+        by_config.setdefault(config_key, []).append(part)
+
+    recordings = []
+    for config_key, group_parts in by_config.items():
+        # Sort by first_index then name; parts of one recording have contiguous Index.
+        group_parts.sort(key=lambda p: (p.first_index, p.path.name))
+        current = []
+        for part in group_parts:
+            if current and part.first_index <= current[-1].last_index:
+                # Index overlap — either a duplicate file or a new recording.
+                if (part.first_index, part.last_index) == (
+                        current[-1].first_index, current[-1].last_index) and (
+                        _file_digest(part.path) == _file_digest(current[-1].path)):
+                    duplicates.append(part.path.name)
+                    continue
+                # New recording starts here (Index restarts from a lower value).
+                recordings.append(current)
+                current = []
+            current.append(part)
+        if current:
+            recordings.append(current)
+
+    if not recordings:
+        raise ValueError('未找到任何有效的 Sysmac Trace 表')
+    # Sort recordings by first file name for deterministic ordering.
+    recordings.sort(key=lambda rec: rec[0].path.name)
+    return recordings, duplicates
 
 
 def _sample_period(parts, sample_interval_ms):
@@ -333,21 +355,12 @@ class _Channel:
         }
 
 
-def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
-    """Return variable series and the input audit for one continuous recording."""
-    path = Path(path)
-    tables, ignored = _find_tables(path)
-    parts, duplicates = _prepare_parts(tables)
-    channels = {name: _Channel() for name in parts[0].channels if matches is None or matches(name)}
-    if not channels:
-        raise ValueError(f'{path}: 找不到符合范围的整型步序变量列')
-    interval_ns, interval_source = _sample_period(parts, sample_interval_ms)
-    if any(part.raw_range is None for part in parts):
-        if parts[0].settings[1] not in ('', 'interval', 'cyclic', 'time'):
-            raise ValueError(f'{path}: 非固定间隔采集的 RawTime 精度不足，请重新导出原始 CSV')
-        if interval_ns is None:
-            raise ValueError(f'{path}: RawTime 精度不足。请加入精确时间分卷，或指定 --sample-interval-ms')
+def _parse_one_recording(parts, channels, interval_ns, sample_interval_ms):
+    """Parse one recording (a list of contiguous parts) into per-channel series.
 
+    Returns (channel_results, file_audit, gaps) where channel_results maps
+    variable name → _Channel.result() dict.
+    """
     right_anchors = [None] * len(parts)
     next_anchor = None
     for pos in reversed(range(len(parts))):
@@ -396,19 +409,115 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
         file_audit.append({'file': part.path.name, 'first_index': part.first_index,
                            'last_index': part.last_index, 'samples': part.row_count,
                            'time_basis': 'estimated_by_index' if estimated else 'raw_time_ns'})
+    return {name: channel for name, channel in channels.items()}, file_audit, gaps
+
+
+def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
+    """Return variable series and the input audit for Sysmac trace tables.
+
+    A directory may contain multiple independent recordings (each recording's
+    Index restarts from 0).  Each recording is parsed independently with its own
+    time origin; recordings are then concatenated with a time offset so all
+    jumps share a globally increasing timeline.  This turns multiple recordings
+    into multiple cycles — the downstream multi-cycle aggregation in
+    ``generate()`` collapses them into median/min/max per (var, from, to) pair.
+    """
+    path = Path(path)
+    tables, ignored = _find_tables(path)
+    recordings, duplicates = _prepare_parts(tables)
+
+    # Use the first recording's channel layout as the reference.
+    ref_channels = recordings[0][0].channels
+    channel_names = [name for name in ref_channels if matches is None or matches(name)]
+    if not channel_names:
+        raise ValueError(f'{path}: 找不到符合范围的整型步序变量列')
+
+    interval_ns, interval_source = _sample_period(
+        [p for rec in recordings for p in rec], sample_interval_ms)
+    # Check RawTime precision across all parts.
+    all_parts = [p for rec in recordings for p in rec]
+    if any(part.raw_range is None for part in all_parts):
+        if recordings[0][0].settings[1] not in ('', 'interval', 'cyclic', 'time'):
+            raise ValueError(f'{path}: 非固定间隔采集的 RawTime 精度不足，请重新导出原始 CSV')
+        if interval_ns is None:
+            raise ValueError(f'{path}: RawTime 精度不足。请加入精确时间分卷，或指定 --sample-interval-ms')
+
+    all_channel_results = {}
+    all_file_audit = []
+    all_gaps = []
+    time_offset_ms = 0
+    total_samples = 0
+
+    for rec_idx, parts in enumerate(recordings):
+        # Fresh channels for this recording.  Different recordings may have
+        # different channel subsets (e.g. 30 vs 28 channels); only process
+        # channels that exist in this recording AND are in our target set.
+        rec_channel_names = [n for n in channel_names if n in parts[0].channels]
+        channels = {name: _Channel() for name in rec_channel_names}
+        ch_results, file_audit, gaps = _parse_one_recording(
+            parts, channels, interval_ns, sample_interval_ms)
+        # Shift this recording's timestamps by time_offset_ms so jumps across
+        # recordings share a globally increasing timeline.
+        for name, ch in ch_results.items():
+            result = ch.result()
+            if name not in all_channel_results:
+                all_channel_results[name] = {
+                    'jumps': [], 'segments': [], 'dwell_starts': {},
+                    'estimated_dwells': set(), 'sample_count': 0,
+                    'time_range': [None, None], 'inactive': True,
+                    'unique_values': set(),
+                }
+            acc = all_channel_results[name]
+            for idx, from_v, to_v, ts in result['jumps']:
+                acc['jumps'].append((idx, from_v, to_v, ts + time_offset_ms))
+            for value, s_ts, e_ts, dur in result['segments']:
+                acc['segments'].append((value, s_ts + time_offset_ms,
+                                        e_ts + time_offset_ms, dur))
+            for idx, dts in result['dwell_starts'].items():
+                acc['dwell_starts'][idx] = dts + time_offset_ms
+            acc['estimated_dwells'] |= result['estimated_dwells']
+            acc['sample_count'] += result['sample_count']
+            r_start, r_end = result['time_range']
+            if r_start is not None:
+                g_start = r_start + time_offset_ms
+                g_end = r_end + time_offset_ms
+                if acc['time_range'][0] is None:
+                    acc['time_range'] = [g_start, g_end]
+                else:
+                    acc['time_range'][1] = max(acc['time_range'][1], g_end)
+            acc['inactive'] = acc['inactive'] and result['inactive']
+            acc['unique_values'] |= set(result['unique_values'])
+        # Advance time offset past this recording's end.
+        max_ts = 0
+        for name, ch in ch_results.items():
+            r = ch.result()
+            if r['time_range'][1] is not None:
+                max_ts = max(max_ts, r['time_range'][1])
+        time_offset_ms = max_ts + time_offset_ms + 1  # +1ms gap between recordings
+        total_samples += sum(p.row_count for p in parts)
+        all_file_audit.extend(file_audit)
+        all_gaps.extend(gaps)
+
+    # Finalize: convert sets to sorted lists for JSON.
+    for name in all_channel_results:
+        acc = all_channel_results[name]
+        acc['unique_values'] = sorted(acc['unique_values'])
+        acc['estimated_dwells'] = acc['estimated_dwells']  # keep as set for now
+        acc['time_range'] = tuple(acc['time_range']) if isinstance(acc['time_range'], list) else acc['time_range']
 
     audit = {
         'format': 'omron_sysmac_table',
         'time_basis': 'relative_ms',
         'sample_interval_ms': interval_ns / NS_PER_MS if interval_ns is not None else None,
         'interval_source': interval_source,
-        'samples_total': sum(part.row_count for part in parts),
-        'files': file_audit,
+        'samples_total': total_samples,
+        'recordings': len(recordings),
+        'files': all_file_audit,
         'duplicate_files': duplicates,
         'ignored_tables': ignored,
-        'index_gaps': gaps,
+        'index_gaps': all_gaps,
     }
-    return {name: channel.result() for name, channel in channels.items()}, audit
+    return all_channel_results, audit
 
 
 # ---- Common step-pair extraction ----

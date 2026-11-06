@@ -1,14 +1,11 @@
----
-name: plc-trace-jump-analysis
-description: 使用统一入口处理 TwinCAT Trace 和 Sysmac 导出表或分卷目录，核对观测跳变、回填时长并标记估算。
----
-
 # Skill: plc-trace-jump-analysis
 
 # PLC 运行时 Trace 跳变分析与预测步序时长回填
 
 ## 何时加载
-用户提供了 PLC 运行时 Trace，包括 TwinCAT Scope 的 .trace 文件、Sysmac 导出表或同次采集的分卷目录，需要核对运行跳变与预测步序并回填交付表。两类格式都交给 `trace_to_pairs.py` 分流。
+用户提供了 PLC 运行时 trace 文件（TwinCAT Scope View 导出的 .trace），
+需要把 trace 里的步序值跳变对应到已提取的预测步序对、用实测时长填入
+交付表时加载本 skill。
 
 不生成预测、不修改预测、不替代覆盖评价；trace 是运行时证据，不是
 GT 答案，也不构成对源码迁移逻辑正确性的证明。
@@ -16,24 +13,33 @@ GT 答案，也不构成对源码迁移逻辑正确性的证明。
 ## 业务目标
 1. 解析 trace 文件，提取每个被监测变量的步值跳变与稳定段时长。
 2. 将预测步序对（开始标签 → 结束标签）与 trace 中的实际跳变匹配，
-   按对应格式报告观测、匹配与时长统计。
-3. 把匹配到的时长回填到交付表的"时长(ms)"列，并在每个工位
-   组块尾的"总时长"行求和。Sysmac 含估算的时长随结果标记。
+   给出该步序在运行时是否发生、发生次数、首次/末次/平均时长。
+3. 把匹配到的实测时长回填到交付表的"时长(ms)"列，并在每个工位
+   组块尾的"总时长"行求和。
+4. 未匹配的预测对与 trace 独有跳变如实记入 review，不静默丢弃。
 
-## Sysmac 导出表或分卷目录
-- `--trace` 可传同一次采集的整个目录。按表内 `Index` 排序，保留完整变量名及数组下标，保留缺号造成的观测断点。
-- 有精度的 `RawTime` 转为相对毫秒。粗化分卷按采样索引估算时间。全组缺乏可靠时间戳时传已核实的 `--trace-sample-interval-ms`。
-- 运行目录产出 `trace_collection_pairs.csv`、`trace_pairs_review.csv`、`trace_pairs_summary.json` 及跳变和恒值段审计。先检查分卷和时间来源。
-- Excel 按完整起止标签回填观测停留时长的中位数。含估算的时长在备注中标明。以下 TwinCAT 的经 0 和松散匹配规则适用于原有 .trace 路径。
+## Trace 文件格式
 
-## TwinCAT Trace 文件格式
-- TwinCAT Scope View XML 序列化（.NET XmlSerializer），UTF-16 LE with BOM。
+支持两种格式（`trace_to_pairs.is_omron_trace_input()` 自动识别）：
+
+### TwinCAT Scope（`.trace` 文件，UTF-16 XML）
+- .NET XmlSerializer 序列化，UTF-16 LE with BOM。
 - 每个变量是一个 `<TraceVariable VarName="..." VariableIndex="..." Type="System.Double">` 块。
 - 每块包含 `<Values>v0,v1,v2,...,vN</Values>` 与 `<Timestamps>t0,t1,...,tN</Timestamps>`。
 - 时间戳单位毫秒（ms），事件驱动采样（非固定周期）。
 - `<StartTime>` 是 .NET ticks 绝对基准，时间戳是相对偏移；分析只关心相对差。
+
+### Sysmac Studio（`.csv` 表或采集目录）
+- CSV 表格：每个变量是一列 `m_nNextAutoStep[N]:INT`，每行是一个采样点。
+- 表头含元数据（TraceType/SamplePeriod/SampleRate/StartRawTime）+ 列定义（Index,Date,ClockTime,RawTime,TraceSampID,变量列...）。
+- 一个目录可含多次独立采集（不同时间戳前缀），每次采集分多个分卷文件（`_00001/_00002/_00003`，Index 连续递增）。
+- 多次采集 = 多循环，`_prepare_parts` 按 Index 重叠自动分组，每组独立解析后按时间偏移合并 jumps。
+- RawTime 是纳秒级时间戳，精度不足时用 SampleInterval 估算（标注 `估算时长次数`）。
+- `parse_omron_trace()` 处理多分卷合并、时间戳重建、估算时长标注。
+
+### 通用说明
 - 部分变量在本次 trace 中完全未活动（值恒为 0）——这是正常现象，不报错。
-- 部分变量（如连续输送线 EM13V）可能从不归零，周期检测需排除这类变量。
+- 部分变量（如连续输送线）可能从不归零，周期检测需排除这类变量。
 
 ## 跳变与稳定段
 - 跳变（jump）：连续两个样本值不同，记 (var, from_value, to_value, timestamp_ms, sample_index)。
@@ -68,7 +74,7 @@ GT 答案，也不构成对源码迁移逻辑正确性的证明。
 | 评价隔离 | trace 匹配结果不回流 coverage 评价；coverage 仍只读预测+人工表 |
 | trace ≠ 源码逻辑证明 | trace 证明"这一跳确实发生了"，不证明"源码迁移逻辑正确" |
 
-## TwinCAT 产物与统一工作流入口
+## 文件与执行
 **输入**：
 - trace 文件路径（必需）
 - final_prediction_pairs.csv（必需，匹配目标）
@@ -96,7 +102,7 @@ python plc_cli.py finish --run "outputs/X"
 
 参数顺序：`XML地址 匹配格式 trace地址（可选） 人工表地址（可选）`。
 
-## TwinCAT 边界情况
+## 边界情况
 | 情况 | 处理 |
 |---|---|
 | 变量 0 跳变（未活动） | trace_variables.json 标记 `inactive: true`，不报错 |
@@ -122,8 +128,3 @@ python plc_cli.py finish --run "outputs/X"
 trace 时长是运行时实测，不改变原子化、合并、跨 FB、反馈后继的边界规则。
 合并区间（signal_merge）的时长 = 合并后起止状态段的 start_ts 差，
 包含内部信号/数据收尾耗时，与合并语义一致。
-
-
-## v9.25.1 实现口径补充
-
-当前 trace_jump_analyzer.py 还保留 loose 匹配：起止之间可存在其他状态，作为宽松候选记录并进入时长映射。exact 包含现有时间容差，via_zero 与 loose 也不自动证明同一生产循环或物理因果。报告应分别列出 exact/via_zero/loose，不能将全部 matched_pairs 称为严格运行验证。跨变量和 BOOL 端点继续按现有实现进入复核。
