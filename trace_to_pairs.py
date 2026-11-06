@@ -3,9 +3,7 @@
 
 Reads TwinCAT Scope .trace XML via trace_jump_analyzer, or Sysmac Studio trace
 tables and recording directories. Converts adjacent observed jumps into state-transition
-pairs of the same shape as prediction_collection_pairs.csv
-so downstream action_describe.py (A/B-tier) and gen_workstation_xlsx.py can be
-reused without modification.
+pairs for downstream action descriptions and workbook rendering.
 
 Pair construction (single-variable, per-jump):
   For a variable whose value sequence is  0 → 100 → 110 → 120 → 0,
@@ -31,8 +29,8 @@ Outputs (in run dir):
   trace_jumps.csv             — all raw jumps (audit)
   trace_segments.csv          — all value segments (audit)
   trace_cycles.json           — cycle boundary timestamps (audit)
-  trace_pairs_review.csv      — pairs missing a source action mapping for the
-                                variable or the start step
+  trace_source_evidence.json  — local source links and description evidence
+  trace_pairs_review.csv      — unresolved source links or descriptions
   trace_pairs_summary.json    — run-level stats
 
 Isolation: reads only the trace input + source-derived evidence files in run
@@ -49,7 +47,7 @@ import os
 import re
 import statistics
 from bisect import bisect_right
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -636,20 +634,6 @@ def _load_var_docs(run):
         return {}
 
 
-def _load_action_map(run):
-    """(state_variable, state_value) -> [action_variable, ...].
-
-    Reuses gen_workstation_xlsx.load_action_map to stay consistent with the
-    prediction-side action-variable mapping (plcopen_action_trace.csv +
-    native_command_evidence.csv + indexed_events.csv ST_assignment).
-    """
-    try:
-        from gen_workstation_xlsx import load_action_map
-        return load_action_map(run)
-    except Exception:
-        return {}
-
-
 def _station_name(var_name, si_map, var_docs):
     """Resolve display station name for a trace variable."""
     exact = si_map.get(var_name)
@@ -675,7 +659,7 @@ PAIR_FIELDS = [
     '证据POU', '证据节点', '原始条件', '控制器', '分支数',
     # Runtime columns (trace-specific):
     '动作变量', '发生次数', '中位数时长ms', '最小时长ms', '最大时长ms',
-    '首次时间ms', '末次时间ms', '所属周期数', '备注', '估算时长次数',
+    '首次时间ms', '末次时间ms', '所属周期数', '备注', '估算时长次数', '源码关系',
 ]
 
 
@@ -708,6 +692,7 @@ def generate(trace_path, run, source=None, proc_name=None,
     dict with run stats and output paths.
     """
     from trace_jump_analyzer import parse_trace, detect_cycles, _write_csv
+    from trace_source_evidence import EVIDENCE_FILE, RELATION_TEXT, TraceSourceIndex
 
     try:
         from utils import load_station_identity, infer_proc_name, em_sort_key_prefixed
@@ -859,36 +844,36 @@ def generate(trace_path, run, source=None, proc_name=None,
             pair_last_ts[key] = int(ts)
             pair_cycles[key].add(bisect_right(boundaries, ts))
 
-    # ---- 6. Load source-derived evidence (action map, step comments, identity) ----
-    amap = _load_action_map(str(run))
+    # ---- 6. Index source evidence for the exact observed variable names ----
+    source_index = TraceSourceIndex(run, variables)
     sc_map = _load_step_comments(str(run))
     si_map = load_station_identity(str(run))
     var_docs = _load_var_docs(str(run))
 
-    mapped_vars = {sv for sv, _ in amap}
-
     # ---- 7. Assemble pair rows ----
     rows = []
     review_rows = []
+    pair_evidence = {}
     for key, durs in pair_durations.items():
         var_name, from_v, to_v = key
         from_int = _val_to_int(from_v)
         to_int = _val_to_int(to_v)
         start_label = _label(var_name, from_int)
         end_label = _label(var_name, to_int)
-        is_reset = (to_int == 0)
-
-        # Some source action maps store the array name without its index.
-        step_value = str(from_int)
-        bare_var = re.sub(r'\[\d+\]', '', var_name)
-        action_vars = amap.get((var_name, step_value), [])
-        used_unindexed_mapping = False
-        if not action_vars and bare_var != var_name:
-            action_vars = amap.get((bare_var, step_value), [])
-            used_unindexed_mapping = bool(action_vars)
-
-        # The measured dwell and its step comment belong to the start state.
-        sc = sc_map.get(start_label, '')
+        evidence = source_index.lookup(start_label, end_label, sc_map.get(start_label, ''))
+        pair_evidence[f'{start_label}|||{end_label}'] = evidence
+        relation = evidence['relation']
+        linked = evidence['direct'] or evidence['candidate_path']
+        scopes = list(dict.fromkeys(e['scope'] for e in linked))
+        guards = {e['guard'] for e in linked if e['guard_complete']}
+        commands = list(evidence['linked_commands'])
+        # A PLCopen EQ-to-coil path is a useful reference, with incomplete gating.
+        if relation == 'direct':
+            commands.extend(
+                c for c in evidence['start_commands']
+                if c['role'] == 'connected_signal' and c['scope'] in scopes
+            )
+        action_vars = list(dict.fromkeys(c['arguments'] for c in commands))
 
         # Station name for grouping
         ws_name = _station_name(var_name, si_map, var_docs)
@@ -898,25 +883,24 @@ def generate(trace_path, run, source=None, proc_name=None,
         max_dur = int(max(durs))
         n_cycles = len(pair_cycles[key])
 
-        remark = []
-        if is_reset:
-            remark.append('复位退出')
+        remark = [RELATION_TEXT[relation]]
+        if to_int == 0:
+            remark.append('返回步0')
         estimated_count = pair_estimated.get(key, 0)
         if estimated_count:
             remark.append(f'含估算时长（{estimated_count}/{len(durs)} 次）')
-        if used_unindexed_mapping:
-            remark.append('动作变量命中无下标映射（槽位待核）')
-        if not action_vars:
-            if var_name in mapped_vars or bare_var in mapped_vars:
-                remark.append('该步值无动作变量')
-                review_type = 'no_action_for_step_value'
-                review_note = f'{start_label} 在源码动作变量映射中无对应动作'
-            else:
-                remark.append('源码无动作变量映射')
-                review_type = 'no_action_mapping'
-                review_note = f'trace变量 {var_name} 不在源码动作变量映射中'
-            if not sc:
-                remark.append('无步注释')
+        start_context = evidence['start_comment']
+        if not start_context and evidence['candidate_path']:
+            start_context = evidence['candidate_path'][0]['comment']
+        if start_context and not evidence['description']:
+            remark.append(f'起始步注释参考 {start_context.splitlines()[0]}')
+        review_type, review_note = '', ''
+        if relation != 'direct':
+            review_type, review_note = relation, RELATION_TEXT[relation]
+        elif not evidence['description'] and not evidence['b_evidence']:
+            review_type, review_note = 'description_evidence_missing', '缺少可用于描述的本网络证据'
+            remark.append(review_note)
+        if review_type:
             review_rows.append({
                 '类型': review_type,
                 '变量': var_name,
@@ -928,15 +912,15 @@ def generate(trace_path, run, source=None, proc_name=None,
         rows.append({
             '构成要素': ws_name,
             '动作': 'trace状态跳变',
-            '动作描述': sc,
+            '动作描述': evidence['description'],
             '开始标签': start_label,
             '结束标签': end_label,
             '状态': 'trace_state_jump',
-            '证据POU': '',
-            '证据节点': '',
-            '原始条件': '',
+            '证据POU': '; '.join(scopes),
+            '证据节点': '; '.join(dict.fromkeys(e['source_id'] for e in linked)),
+            '原始条件': next(iter(guards)) if relation == 'direct' and len(guards) == 1 else '',
             '控制器': var_name,
-            '分支数': 0,
+            '分支数': len(guards) if relation == 'direct' else 0,
             '动作变量': '; '.join(action_vars),
             '发生次数': len(durs),
             '中位数时长ms': median_dur,
@@ -947,6 +931,7 @@ def generate(trace_path, run, source=None, proc_name=None,
             '所属周期数': n_cycles,
             '备注': ' | '.join(remark),
             '估算时长次数': estimated_count,
+            '源码关系': relation,
         })
 
     # Sort: by station sort key, then variable, then from-value
@@ -963,6 +948,9 @@ def generate(trace_path, run, source=None, proc_name=None,
 
     rev_fields = ['类型', '变量', '开始标签', '结束标签', '说明']
     _write_csv(run / 'trace_pairs_review.csv', review_rows, rev_fields)
+    (run / EVIDENCE_FILE).write_text(
+        json.dumps({'schema': 1, 'pairs': pair_evidence}, ensure_ascii=False, indent=2),
+        encoding='utf-8')
 
     proc = infer_proc_name(source, str(run), proc_name)
 
@@ -981,8 +969,9 @@ def generate(trace_path, run, source=None, proc_name=None,
         'pairs_with_estimated_duration': len(pair_estimated),
         'pairs_with_action_vars': sum(1 for r in rows if r['动作变量']),
         'pairs_with_step_comment': sum(1 for r in rows if r['动作描述']),
-        'pairs_reset_exit': sum(1 for r in rows if '复位退出' in r['备注']),
+        'pairs_reset_exit': sum(1 for r in rows if '返回步0' in r['备注']),
         'review_count': len(review_rows),
+        'source_relations': dict(Counter(r['源码关系'] for r in rows)),
         'outputs': {
             'pairs_csv': str(csv_path),
             'variables': str(run / 'trace_variables.json'),
@@ -990,6 +979,7 @@ def generate(trace_path, run, source=None, proc_name=None,
             'segments': str(run / 'trace_segments.csv'),
             'cycles': str(run / 'trace_cycles.json'),
             'review': str(run / 'trace_pairs_review.csv'),
+            'source_evidence': str(run / EVIDENCE_FILE),
             'summary': str(run / 'trace_pairs_summary.json'),
         },
     }

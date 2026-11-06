@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +35,30 @@ class SysmacRecordingTests(unittest.TestCase):
     def read_csv(self, path):
         with open(path, encoding='utf-8-sig', newline='') as file:
             return list(csv.DictReader(file))
+
+    def write_csv(self, path, rows):
+        with path.open('w', encoding='utf-8-sig', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def source_edges(self, run, edges):
+        self.write_csv(run / 'source_transition_edges.csv', [
+            {
+                'id': f'T{i}', 'scope': 'Program::Step', 'binding_scope': '',
+                'body': f'{i};line:{i};node:{i}', 'variable': 'Step[1]',
+                'from': start, 'to': end, 'guard': f'Step[1]={start} AND Ready',
+                'guard_complete': True, 'evidence': 'omron_native_wired_guard', 'path': str(i),
+            }
+            for i, (start, end) in enumerate(edges, 1)
+        ])
+
+    def command(self, start, network, command, arguments):
+        return {
+            'scope': 'Program::Step', 'network': network, 'source_line': '100', 'node': str(network),
+            'start': f'Step[1]={start}', 'command': command, 'arguments': arguments,
+            'guard': f'Step[1]={start}', 'guard_complete': True, 'issue': '', 'path': '', 'comment': '',
+        }
 
     def test_filename_groups_parts_and_estimates_each_recording_separately(self):
         later = self.EPOCH + 3_600_000_000_000
@@ -104,3 +129,84 @@ class SysmacRecordingTests(unittest.TestCase):
         self.write_part(self.FIRST + '_00002.csv', self.EPOCH, [(1, 20), (2, 20)])
         with self.assertRaisesRegex(ValueError, 'Index 重叠'):
             parse_omron_trace(self.trace)
+
+    def test_source_path_and_comment_preserve_the_observed_jump(self):
+        self.write_part(self.FIRST + '_00001.csv', self.EPOCH, [(0, 0), (1, 10), (2, 30)])
+        run = self.root / 'run'
+        run.mkdir()
+        self.source_edges(run, [(0, 10), (10, 20), (20, 30)])
+        self.write_csv(run / 'source_stage_candidates.csv', [{
+            '开始标签': 'Step[1]=0', '结束标签': 'Step[1]=10',
+            '证据POU': 'Program::Step', '证据节点': 'T1', '网络序号': '1',
+            '源码行号': '1', '动作描述': '步0-模式跳转', '状态': 'native_wired_transition',
+        }])
+        self.write_csv(run / 'native_command_evidence.csv', [self.command(0, 9, 'coil_reset', 'PPM')])
+
+        stats = generate(self.trace, run, proc_name='test')
+        evidence = json.loads((run / 'trace_source_evidence.json').read_text(encoding='utf-8'))['pairs']
+        self.assertEqual(stats['source_relations'], {'direct': 1, 'path_candidate': 1})
+        direct = evidence['Step[1]=0|||Step[1]=10']
+        self.assertEqual(direct['description'], '模式跳转')
+        self.assertEqual(direct['b_evidence'], [])
+        self.assertEqual(direct['start_commands'][0]['operation'], '复位')
+        skip = evidence['Step[1]=10|||Step[1]=30']
+        self.assertEqual([edge['to'] for edge in skip['candidate_path']], [20, 30])
+        rows = self.read_csv(stats['outputs']['pairs_csv'])
+        self.assertEqual([(r['开始标签'], r['结束标签'], r['中位数时长ms']) for r in rows],
+                         [('Step[1]=0', 'Step[1]=10', '12'), ('Step[1]=10', 'Step[1]=30', '12')])
+
+    def test_trace_descriptions_require_current_command_evidence_and_all_rows(self):
+        from action_describe import cmd_a, cmd_build, cmd_validate
+
+        self.write_part(self.FIRST + '_00001.csv', self.EPOCH, [(0, 0), (1, 10), (2, 20), (3, 30)])
+        run = self.root / 'run'
+        run.mkdir()
+        self.source_edges(run, [(10, 20), (20, 30)])
+        self.write_csv(run / 'native_command_evidence.csv', [
+            self.command(10, 1, 'AxisMove', '_Axis=Axis1;_Position=3'),
+            self.command(20, 2, 'coil_reset', 'PPM'),
+        ])
+        generate(self.trace, run, proc_name='test')
+        cmd_a(run)
+        self.assertEqual(cmd_build(run, batch_size=1), 2)
+        batch_dir = run / 'batches_desc'
+        batch = json.loads((batch_dir / 'batch_001.input.json').read_text(encoding='utf-8'))
+        row, = batch['rows']
+        command, = row['command_evidence']
+        self.assertEqual(command['arguments'], '_Axis=Axis1;_Position=3')
+        result = {'basis': row['basis'], 'ok': True, 'desc': '焊接',
+                  'kind': '机械动作', 'evidence_refs': []}
+        path = batch_dir / 'batch_001.result.json'
+        data = {'batch_id': 1, 'descs': {row['id']: result}}
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        stats = {}
+        final = cmd_validate(run, stats=stats)
+        self.assertEqual((stats['b_candidates'], stats['unresolved_rows'], stats['b_tier_pending_rows']),
+                         (0, 2, 1))
+        self.assertEqual(stats['missing_b_tier_batches'], ['batch_002.result.json'])
+        self.assertTrue(all(not r['动作描述'] for r in self.read_csv(final)))
+        self.assertNotIn('nan', (batch_dir / 'batch_001.input.json').read_text(encoding='utf-8'))
+
+        result.update(desc='伺服定位', evidence_refs=[command['id']])
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        final = cmd_validate(run, stats=stats)
+        self.assertEqual(stats['b_candidates'], 1)
+        described, = [r for r in self.read_csv(final) if r['动作描述']]
+        self.assertEqual(described['描述来源'], 'B档(证据归纳待核)')
+        self.assertEqual(described['证据引用'], command['id'])
+
+        (batch_dir / 'batch_002.result.json').write_text('{"batch_id":2,"descs":{}}', encoding='utf-8')
+        cmd_validate(run, stats=stats)
+        self.assertEqual(stats['b_tier_result_count'], 2)
+        self.assertEqual(stats['b_tier_pending_rows'], 1)
+
+        result['desc'] = '焊接定位'
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        cmd_validate(run, stats=stats)
+        self.assertEqual(stats['b_candidates'], 0)
+
+        result['desc'] = '伺服定位'
+        result['basis'] = 'old-source'
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        cmd_validate(run, stats=stats)
+        self.assertEqual(stats['b_candidates'], 0)

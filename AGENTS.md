@@ -125,20 +125,20 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 **Sysmac 目录和时长口径**
 
 - 将原始导出表放在输入目录顶层并保留 `YYYYMMDDhhmmss_00001.csv` 这类文件名。按前缀区分采集，按卷号读取，同组校验配置、通道、`StartRawTime` 和 `Index`。索引有缺口就切断连续段并记入审计。分卷已改名且无法可靠归组时，恢复原名或按采集分目录运行。
-- 各次采集独立提取跳变与起始状态的观测停留时长，再按 `(变量, 起始步, 结束步)` 汇总出现次数和时长中位数。生产周期候选依据采集内部的空闲段。复位到 0 的跳变保留并标注。
+- 各次采集独立提取跳变与起始状态的观测停留时长，再按 `(变量, 起始步, 结束步)` 汇总出现次数和时长中位数。生产周期候选依据采集内部的空闲段。到步值 0 的跳变保留，备注标为返回步0。
 - `RawTime` 精度不足时，优先使用同次采集的精确时间重建，或使用已知的固定采样间隔。`trace_collection_pairs.csv` 记录 `估算时长次数`。`trace_pairs_summary.json` 的 `trace_input` 记录分组、分卷、时间依据和索引缺口。Sysmac 跳变表保留采集 ID 和原始 `Index`。
 
 **执行与续跑**
 
-1. 使用 `plc-trace-jump-analysis` 的输入格式、跳变和审计规则。其预测对匹配与平均时长回填属于入口一的 `predict --trace`。入口四调用 `trace_to_pairs.py` 直接生成 `trace_collection_pairs.csv`，再据此准备 A/B 档描述。A 档取当前起始步的源码注释，缺失时交给 B 档。`batches/` 是预测用的工艺批次，入口四处理的是 `batches_desc/`。全程只读源码、Trace 和本次运行证据。
-2. `prepared_b_tier_pending` 表示 B 档待处理，已生成的工作簿是 A 档预览。只要有 B 档输入批次，就加载 `plc-action-description`，按每个 `batches_desc/batch_NNN.input.json` 写同名 `batch_NNN.result.json`。用输入行的 `开始标签|||结束标签` 作为键，逐行处理，证据不足时记录复核原因。只有实际生成的全部批次都有对应结果，才进入续跑。
-3. 使用相同源码、Trace、变量范围和输出目录重跑 `plc_cli.py trace`，加 `--force` 通过已有产物保护。程序先备份本次目录的 B 档结果再清理和恢复它们。只在本次 Trace 的续跑目录使用 `--force`。输入变动时另开输出目录。入口一的预测批次由 `finish` 合并。
+1. 使用 `plc-trace-jump-analysis` 的输入格式、跳变和审计规则。其预测对匹配与平均时长回填属于入口一的 `predict --trace`。入口四的 `trace_collection_pairs.csv` 保留原始观测对，`trace_source_evidence.json` 分开记录源码直跳、静态候选路径和待核验关系。候选路径中的中间步及耗时需要独立验证。
+2. A 档使用对齐的源码注释。仅对缺 A 档且能在本网络定位主指令证据的行生成 B 档批次。处理 `batches_desc/*.input.json` 时加载 `plc-action-description` 的 Trace 协议，逐行回传 `basis`、主指令引用及候选描述，或填写证据不足原因。其余行保留观测对并列入复核。
+3. 使用相同源码、Trace、变量范围和输出目录执行 `plc_cli.py trace ... --force`。程序保留 B 档结果，重建证据并校验每个结果的 `basis`。输入变动时另开输出目录。入口一的预测批次由 `finish` 合并。
 
 ```powershell
 python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" --out "outputs/PLC_trace" --force
 ```
 
-交付时核验 `status=done`、`trace_collection_pairs.csv`、`action_desc_final.csv` 和实际生成的 `<工序名>_trace步序采集表.xlsx`。汇报未完成批次、`action_desc_review.csv` 中的描述复核项及 `trace_pairs_review.csv` 中的源码映射复核项。若首跑确认无 B 档批次，可直接核验首跑交付物。
+核验 `workflow_status.json`、状态对、动作描述和实际工作簿。`prepared_b_tier_pending` 表示有未回答的 B 档行。`done_with_review` 表示工作簿已出且仍有源码或描述待核。分别报告源码注释行、B 档候选、证据待核行和未完成批次，逐项查 `trace_pairs_review.csv` 和 `action_desc_review.csv`。
 
 ### 隔离与数据规则
 - 预测与评价建议在独立会话执行；提示词隔离不是操作系统沙箱。
@@ -297,7 +297,7 @@ gen_workstation_xlsx.py load_trace_runtime 扩展：优先读 trace_collection_p
 **问题**：trace 模式 `_run_trace_mode` 把 cmd_a→cmd_build→cmd_validate 三步连跑，cmd_validate 在 agent 写 result.json 之前执行，导致无步注释的行 B档描述为空/nan。B档处理协议散落在6处版本变更+代码注释，无专门 SKILL 固化，agent"容易不用"。predict+finish 路径虽有兜底（复制A档+warning）但纵容跳过。
 **修复**：
 1. 新建 `.opencode/skills/plc-action-description/SKILL.md`：B档处理协议（何时加载、读input.json、写result.json、白名单红线、三入口统一编排）。Skill 数 7→8。
-2. `plc_cli.py _run_trace_mode`：cmd_build 后检测 result.json——不存在则复制A档为final、渲染A档兜底交付表（备注列标【B档未处理】）、status=`prepared_b_tier_pending`、停止；存在则 cmd_validate 合并+完整交付表。同次采集按入口四续跑，`trace --force` 备份并恢复已有 B 档结果。
+2. `plc_cli.py _run_trace_mode`：cmd_build 后检测 result.json——不存在则复制A档为final、渲染A档兜底交付表（备注列标【B档未处理】）、status=`prepared_b_tier_pending`、停止；存在则 cmd_validate 合并+完整交付表。当前续跑按入口四执行，核验现有 B 档结果与本次证据。
 3. `workflow.py validate`：result.json 缺失时保留复制A档兼容行为，新增 `b_tier_incomplete` 强制标记，stderr 报警。
 4. `gen_workstation_xlsx.py`：检测 batches_desc 有 input.json 无 result.json → `b_tier_pending=True`；有动作变量但描述为空的行备注列标【B档未处理】（红色加粗）；note 行追加图例。
 预测经 `finish` 合并，Trace 经同次 `trace --force` 续跑合并。以当前输入批次逐一核验 B 档结果。

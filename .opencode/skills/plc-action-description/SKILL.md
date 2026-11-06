@@ -7,8 +7,17 @@
 - finish / 重跑前**必须加载**
 - B档是 LLM 环节，agent 介入是架构要求，**非可选**
 
-## 业务目标
-为每个状态对（开始标签→结束标签）生成一句纯中文工艺动作描述。
+## 入口四 Trace 协议
+
+批次 `schema=trace-description-evidence-v1` 时，使用本节。下文的变量 token 协议用于预测批次。
+
+1. 读取当前行的 `direct_source` 和 `command_evidence`。前者是源码迁移门控，后者给出可引用的本网络指令。只将实际指令当作动作依据，只用 `description_comment` 核对对象、方向和目标位，原始网络注释保留为背景。
+2. 对应每个输入文件写同名 `.result.json`，保留 `batch_id` 和每行的 `id`、`basis`。例如 `{"batch_id":1,"descs":{"开始标签|||结束标签":{"basis":"TB…","ok":true,"desc":"伺服定位","kind":"机械动作","evidence_refs":["TE…"]}}}`。
+3. 从 `command_evidence` 选择一个主指令 ID，回传其 `kind`。用不超过 30 字的中文描述表达该指令的 `operation`。只在 `description_comment` 支持时补充方向、工艺或完成状态。证据不足时回传 `{"basis":"TB…","ok":false,"reason":"实际缺失的证据"}`。
+4. 处理所有输入行。源码注释来自 A 档，B 档引用通过的内容标为候选。无指令证据的行直接进入复核。分开报告源码注释行、B 档候选、证据待核和缺结果行。
+
+## 预测业务目标
+为有支持证据的状态对（开始标签→结束标签）生成一句纯中文工艺动作描述。
 A档由代码确定性生成（源码步注释），B档由 LLM 补充无步注释的行。
 两者合并写入 `action_desc_final.csv`，供交付表读取。
 
@@ -46,7 +55,7 @@ A档由代码确定性生成（源码步注释），B档由 LLM 补充无步注�
 | 入口 | A档 | B档批次 | agent窗口 | 合并 | 交付表 |
 |---|---|---|---|---|---|
 | predict | predict末尾 cmd_a | predict末尾 cmd_build | predict停→agent写result.json | finish cmd_validate | finish渲染 |
-| trace | trace step4 cmd_a | trace step4 cmd_build | **检测result.json：无则停止+提示** | 有则 cmd_validate | 有则渲染完整/无则A档兜底 |
+| trace | 对齐源码注释 | 只为有指令证据的行建批 | Agent 逐行作答 | 核验批次、证据版本和指令引用 | 渲染工作簿并标出待处理和待核验 |
 | 重跑 | cmd_a（确定性不变）| cmd_build（不删result.json，v9.22）| agent成果保留 | cmd_validate | 渲染 |
 
 **幂等保证**：`cmd_build` 不删除已有 `result.json`（v9.22），agent 处理成果在重跑时保留。
@@ -58,14 +67,14 @@ action_desc_a.csv (A档)
   → batches_desc/*.result.json (agent逐批写)
   → action_desc_final.csv (cmd_validate合并B+A)
   → 交付表动作描述列
-action_desc_review.csv (B档校验失败行)
+action_desc_review.csv (描述待核和待处理行)
 ```
 
 ## 与现有 SKILL 的关系
 | 现有 SKILL | 关系 |
 |---|---|
 | plc-boundary-normalization | A/B档不改变边界规则，只描述已确定的步序对 |
-| plc-trace-jump-analysis | trace模式复用同一A/B档协议 |
+| plc-trace-jump-analysis | Trace 模式按本文件的指令证据协议描述观测对 |
 | plc-station-identity | 工位名进"构成要素"列，不进动作描述 |
 | 其他代码逻辑型skill | 正交，不冲突 |
 
@@ -87,9 +96,8 @@ python plc_cli.py finish --run "outputs/X"
 **trace 路径**：
 ```bash
 python plc_cli.py trace --source "..." --trace "..." --out "outputs/X" [--pattern "..."]
-# trace 自动 cmd_a + cmd_build，检测 result.json：
-#   无 → 渲染A档兜底交付表 + 标记 prepared_b_tier_pending + 停止
-#   有 → cmd_validate 合并 + 渲染完整交付表
+# 首跑生成观测表、源码证据和适用的 B 档批次
+# Agent 完成 B 档后用相同参数加 --force，核验 workflow_status.json
 ```
 
 ## 边界情况

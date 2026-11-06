@@ -28,7 +28,9 @@ _STALE_MARKERS=['workflow_manifest.json','workflow_status.json','batches',
 _STALE_PATTERNS=('step_variables.json','step_variables.csv',
                  'trace_collection_pairs.csv','trace_*.csv','trace_*.json',
                  '*_步序变量表.xlsx','*_步序采集表.xlsx','*_trace步序采集表.xlsx',
-                 'action_desc_*.csv','indexed_candidates.csv',
+                 'action_desc_*.csv','indexed_candidates.csv','indexed_events.csv',
+                 'source_transition_graph.json','source_transition_edges.csv','source_stage_candidates.csv',
+                 'native_command_evidence.csv','plcopen_action_trace.csv',
                  'prediction_*.csv','sequence_*.csv','final_*.csv',
                  'step_comments.json','network_comments.json',
                  'variable_documentation.json','station_identity.json')
@@ -36,15 +38,21 @@ _STALE_PATTERNS=('step_variables.json','step_variables.csv',
 def _check_isolation(out,args,mode_name):
   """Refuse to write into a dir with predict/finish products unless --force.
   Returns True if stale was cleared (caller should use force=True on create)."""
-  has_stale=any((out/m).exists() for m in _STALE_MARKERS)
+  markers = _STALE_MARKERS
+  if mode_name == 'trace':
+   markers = markers + ['trace_pairs_summary.json','source_transition_edges.csv',
+                        'native_command_evidence.csv','plcopen_action_trace.csv']
+  has_stale=any((out/m).exists() for m in markers)
   if has_stale and not args.force:
    raise SystemExit(
     f'{mode_name} 模式拒绝写入已有 predict/finish 产物的目录：{out}\n'
-    f'  检测到残留：{[m for m in _STALE_MARKERS if (out/m).exists()]}\n'
+    f'  检测到残留：{[m for m in markers if (out/m).exists()]}\n'
     f'  请指定空目录，或加 --force 强制清理残留后重跑。')
   if has_stale and args.force:
    import shutil
-   for m in _STALE_MARKERS:
+   for m in markers:
+    if m == 'batches_desc' and mode_name == 'trace':
+     continue  # Rebuild inputs and validate retained results against the new source basis.
     p=out/m
     if p.is_dir(): shutil.rmtree(p,ignore_errors=True)
     elif p.exists(): p.unlink()
@@ -114,116 +122,68 @@ def _run_tagvars(src,out,args):
  print(json.dumps(stats,ensure_ascii=False,indent=2))
 
 def _run_trace_mode(src,out,args):
- """v9.28 trace mode: parse trace jumps into state-transition pairs and
- render a <proc_name>_trace步序采集表.xlsx.  Reuses the candidate pipeline
- (workflow.create) for source-derived evidence (action-variable mapping,
- step comments, station identity), then trace_to_pairs for jump→pair
- conversion, then action_describe (A/B-tier) and gen_workstation_xlsx for
- the delivery table.  Reads source XML + trace file only; never GT/manual."""
+ """Prepare observed Trace pairs, source evidence and a reviewable workbook."""
+ trace = Path(args.trace)
+ if not src.is_file():
+  raise FileNotFoundError(f'PLC源码不存在：{src}')
+ if not trace.exists():
+  raise FileNotFoundError(f'Trace输入不存在：{trace}')
+ if src.is_relative_to(out) or trace.resolve().is_relative_to(out):
+  raise ValueError('输出目录须与PLC源码和Trace输入分开')
  out.mkdir(parents=True,exist_ok=True)
- stats={'mode':'trace','source':str(src),'trace':str(args.trace),'out':str(out),'status':'running'}
- # v9.29: preserve agent's B-tier results across --force + create(force=True).
- # Both _check_isolation and workflow.create clear batches_desc on --force;
- # we back up *.result.json to memory and restore after create(), before cmd_build.
- import glob as _g0
- _bdir0=out/'batches_desc'
- _saved_b_results=[]
- if _bdir0.is_dir():
-  for _rp in _g0.glob(str(_bdir0/'*.result.json')):
-   try: _saved_b_results.append((Path(_rp).name,Path(_rp).read_bytes()))
-   except Exception: pass
  _check_isolation(out,args,'trace')
- # 1) Run the normal candidate pipeline (parse → filter → freeze candidates).
- #    Produces plcopen_action_trace.csv (action-variable mapping) + indexed_candidates.csv.
- print('Trace [1/4] 解析 PLC 源码并准备候选批次', file=sys.stderr, flush=True)
- manifest=create(str(src),str(out),batch_size=args.batch_size,
-                 pattern=args.pattern,force=True,manual=None,trace=None)
- # Restore agent's B-tier results (create's --force cleared batches_desc).
- if _saved_b_results:
-  _rbdir=out/'batches_desc'; _rbdir.mkdir(parents=True,exist_ok=True)
-  for _name,_data in _saved_b_results:
-   (_rbdir/_name).write_bytes(_data)
- stats['candidate_count']=manifest.get('candidate_count',0)
- # 2) Extract source-derived evidence (workstation naming + step comments +
- #    action-variable mapping).  trace mode needs all four evidence files.
- print('Trace [2/4] 提取变量文档、步注释和工位身份', file=sys.stderr, flush=True)
- _extract_source_evidence(src,out,include_comments=True)
- # 3) trace → pairs (reuses trace_jump_analyzer.parse_trace).
- print('Trace [3/4] 解析采集数据并汇总状态对', file=sys.stderr, flush=True)
+ stats = {'mode':'trace','source':str(src),'trace':str(trace),'out':str(out)}
+ stage = 'source'
  try:
+  print('Trace [1/4] 解析 PLC 源码并准备候选批次', file=sys.stderr, flush=True)
+  manifest = create(str(src),str(out),batch_size=args.batch_size,
+                    pattern=args.pattern,force=True,manual=None,trace=None)
+  stats['candidate_count'] = manifest.get('candidate_count',0)
+
+  stage = 'source_evidence'
+  print('Trace [2/4] 提取变量文档、步注释和工位身份', file=sys.stderr, flush=True)
+  _extract_source_evidence(src,out,include_comments=True)
+
+  stage = 'trace'
+  print('Trace [3/4] 解析采集数据并汇总状态对', file=sys.stderr, flush=True)
   from trace_to_pairs import generate as gen_trace_pairs
-  trace_stats=gen_trace_pairs(str(args.trace),str(out),source=str(src),pattern=args.pattern,
-                            sample_interval_ms=args.sample_interval_ms)
+  trace_stats = gen_trace_pairs(str(trace),str(out),source=str(src),pattern=args.pattern,
+                                sample_interval_ms=args.sample_interval_ms)
   stats.update({k:trace_stats[k] for k in ('variables_total','variables_active',
       'total_jumps','cycles_detected','unique_pairs','pairs_with_action_vars',
-      'pairs_with_step_comment','pairs_reset_exit','review_count')})
-  stats['proc_name']=trace_stats['proc_name']
-  stats['trace_input']=trace_stats.get('trace_input',{})
- except Exception as exc:
-  stats['error']=str(exc);stats['status']='failed'
-  print(json.dumps(stats,ensure_ascii=False,indent=2));sys.exit(2)
- # 4) A-tier + B-tier action descriptions (reads trace_collection_pairs.csv via fallback).
- print('Trace [4/4] 准备动作描述和交付表', file=sys.stderr, flush=True)
- # v9.29: B-tier is a mandatory LLM step.  cmd_build generates batches_desc/*.input.json;
- # agent must write *.result.json before cmd_validate can merge B+A.  If result.json is
- # absent (first run / agent hasn't processed yet), render an A-tier fallback xlsx marked
- # 【B档未处理】 and STOP — do NOT run cmd_validate (it would produce empty/nan descs).
- # Re-running the same command after agent writes result.json completes the merge.
- import glob as _glob
- try:
+      'pairs_with_step_comment','pairs_reset_exit','review_count','source_relations',
+      'proc_name','trace_input')})
+
+  stage = 'description'
+  print('Trace [4/4] 准备动作描述和交付表', file=sys.stderr, flush=True)
   from action_describe import cmd_a, cmd_build, cmd_validate
   cmd_a(str(out))
   cmd_build(str(out))
- except Exception as exc:
-  print(f'动作描述A档/B档批次生成失败（不影响trace交付表，描述列留空）：{exc}',file=sys.stderr)
- result_files=_glob.glob(str(out/'batches_desc'/'*.result.json'))
- b_input_files=_glob.glob(str(out/'batches_desc'/'*.input.json'))
- if not result_files and b_input_files:
-  # B-tier pending: agent hasn't written result.json yet.
-  # Copy A-tier as fallback final so the xlsx can render, then STOP.
-  import shutil as _sh
-  _a_path=out/'action_desc_a.csv'
-  _f_path=out/'action_desc_final.csv'
-  if _a_path.exists():
-   _sh.copyfile(str(_a_path),str(_f_path))
-  stats['status']='prepared_b_tier_pending'
-  stats['b_tier_pending']=len(b_input_files)
-  stats['b_tier_result_count']=0
-  # Render A-tier fallback xlsx (gen_workstation_xlsx detects b_tier_pending via
-  # batches_desc having input.json but no result.json, marks 【B档未处理】).
-  try:
-   from gen_workstation_xlsx import generate as gen_ws
-   proc=stats.get('proc_name') or '工序'
-   xlsx_out=str(out/f'{proc}_trace步序采集表.xlsx')
-   ws_stats=gen_ws(str(out/'trace_collection_pairs.csv'),out=xlsx_out,
-                   proc_name=proc,run=str(out),sheet='trace步序采集表')
-   stats['workstation_xlsx']=ws_stats
-  except Exception as exc:
-   stats['workstation_xlsx']={'error':str(exc)}
-   print(f'A档兜底交付表生成失败（CSV产物已生成）：{exc}',file=sys.stderr)
-  print(f'B档待处理: {len(b_input_files)}批 input.json 待 agent 逐批写 result.json 后重跑本命令；'
-        f'当前交付表动作描述仅A档（无步注释的行留空，备注列标【B档未处理】）',file=sys.stderr)
-  print(json.dumps(stats,ensure_ascii=False,indent=2))
-  return
- # result.json exists (or no B-tier needed) → merge B+A.
- try:
-  cmd_validate(str(out))
- except Exception as exc:
-  print(f'动作描述合并失败（不影响trace交付表，描述列用A档）：{exc}',file=sys.stderr)
- # 5) Render delivery xlsx (reuses gen_workstation_xlsx.generate).
- try:
+  cmd_validate(str(out), stats=stats)
+
+  stage = 'workbook'
   from gen_workstation_xlsx import generate as gen_ws
-  proc=stats.get('proc_name') or '工序'
-  xlsx_out=str(out/f'{proc}_trace步序采集表.xlsx')
-  ws_stats=gen_ws(str(out/'trace_collection_pairs.csv'),out=xlsx_out,
-                  proc_name=proc,run=str(out),sheet='trace步序采集表')
-  stats['workstation_xlsx']=ws_stats
-  stats['status']='done'
+  proc = stats['proc_name'] or '工序'
+  xlsx_out = str(out/f'{proc}_trace步序采集表.xlsx')
+  stats['workstation_xlsx'] = gen_ws(str(out/'trace_collection_pairs.csv'),out=xlsx_out,
+                                    proc_name=proc,run=str(out),sheet='trace步序采集表')
+  if stats['b_tier_pending_rows']:
+   stats['status'] = 'prepared_b_tier_pending'
+  elif stats['review_count'] or stats['description_review_count']:
+   stats['status'] = 'done_with_review'
+  else:
+   stats['status'] = 'done'
  except Exception as exc:
-  stats['workstation_xlsx']={'error':str(exc)}
-  stats['status']='xlsx_failed'
-  print(f'交付表生成失败（CSV产物已生成）：{exc}',file=sys.stderr)
- print(json.dumps(stats,ensure_ascii=False,indent=2))
+  stats.update(status='xlsx_failed' if stage == 'workbook' else 'failed',
+               failed_stage=stage, error=str(exc))
+ status = json.dumps(stats,ensure_ascii=False,indent=2)
+ status_path = out/'workflow_status.json'
+ tmp_path = status_path.with_suffix('.tmp')
+ tmp_path.write_text(status,encoding='utf-8')
+ tmp_path.replace(status_path)
+ print(status)
+ if 'error' in stats:
+  sys.exit(2)
 
 def predict(args):
  src=Path(args.source).resolve()
