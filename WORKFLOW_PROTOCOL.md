@@ -1,6 +1,6 @@
 # OpenCode 执行协议 v9.25.1
 
-本协议整理 v9.25 已有能力的调用和完成条件。提取、边界、动作描述、Trace 匹配、评价和 Excel 引擎继续使用原实现。根 AGENTS.md 与各领域 Skill 的证据和隔离要求全部适用。
+本协议整理 v9.25 已有能力的调用和完成条件。Trace 处理通过 `trace_to_pairs.py` 统一分流，支持 TwinCAT .trace、Sysmac 表和同次 Sysmac 分卷目录。根 AGENTS.md 与各领域 Skill 的证据和隔离要求全部适用。
 
 ## 输入路由
 
@@ -86,7 +86,7 @@ descs 的键必须与本批 rows.id 一一对应，不能漏行、重复跨批�
 - PLCopen、SMC2、欧姆龙原生适配器，以及 ST 双轨解析全部保留。
 - OR 首出口、未知写入阻断、AND、BOOL 端点、跨 FB 协议和动作后收尾规则不变。
 - A/B 描述通过独立文件关联 Excel，不改写原预测来提高描述或评价指标。
-- Trace 的 exact/via_zero/loose 分类及当前时长计算不变；不能将 loose 当严格运行因果证明。
+- TwinCAT 的 exact/via_zero/loose 是各自的运行匹配口径。Sysmac 以完整起止标签关联观测步序对，按起始步停留时长中位数回填并标记估算。
 - coverage 的路径/写法/粒度覆盖与 evaluate 的严格单对口径分别报告，不混算。
 - 交付表依旧读取 final_prediction_pairs.csv；原池含弱候选，不能将行数称为全部已证实真实动作。
 - 词典、运行时、模型和权限模式均不因本次编排调整而替换。不得为稳定性删能力、少处理批次或伪造描述。

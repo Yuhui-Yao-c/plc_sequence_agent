@@ -87,11 +87,11 @@ B 档仅补 A 档为空的行。读取本行 tokens、step_comment 和 prev/next
 
 备注保留最具体的 1–2 条相关网络注释并过滤泛化注释。工位显示按已有 POU 直接路径、子工位粒度、station_identity 与 var_docs 回退规则组织，不把不同工位的裸 SC04 段混为一组。
 
-需要重渲染时用 `python gen_workstation_xlsx.py --prediction "运行目录/final_prediction_pairs.csv" --run "运行目录"`，可指定 --proc-name、--group-by 或 --out。重渲染只读冻结预测和证据，不生成新候选或代替两类批次。
+独立重渲染时，TwinCAT 或无 Trace 的运行可用 `python gen_workstation_xlsx.py --prediction "运行目录/final_prediction_pairs.csv" --run "运行目录"`。Sysmac 运行使用已有步序对产物时调用 `gen_workstation_xlsx.generate(..., trace_mode='sysmac')`。重渲染读取冻结预测和证据。
 
 ## Trace 与只读评价
 
-Trace 由既有 UTF-16 解析器读取；核查变量、样本与缺失覆盖。仅对已有预测分析运行跳变并回填时长，区分 exact、via_zero、loose，不能把 loose、BOOL/跨变量弱观察或简单平均/求和当作严格运行因果证明。无 Trace 或未观察到时保留空值和原因。请求的分析失败须报告，不能只因 CSV 已产生就称完整交付完成。
+Trace 统一由 `trace_to_pairs.py` 识别格式和分流。TwinCAT Scope .trace 使用原有 UTF-16 解析及 exact、via_zero、loose 匹配。Sysmac 表或分卷目录按采样索引提取观测跳变，按完整起止标签回填中位数时长，并在 Excel 标出包含估算时长的行。Sysmac 的 `trace_pairs_summary.json` 记录分卷、缺号和时间来源。分别报告匹配口径、缺失时长与交付错误。Trace 结果作为运行观测，源码与人工评价各自保留其证据来源。
 
 人工 Excel 评价：`python plc_cli.py coverage --prediction "冻结预测.csv" --manual "人工表.xlsx" --out "独立评价目录/覆盖评价.xlsx"`；需要时指定 --proc-name、--var-desc、--kind。复用现有 match_one/find_path/classify，区分直接匹配、多段路径、写法不同、拆分粒度、周期待确认和未覆盖根因。原始条件参与 guards 核验；实际 zero 回退和条件缺失放宽不能描述成严格等价。报告覆盖率和根因，不修改预测或人工表。
 

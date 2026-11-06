@@ -281,18 +281,14 @@ def validate(out,write=False,source_fallback=True):
    trace_mode = None
    if trace_path:
     try:
-     from omron_trace import is_omron_trace_input
-     if is_omron_trace_input(trace_path):
-      from trace_to_pairs import generate as trace_pairs
-      ta_stats = trace_pairs(trace_path, out, source=manifest.get('source'),
-                             pattern=manifest.get('filter', {}).get('pattern'),
-                             sample_interval_ms=manifest.get('trace_sample_interval_ms'))
-      trace_mode = 'sysmac'
+     from trace_to_pairs import analyze_for_workflow
+     trace_mode, ta_stats = analyze_for_workflow(
+         trace_path, out, source=manifest.get('source'),
+         pattern=manifest.get('filter', {}).get('pattern'),
+         sample_interval_ms=manifest.get('trace_sample_interval_ms'))
+     if trace_mode == 'sysmac':
       print(f'Sysmac Trace 分析: {ta_stats["unique_pairs"]} 对观测跳变', file=sys.stderr)
      else:
-      from trace_jump_analyzer import analyze as trace_analyze
-      ta_stats = trace_analyze(str(trace_path), str(out/'final_prediction_pairs.csv'), str(out/'trace_analysis'))
-      trace_mode = 'legacy'
       print(f'trace分析: {ta_stats["matched_pairs"]}/{ta_stats["prediction_pairs"]} 预测对在trace中观察到', file=sys.stderr)
      status['trace_analysis'] = ta_stats
     except Exception as exc:

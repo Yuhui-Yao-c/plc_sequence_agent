@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 
-from omron_trace import trace_input_digest
+from trace_to_pairs import trace_input_digest
 
 VERSION = '9.25.1'
 CONTRACT = 'workflow_execution.json'

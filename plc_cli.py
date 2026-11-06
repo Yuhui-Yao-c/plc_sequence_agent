@@ -25,7 +25,7 @@ def predict(args):
   if not (tp.is_file() or tp.is_dir()):raise FileNotFoundError(f'Trace 文件或目录不存在：{tp}')
   trace_path=str(tp)
  if interval is not None:
-  from omron_trace import is_omron_trace_input
+  from trace_to_pairs import is_omron_trace_input
   if not trace_path or not is_omron_trace_input(trace_path) or not math.isfinite(interval) or interval<=0:
    raise ValueError('--trace-sample-interval-ms 要求 Sysmac Trace 输入和有限正间隔')
  manifest=create(str(src),str(out),batch_size=args.batch_size,pattern=args.pattern,force=args.force,

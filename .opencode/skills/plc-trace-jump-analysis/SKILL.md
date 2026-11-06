@@ -1,6 +1,6 @@
 ---
 name: plc-trace-jump-analysis
-description: 在提供运行时Trace时分析状态跳变与exact、via_zero、loose匹配，回填时长并保留未观测和跨变量复核项。
+description: 使用统一入口处理 TwinCAT Trace 和 Sysmac 导出表或分卷目录，核对观测跳变、回填时长并标记估算。
 ---
 
 # Skill: plc-trace-jump-analysis
@@ -8,7 +8,7 @@ description: 在提供运行时Trace时分析状态跳变与exact、via_zero、l
 # PLC 运行时 Trace 跳变分析与预测步序时长回填
 
 ## 何时加载
-用户提供了 PLC 运行时 Trace，包括 TwinCAT Scope 的 .trace 文件、Sysmac 导出表或同次采集的分卷目录，需要核对运行跳变与预测步序并回填交付表。
+用户提供了 PLC 运行时 Trace，包括 TwinCAT Scope 的 .trace 文件、Sysmac 导出表或同次采集的分卷目录，需要核对运行跳变与预测步序并回填交付表。两类格式都交给 `trace_to_pairs.py` 分流。
 
 不生成预测、不修改预测、不替代覆盖评价；trace 是运行时证据，不是
 GT 答案，也不构成对源码迁移逻辑正确性的证明。
@@ -16,10 +16,9 @@ GT 答案，也不构成对源码迁移逻辑正确性的证明。
 ## 业务目标
 1. 解析 trace 文件，提取每个被监测变量的步值跳变与稳定段时长。
 2. 将预测步序对（开始标签 → 结束标签）与 trace 中的实际跳变匹配，
-   给出该步序在运行时是否发生、发生次数、首次/末次/平均时长。
-3. 把匹配到的实测时长回填到交付表的"时长(ms)"列，并在每个工位
-   组块尾的"总时长"行求和。
-4. 未匹配的预测对与 trace 独有跳变如实记入 review，不静默丢弃。
+   按对应格式报告观测、匹配与时长统计。
+3. 把匹配到的时长回填到交付表的"时长(ms)"列，并在每个工位
+   组块尾的"总时长"行求和。Sysmac 含估算的时长随结果标记。
 
 ## Sysmac 导出表或分卷目录
 - `--trace` 可传同一次采集的整个目录。按表内 `Index` 排序，保留完整变量名及数组下标，保留缺号造成的观测断点。
@@ -69,7 +68,7 @@ GT 答案，也不构成对源码迁移逻辑正确性的证明。
 | 评价隔离 | trace 匹配结果不回流 coverage 评价；coverage 仍只读预测+人工表 |
 | trace ≠ 源码逻辑证明 | trace 证明"这一跳确实发生了"，不证明"源码迁移逻辑正确" |
 
-## 文件与执行
+## TwinCAT 产物与统一工作流入口
 **输入**：
 - trace 文件路径（必需）
 - final_prediction_pairs.csv（必需，匹配目标）
@@ -97,7 +96,7 @@ python plc_cli.py finish --run "outputs/X"
 
 参数顺序：`XML地址 匹配格式 trace地址（可选） 人工表地址（可选）`。
 
-## 边界情况
+## TwinCAT 边界情况
 | 情况 | 处理 |
 |---|---|
 | 变量 0 跳变（未活动） | trace_variables.json 标记 `inactive: true`，不报错 |
