@@ -27,7 +27,8 @@ _MOTION = {
 }
 _COIL = {'coil_set': '置位', 'coil_reset': '复位', 'coil_write': '写入'}
 _STEP_PREFIX = re.compile(r'^\s*(?:步\s*)?(\d+)\s*[-—:：>]\s*')
-_TEMPLATE = re.compile(r'^相邻已观察|^源码局部状态迁移|^步进保持|^迁移（')
+_TEMPLATE = re.compile(r'^相邻已观察|^源码局部状态迁移|^步进保持|^迁移（|^0状态已出现|^触发.*到达信号.*参与接收条件')
+_NOISE_COMMENT = re.compile(r'^(计时开始|计时结束|计时)$')
 
 
 def _read_csv(path):
@@ -46,7 +47,7 @@ def _state(label):
 
 def _comment_text(comment, source_step):
     lines = comment.strip().splitlines()
-    if not lines or _TEMPLATE.search(lines[0]):
+    if not lines or _TEMPLATE.search(lines[0]) or _NOISE_COMMENT.fullmatch(lines[0].strip()):
         return ''
     text = lines[0].strip()
     prefix = _STEP_PREFIX.match(text)
@@ -98,6 +99,7 @@ class TraceSourceIndex:
         self.graphs = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.bindings = defaultdict(set)
         self.commands = defaultdict(list)
+        self.notes = defaultdict(list)
         wanted = {name.casefold() for name in variables}
         run = Path(run)
         edges_by_id = {}
@@ -122,6 +124,9 @@ class TraceSourceIndex:
             start = _state(row.get('开始标签'))
             end = _state(row.get('结束标签'))
             scope = row.get('证据POU', '')
+            if start and start[0] in wanted:
+                self._note(start, row.get('动作描述', ''), scope, row.get('网络序号', ''),
+                           row.get('证据节点', ''), 'source_stage_candidates.csv', 3)
             if not start or not end or start[0] not in wanted or start[0] != end[0] or not scope:
                 continue
             source_id = row.get('证据节点', '')
@@ -151,6 +156,8 @@ class TraceSourceIndex:
                 }
                 record['id'] = stable_id('TE', record)
                 self.commands[start].append(record)
+                self._note(start, row.get('comment', ''), row['scope'], row['network'],
+                           row['node'], 'native_command_evidence.csv', 2)
 
         for row in _read_csv(run / 'plcopen_action_trace.csv'):
             start = _state(f"{row['state_variable']}={row['state_value']}")
@@ -165,6 +172,27 @@ class TraceSourceIndex:
                 record['id'] = stable_id('TE', record)
                 self.commands[start].append(record)
 
+        # State inventory comments remain useful even when a sampled jump spans
+        # several source transitions or its successor has not been resolved.
+        for row in _read_csv(run / 'indexed_candidates.csv'):
+            start = _state(row.get('开始标签', ''))
+            if start and start[0] in wanted and row.get('状态') != 'reset_hypothesis':
+                self._note(start, row.get('动作描述', ''), row.get('证据POU', ''), '',
+                           row.get('证据节点', ''), 'indexed_candidates.csv', 1)
+        from trace_description_context import DescriptionContext
+        self.context = DescriptionContext(run, self, wanted)
+
+    def _note(self, state, comment, scope, network, source_id, source_file, rank):
+        text = _comment_text(comment, state[1])
+        if not text:
+            return
+        item = {'text': text, 'raw': comment, 'scope': scope, 'network': network,
+                'source_id': source_id, 'source_file': source_file,
+                'priority': rank + (3 if _STEP_PREFIX.match(comment) else 0)}
+        item['id'] = stable_id('TC', item)
+        if item not in self.notes[state]:
+            self.notes[state].append(item)
+
     def _add_edge(self, variable, edge):
         self.transitions[variable, edge['from'], edge['to']].append(edge)
         self.graphs[variable][edge['scope'], edge['binding']][edge['from']].append(edge)
@@ -172,7 +200,7 @@ class TraceSourceIndex:
 
     def lookup(self, start_label, end_label, step_comment):
         start, end = _state(start_label), _state(end_label)
-        direct, path, commands, linked, eligible, refs = [], [], [], [], [], []
+        direct, path, commands, linked, eligible, refs, notes = [], [], [], [], [], [], []
         relation, description, description_source = 'unresolved', '', ''
         if start and end and start[0] == end[0]:
             variable, value = start
@@ -221,12 +249,32 @@ class TraceSourceIndex:
                     if description:
                         description_source = 'A档(源码步注释)'
                         refs = [f'step_comments.json:{start_label}']
+            # A description identifies the start state; proving a direct edge
+            # is a separate question and must not suppress an available note.
+            exact_note = _comment_text(step_comment, value)
+            notes = self.notes.get(start, [])
+            if exact_note:
+                description, description_source = exact_note, 'A档(源码步注释)'
+                refs = [f'step_comments.json:{start_label}']
+            elif not description and notes:
+                scoped = [n for n in notes if not scopes or n['scope'] in scopes] or notes
+                priority = max(n['priority'] for n in scoped)
+                best = [n for n in scoped if n['priority'] == priority]
+                if len({n['text'] for n in best}) == 1:
+                    description, description_source = best[0]['text'], 'A档(起始步源码注释)'
+                    refs = list(dict.fromkeys(n['id'] for n in best))
+            context = (self.context.packet(start, end, relation, direct, path, commands, notes)
+                       if not description else {})
+        else:
+            context = {}
         return {
             'relation': relation, 'direct': direct, 'candidate_path': path,
             'start_comment': step_comment, 'start_commands': commands, 'linked_commands': linked,
+            'start_notes': notes,
             'description': description, 'description_source': description_source,
             'description_refs': refs, 'b_evidence': eligible,
-            'basis': stable_id('TB', [start_label, end_label, direct, eligible]) if eligible else '',
+            'description_context': context,
+            'basis': context.get('basis', ''),
         }
 
 

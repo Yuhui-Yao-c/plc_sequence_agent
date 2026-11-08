@@ -2,7 +2,7 @@
 
 ## 模块层次与嵌套调用
 
-根目录含 41 个 Python 模块，另有 1 个回归测试文件；按依赖深度分 9 层（层 8 入口 → 层 0 叶子）。同层模块互不依赖，跨层只向下调用。所有命令在仓库根目录运行，模块名即文件名（裸 import）。
+根目录含 42 个 Python 模块，另有 2 个回归测试文件；按依赖深度分 9 层（层 8 入口 → 层 0 叶子）。同层模块互不依赖，跨层只向下调用。所有命令在仓库根目录运行，模块名即文件名（裸 import）。
 
 ```
 层8  入口
@@ -18,7 +18,7 @@
                    │                ├─ temporal_audit.py / extract_step_comments.py
                    │                ├─ action_describe.py ── gen_workstation_xlsx.py
                    │                └─ trace_jump_analyzer.py
-                   ├─ trace_to_pairs.py ── trace_jump_analyzer.py + trace_source_evidence.py
+                   ├─ trace_to_pairs.py ── trace_jump_analyzer.py + trace_source_evidence.py → trace_description_context.py
                    ├─ atomic_evaluation.py ── atomic_boundaries.py + pair_evaluation.py
                    ├─ gen_stepvars_xlsx.py
                    ├─ extract_variable_docs.py / extract_network_comments.py
@@ -120,7 +120,7 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 ```
 
 - 使用用户指定的输出目录。缺省为 `outputs/<源码名>`。该目录已有其他运行产物时，为本次 Trace 另选独立的空目录。
-- 默认提取全部可解析的 Trace 变量。用户指定范围时，向 `trace` 传 `--pattern "格式"`，按完整变量名匹配。需要手动重建 Sysmac 固定间隔采样时间时，可传已知的 `--sample-interval-ms`。这个值对本次命令适用，采样间隔不同且需手动指定时按采集分开运行。
+- 默认提取全部可解析的 Trace 变量。用户指定范围时，向 `trace` 传 `--pattern "格式"`。交付名使用源码所在工序目录名，如 `source/包mylar/PLC程序.xml` 输出 `包mylar_trace步序采集表.xlsx`；可显式传 `--proc-name "包mylar"` 覆盖。需要手动重建固定间隔时间时，可传已知的 `--sample-interval-ms`；不同间隔需手动指定时按采集分开运行。
 
 **Sysmac 目录和时长口径**
 
@@ -131,7 +131,7 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 **执行与续跑**
 
 1. 使用 `plc-trace-jump-analysis` 的输入格式、跳变和审计规则。其预测对匹配与平均时长回填属于入口一的 `predict --trace`。入口四的 `trace_collection_pairs.csv` 保留原始观测对，`trace_source_evidence.json` 分开记录源码直跳、静态候选路径和待核验关系。候选路径中的中间步及耗时需要独立验证。
-2. A 档使用对齐的源码注释。仅对缺 A 档且能在本网络定位主指令证据的行生成 B 档批次。处理 `batches_desc/*.input.json` 时加载 `plc-action-description` 的 Trace 协议，逐行回传 `basis`、主指令引用及候选描述，或填写证据不足原因。其余行保留观测对并列入复核。
+2. A 档优先使用完整状态变量和起始步对应的源码注释；即使观测跨步或迁移尚未对齐，也填写已知起始步注释并保留迁移复核。全部缺 A 档的行进入 `trace-description-context-v2` 批次。加载 `plc-action-description` 的 Trace 协议，综合本步指令实参、源码控制关系、邻步注释、调用关联、变量映射及同工程命名族记忆，逐行回传 `basis`、多条证据引用、中文描述与 `reasoning`，或明确证据不足原因。B 档推断和源码注释分开标识。
 3. 使用相同源码、Trace、变量范围和输出目录执行 `plc_cli.py trace ... --force`。程序保留 B 档结果，重建证据并校验每个结果的 `basis`。输入变动时另开输出目录。入口一的预测批次由 `finish` 合并。
 
 ```powershell

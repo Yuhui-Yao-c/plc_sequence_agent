@@ -16,6 +16,7 @@ merged here — they have different semantics from their namesakes.
 import json
 import os
 import re
+from pathlib import PurePosixPath
 
 
 def load_station_identity(run: str) -> dict:
@@ -36,26 +37,41 @@ def load_station_identity(run: str) -> dict:
 
 
 def infer_proc_name(source: str, run: str = None, proc_name: str = None) -> str:
-    """Infer process name from source filename, run dir name, or explicit override.
-
-    Priority: proc_name > source filename (last Chinese segment) > run dir name.
-    Strips _YYYYMMDD and _vN suffixes.
-    """
+    """Prefer the named source folder, then meaningful names, never 'PLC程序'."""
     if proc_name:
-        return proc_name
-    base = ''
+        name = str(proc_name).strip()
+        if not name or re.search(r'[<>:"/\\|?*\x00-\x1f]', name) or name in ('.', '..'):
+            raise ValueError('工序名称须为有效文件名，不能包含路径分隔符')
+        return name
+    generic = {'source', 'sources', 'src', 'input', 'inputs', 'output', 'outputs',
+               'data', 'project', 'repo', '工程', '源码', '程序', '工序', 'xml', 'plc'}
+    def clean(name):
+        name = re.sub(r'\.(xml|smc2|txt)$', '', name, flags=re.I)
+        name = re.sub(r'(?:[_ -]?\d{8,14})$', '', name)
+        name = re.sub(r'[_ -]v\d+(?:\.\d+)*$', '', name, flags=re.I)
+        return re.sub(r'[_ -]trace$', '', name, flags=re.I).strip(' _-.')
+    source_name = ''
     if source:
-        base = os.path.basename(source)
-        base = re.sub(r'\.(xml|smc2|txt)$', '', base, flags=re.I)
-        base = re.sub(r'_\d{8}$', '', base)
-        base = re.sub(r'_v\d+$', '', base, flags=re.I)
-        segs = re.findall(r'[\u4e00-\u9fff]+', base)
+        path = PurePosixPath(str(source).replace('\\', '/'))
+        parent = clean(path.parent.name)
+        if parent and parent.casefold() not in generic and (
+                re.search(r'[\u4e00-\u9fff]', parent) or path.parent.parent.name.casefold() in generic):
+            return parent
+        source_name = clean(path.name)
+        meaningful = re.sub(r'(?:PLC\s*)?(?:程序|工程|源码)|PLC', '', source_name, flags=re.I).strip(' _-.')
+        parts = [s for s in re.split(r'[_\s]+', meaningful) if re.search(r'[\u4e00-\u9fff]', s)]
+        if parts:
+            return parts[-1]
+        segs = [s for s in re.findall(r'[\u4e00-\u9fff]+', source_name)
+                if s.casefold() not in generic and s not in ('程序', '工程', '源码')]
         if segs:
-            base = segs[-1]
-    if not base and run:
-        base = os.path.basename(os.path.normpath(run))
-        base = re.sub(r'_v\d+$', '', base, flags=re.I)
-    return base or '工序'
+            return segs[-1]
+    if run:
+        name = clean(PurePosixPath(str(run).replace('\\', '/')).name)
+        if name and name.casefold() not in generic:
+            return name
+    source_name = re.sub(r'(?:PLC\s*)?(?:程序|工程|源码)|PLC', '', source_name, flags=re.I).strip(' _-.')
+    return source_name or '工序'
 
 
 def em_sort_key_prefixed(name: str):

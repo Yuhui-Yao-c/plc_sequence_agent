@@ -16,6 +16,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_workstation_xlsx import load_action_map, var_of, load_var_docs
 from trace_source_evidence import RELATION_TEXT, read_trace_evidence
+from trace_description_context import SCHEMA as TRACE_CONTEXT_SCHEMA, validate_context_result
 
 WORDBOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'action_wordbook.json')
 DASH_RE = re.compile(r'^[—…\-–\s]*$')
@@ -416,32 +417,45 @@ def cmd_build(run, batch_size=40):
 
 
 def _build_trace_batches(df, outdir, evidence, batch_size):
+    if batch_size < 1:
+        raise ValueError('B档batch_size须大于0')
     rows = []
     for _, row in df.iterrows():
         key = f"{row['开始标签']}|||{row['结束标签']}"
         info = evidence.get(key, {})
-        if not info.get('b_evidence'):
-            continue
+        context = info.get('description_context', {})
+        if not context:
+            raise ValueError('Trace描述上下文缺失，请先用当前版本重跑trace以生成证据包')
         rows.append({
             'id': key, 'basis': info['basis'], 'start': row['开始标签'], 'end': row['结束标签'],
-            'direct_source': info['direct'], 'command_evidence': info['b_evidence'],
+            'direct_source': info['direct'], 'command_evidence': info['start_commands'],
+            'context': context,
         })
+    chunks, chunk, size = [], [], 0
+    for row in rows:
+        row_size = len(json.dumps(row, ensure_ascii=False))
+        if chunk and (len(chunk) >= batch_size or size + row_size > 80_000):
+            chunks.append(chunk); chunk, size = [], 0
+        chunk.append(row); size += row_size
+    if chunk:
+        chunks.append(chunk)
     count = 0
-    for offset in range(0, len(rows), batch_size):
-        count += 1
+    for count, chunk in enumerate(chunks, 1):
         payload = {
-            'batch_id': count, 'schema': 'trace-description-evidence-v1',
-            'rows': rows[offset:offset + batch_size],
+            'batch_id': count, 'schema': TRACE_CONTEXT_SCHEMA,
+            'rows': chunk,
             'task': (
-                '按本行指令和门控归纳一句不超过30字的中文候选描述。'
-                '保留basis，evidence_refs填写一条主指令ID，kind与该指令一致，'
-                '描述包含该指令的operation。仅以description_comment支持方向、工艺和完成状态。'
-                '证据不足时返回ok=false及reason。'
+                '为起始步生成一句不超过40字的中文动作或等待描述。'
+                '综合context.evidence中的本步调用、实参、控制关系、源码邻接注释、中文映射及工程记忆。'
+                '静态路径不等于采样间实际执行路径；邻步注释只作上下文。'
+                '同类命名示例可辅助判断机构类别，方向和目标位须有本步证据或精确映射。'
+                '保留basis，evidence_refs引用context.evidence的ID，可引用多条；'
+                '回传kind及reasoning说明本步依据和推断限制。证据仍不足时返回ok=false及reason。'
             ),
         }
         path = outdir / f'batch_{count:03d}.input.json'
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
-    print(f'Trace B档: {len(rows)}行具备指令证据，{count}批，另有{len(df) - len(rows)}行待核验')
+    print(f'Trace B档: 全部{len(rows)}行缺注释状态对进入上下文描述，{count}批')
     return count
 
 
@@ -487,6 +501,8 @@ def _trace_results(run):
 
 
 def _validate_trace_result(result, evidence, allowed):
+    if evidence.get('description_context'):
+        return validate_context_result(result, evidence['description_context'])
     if not isinstance(result, dict) or result.get('basis') != evidence['basis']:
         return None, 'B档证据版本不匹配'
     if result.get('ok') is not True:
@@ -516,6 +532,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
     counts.update(a_sourced=0, b_candidates=0, unresolved_rows=0, b_tier_pending_rows=0)
     rows, review = [], []
     for row in a.to_dict('records'):
+        candidate = {}
         key = f"{row['开始标签']}|||{row['结束标签']}"
         info = evidence.get(key, {})
         desc, kind, refs = info.get('description', ''), row['行性质'], info.get('description_refs', [])
@@ -524,7 +541,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
         if desc:
             counts['a_sourced'] += 1
             status = '源码注释'
-        elif info.get('b_evidence'):
+        elif info.get('description_context') or info.get('b_evidence'):
             if key not in results:
                 status, reason = 'B档待处理', '缺少本行B档结果'
                 counts['b_tier_pending_rows'] += 1
@@ -532,7 +549,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
                 candidate, reason = _validate_trace_result(results[key], info, allowed)
                 if candidate:
                     desc, kind, refs = candidate['desc'], candidate['kind'], candidate['refs']
-                    source, status = 'B档(证据归纳待核)', 'B档归纳待核验'
+                    source, status = 'B档(上下文推断)', 'LLM推断待核验'
                     reason = 'B档引用通过，工艺语义待核验'
                     counts['b_candidates'] += 1
                 else:
@@ -546,16 +563,20 @@ def _validate_trace(run, a, evidence, allowed, stats):
         rows.append({
             **record, '动作描述': desc, '行性质': kind, '描述来源': source,
             '描述状态': status, '证据引用': '; '.join(refs),
+            '推断依据': candidate.get('reasoning', '') if status == 'LLM推断待核验' else '',
+            '证据等级': candidate.get('evidence_level', '') if status == 'LLM推断待核验' else '源码注释' if desc else '',
         })
         if reason:
             review.append({**record, '描述状态': status, '原因': reason})
     fields = ['行号', '开始标签', '结束标签', '动作变量']
     out = run / 'action_desc_final.csv'
-    pd.DataFrame(rows, columns=fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用']).to_csv(
+    pd.DataFrame(rows, columns=fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用', '推断依据', '证据等级']).to_csv(
         out, index=False, encoding='utf-8-sig')
     pd.DataFrame(review, columns=fields + ['描述状态', '原因']).to_csv(
         run / 'action_desc_review.csv', index=False, encoding='utf-8-sig')
     counts['description_review_count'] = len(review)
+    counts['description_total'] = len(rows)
+    counts['description_filled'] = counts['a_sourced'] + counts['b_candidates']
     if stats is not None:
         stats.update(counts)
     print(f'Trace动作描述: 源码注释{counts["a_sourced"]}行，B档候选{counts["b_candidates"]}行，'

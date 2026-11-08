@@ -27,7 +27,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-from utils import load_station_identity
+from utils import load_station_identity, infer_proc_name
 
 
 def clean_doc(text: str) -> str:
@@ -354,11 +354,17 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     group_by='auto' picks 构成要素 for SC04 naming, else 证据POU when available.
     out/proc_name default like the CLI: <proc_name>_步序采集表.xlsx beside the prediction.
     Raises ValueError on missing columns (caller decides how to report)."""
-    proc_name = proc_name or re.sub(r'_v\d+$', '', os.path.basename(os.path.normpath(os.path.dirname(prediction)))) or '工序'
-    if not out:
-        out = os.path.join(os.path.dirname(prediction), f'{proc_name}_步序采集表.xlsx')
     run = run or os.path.dirname(prediction)
     is_trace = sheet == 'trace步序采集表' or os.path.basename(prediction) == 'trace_collection_pairs.csv'
+    if is_trace and not proc_name:
+        summary_path = os.path.join(run, 'trace_pairs_summary.json')
+        if os.path.isfile(summary_path):
+            with open(summary_path, encoding='utf-8-sig') as stream:
+                proc_name = json.load(stream).get('proc_name')
+    proc_name = infer_proc_name(None, run, proc_name)
+    if not out:
+        suffix = 'trace步序采集表' if is_trace else '步序采集表'
+        out = os.path.join(os.path.dirname(prediction), f'{proc_name}_{suffix}.xlsx')
     amap = {} if is_trace else load_action_map(run)
     # 动作描述（A档模板/B档LLM工艺语义，action_describe.py 产物；存在则升级 col C）
     # v9.19: fallback chain: action_desc_final.csv (B+A merged) -> action_desc_a.csv (A only)
@@ -381,7 +387,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             desc_text = '' if pd.isna(desc_text) or str(desc_text).strip().lower() in ('nan', 'none') else str(desc_text).strip()
             desc_map[(str(r['开始标签']), str(r['结束标签']))] = (
                 desc_text, vt, str(r.get('行性质', '')), str(r.get('描述来源', 'A档(源码模板)')),
-                cell_str(r.get('描述状态', '')))
+                cell_str(r.get('描述状态', '')), cell_str(r.get('推断依据', '')),
+                cell_str(r.get('证据等级', '')))
         desc_stats = dd['描述来源'].value_counts().to_dict()
     df = pd.read_csv(prediction, dtype=str, encoding='utf-8-sig')
     for col in ('开始标签', '结束标签'):
@@ -605,6 +612,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
                 desc_entry = desc_map.get(rt_key)
                 desc_status = desc_entry[4] if desc_entry else ''
                 trace_needs_review = row.get('源码关系') != 'direct' or desc_status != '源码注释'
+                if desc_entry and desc_entry[5]:
+                    remark_parts.append(f'{desc_entry[6]}：{desc_entry[5]}')
                 if trace_needs_review:
                     trace_review_rows += 1
                     remark_parts.append(f'【{desc_status or "描述待核验"}】')

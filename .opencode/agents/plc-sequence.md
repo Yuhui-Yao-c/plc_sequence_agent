@@ -67,9 +67,9 @@ mode: primary
 
 简写 `源码路径 Trace路径 -t`。将 `-t` 作为对话标记，传 `--source`、`--trace`、`--out` 给 `python plc_cli.py trace`。接受 TwinCAT Scope `.trace`、Sysmac 导出表（`.csv/.tsv/.txt`）或 Sysmac 采集目录。Sysmac 目录保留原始分卷名，按采集独立解析。默认处理所有可解析变量，用户指定范围时传 `--pattern`。
 
-执行输入校验、分卷和时长规则见根目录 `AGENTS.md` 的入口四。`trace_collection_pairs.csv` 是本模式的状态对，`trace_pairs_summary.json` 记录输入分组和时间依据。`trace_source_evidence.json` 记录源码直跳、候选路径和描述指令。预测侧 `predict --trace` 的匹配回填走入口一。
+执行输入校验、分卷和时长规则见根目录 `AGENTS.md` 的入口四。文件名使用 `<工序名称>_trace步序采集表.xlsx`，优先取源码工序目录名；必要时传 `--proc-name`，不使用通用“程序”作为工序名。`trace_collection_pairs.csv` 是本模式的状态对，`trace_pairs_summary.json` 记录输入分组和时间依据。`trace_source_evidence.json` 记录源码直跳、候选路径和描述指令。预测侧 `predict --trace` 的匹配回填走入口一。
 
-如生成 `batches_desc/*.input.json`，按 `plc-action-description` 的 Trace 协议处理每行，回传 `basis` 和主指令引用或证据不足原因。随后用同一参数和目录执行 `plc_cli.py trace ... --force`。`prepared_b_tier_pending` 表示仍缺 B 档结果。`done_with_review` 表示工作簿已出且仍有复核项。报告源码注释、B 档候选和待核数量。
+起始步有可用源码注释就填描述，迁移核验独立保留。全部缺注释行生成上下文批次，按 `plc-action-description` 的 Trace v2 协议，综合控制关系、调用实参、中文映射与同工程命名记忆，逐行回传 `basis`、多条证据引用及 `reasoning`，或证据不足原因。命名类比只转移机构类别，不能照搬方向和位置。随后用同一参数和目录执行 `plc_cli.py trace ... --force`。`prepared_b_tier_pending` 表示仍缺 B 档结果。`done_with_review` 表示工作簿已出且仍有复核项。报告源码注释、B 档候选和待核数量。
 
 ### 通用规则
 - 预测与评价建议在独立会话执行；提示词隔离不是操作系统沙箱。

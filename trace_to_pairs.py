@@ -884,6 +884,8 @@ def generate(trace_path, run, source=None, proc_name=None,
         n_cycles = len(pair_cycles[key])
 
         remark = [RELATION_TEXT[relation]]
+        if evidence['description'] and relation != 'direct':
+            remark.append('描述取起始步源码注释；迁移关系另行核验')
         if to_int == 0:
             remark.append('返回步0')
         estimated_count = pair_estimated.get(key, 0)
@@ -897,8 +899,8 @@ def generate(trace_path, run, source=None, proc_name=None,
         review_type, review_note = '', ''
         if relation != 'direct':
             review_type, review_note = relation, RELATION_TEXT[relation]
-        elif not evidence['description'] and not evidence['b_evidence']:
-            review_type, review_note = 'description_evidence_missing', '缺少可用于描述的本网络证据'
+        elif not evidence['description']:
+            review_type, review_note = 'description_pending', '无步注释，等待LLM综合上下文描述'
             remark.append(review_note)
         if review_type:
             review_rows.append({
@@ -980,6 +982,7 @@ def generate(trace_path, run, source=None, proc_name=None,
             'cycles': str(run / 'trace_cycles.json'),
             'review': str(run / 'trace_pairs_review.csv'),
             'source_evidence': str(run / EVIDENCE_FILE),
+            'semantic_memory': str(run / 'trace_semantic_memory.json'),
             'summary': str(run / 'trace_pairs_summary.json'),
         },
     }
