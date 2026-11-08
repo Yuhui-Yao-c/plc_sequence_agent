@@ -1,4 +1,4 @@
-# PLC Sequence Agent v9.28
+# PLC Sequence Agent
 
 PLC 步序采集 Agent：从 PLC 源码（PLCopen / 欧姆龙 IEC61131-10 / SMC2）和运行时 trace
 中提取状态迁移对，生成步序采集表、动作描述与时长回填。
@@ -15,6 +15,12 @@ PLC 步序采集 Agent：从 PLC 源码（PLCopen / 欧姆龙 IEC61131-10 / SMC2
 | trace步序采集 | `XML地址 trace地址 -t` | `python plc_cli.py trace --source ... --trace ... --out ... [--pattern ...] [--force]` |
 
 详见 `AGENTS.md`（权威规则源）。
+
+当前修订为 2026-11-08 离线同步汇总。`VERSION` 保留原迁移包的 `9.28.0` 标识；源码修订以 Git 提交和 `CHANGELOG.md` 为准。
+
+从离线包升级时，按汇总提交更新全部变更文件，并使用新的输出目录运行原来的 `plc_cli.py trace` 命令。对话简写 `源码路径 Trace路径 -t` 保持不变；变量清单使用完整 `predict --tagvars` 命令。Trace 首次运行后按 `workflow_status.json` 处理当前 B 档输入，再用相同参数加 `--force` 续跑。旧 B 档结果缺少当前证据的 `basis`，需要重新生成。
+
+`prepared_b_tier_pending` 表示仍有未回答的 B 档行；`done_with_review` 表示交付表已生成且仍有源码或描述待核项。动作描述填充率和格式校验通过率不能作为语义准确率。
 
 ## 安装
 
@@ -49,14 +55,14 @@ coverage : 预测CSV + 人工表 → 覆盖率评价（只读）
 
 ## 模块结构
 
-运行时核心 39 个 .py，按依赖层次组织（详见 `AGENTS.md` 模块概览章节）：
+根目录含 41 个 Python 模块，另有 1 个回归测试文件，按依赖层次组织（详见 `AGENTS.md` 模块概览章节）：
 
 - **入口/编排**：`plc_cli.py` `workflow.py` `agent.py`
 - **源码解析**：`omron_native.py` `smc2_*.py` `plcopen_*.py` `source_*.py` `extract_*.py`
 - **边界/候选**：`boundary_*.py` `atomic_*.py` `candidate_filter.py` `recall.py` `successor_graph.py`
 - **合并/后继**：`signal_tail_merge.py` `fb_transport.py` `feedback_successor.py`
 - **动作描述/交付**：`action_describe.py` `gen_*_xlsx.py` `station_identity.py`
-- **trace**：`trace_jump_analyzer.py` `trace_to_pairs.py`
+- **trace**：`trace_jump_analyzer.py` `trace_to_pairs.py` `trace_source_evidence.py`
 - **评价**：`pair_evaluation.py` `atomic_evaluation.py` `评价器/gen_coverage_*.py`
 
 ## Skills

@@ -1,4 +1,32 @@
 # 变更记录（CHANGELOG）
+
+## 2026-11-08 离线版同步汇总
+
+本次把离线工程需要同步的修订集中为一个提交。恢复基线为 `c39ae381237ef5705b2f8065e549a41cb2e387e3`，功能实现取自 `ba626b8fea6766b733ee7b496dc175e3deb34830`，保留离线版 `源码路径 Trace路径 -t` 的对话入口。
+
+### 内容
+
+- 保留 Sysmac 原始文件名采集分组、独立时间和索引、通道并集、缺口切断及估算时长审计；继续支持原有 TwinCAT Scope `.trace`。
+- 增加 `trace_source_evidence.py`：区分源码直跳、候选路径和待核关系，按精确状态变量及作用域关联本网络注释和指令。观测中间步未被采到时，保留原观测对，静态候选路径另记证据。
+- 同步 `trace_to_pairs.py`、`action_describe.py`、`plc_cli.py` 和 `gen_workstation_xlsx.py`。Trace B 档结果校验 `basis`、主指令引用及批次行完整性；无充分证据时留空并进入复核。B 档接受项标为证据归纳候选，完成状态区分待处理和已交付待复核。
+- 保留 `workflow.py` 的控制器正则预编译优化，以及 CLI 阶段进度输出。
+- 统一 `AGENTS.md`、`.opencode/agents/plc-sequence.md`、动作描述及 Trace 跳变分析规则。对话 `-t` 只选入口四；完整 CLI 的 `predict -t` 保留兼容别名，变量清单推荐显式 `--tagvars`。
+- 新增 `test_trace_to_pairs.py`，更新 README 的升级说明和模块清单。
+
+### 升级要求
+
+按本提交更新全部变更文件，使用新的输出目录运行 `python plc_cli.py trace --source ... --trace ... --out ...`。旧 `batches_desc/*.result.json` 需按当前输入重新生成；新结果完成后以同一组参数加 `--force` 续跑。运行输入、输出和本地 `node_modules` 不属于本次代码提交。
+
+`VERSION` 沿用原迁移包 `9.28.0`，本次同步以提交及本日期记录标识。`trace_collection_pairs.csv` 增加源码关系，另输出 `trace_source_evidence.json`；下游应按列名读取，不能依赖固定列序或将 `done_with_review` 当作无待核项。
+
+### 验证与范围
+
+- 8 项回归测试通过，覆盖 Sysmac 采集分组、独立计时、通道筛选、缺口、改名归组、分卷冲突、源码候选路径及描述证据校验。
+- 真实 8 个 CSV、4 次采集、75110 个样本：升级前后均为 33908 次跳变、928 个唯一状态对；逐对发生次数和时长统计一致。源码注释描述从 0 行增加到 221 行。
+- 原有 `.trace` 样本：升级前后均为 1921 次跳变、174 个唯一状态对；逐对发生次数和时长统计一致。
+- 上述验证复用了同一批已提取源码证据；本次汇总未重新运行完整大 XML 解析或完整 25 个 CSV，也没有人工逐行标注的动作描述准确率结果。
+
+---
 > 合并自 v3 ~ v9.28 的分版 CHANGELOG，最新版本在前。
 
 

@@ -358,7 +358,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     if not out:
         out = os.path.join(os.path.dirname(prediction), f'{proc_name}_步序采集表.xlsx')
     run = run or os.path.dirname(prediction)
-    amap = load_action_map(run)
+    is_trace = sheet == 'trace步序采集表' or os.path.basename(prediction) == 'trace_collection_pairs.csv'
+    amap = {} if is_trace else load_action_map(run)
     # 动作描述（A档模板/B档LLM工艺语义，action_describe.py 产物；存在则升级 col C）
     # v9.19: fallback chain: action_desc_final.csv (B+A merged) -> action_desc_a.csv (A only)
     desc_map = {}
@@ -379,14 +380,15 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             desc_text = r.get('动作描述', '')
             desc_text = '' if pd.isna(desc_text) or str(desc_text).strip().lower() in ('nan', 'none') else str(desc_text).strip()
             desc_map[(str(r['开始标签']), str(r['结束标签']))] = (
-                desc_text, vt, str(r.get('行性质', '')), str(r.get('描述来源', 'A档(源码模板)')))
+                desc_text, vt, str(r.get('行性质', '')), str(r.get('描述来源', 'A档(源码模板)')),
+                cell_str(r.get('描述状态', '')))
         desc_stats = dd['描述来源'].value_counts().to_dict()
     df = pd.read_csv(prediction, dtype=str, encoding='utf-8-sig')
     for col in ('开始标签', '结束标签'):
         if col not in df.columns:
             raise ValueError(f'prediction file lacks column: {col}')
     if group_by == 'auto':
-        group_by = pick_group_by(df)
+        group_by = '构成要素' if is_trace and '构成要素' in df else pick_group_by(df)
     if group_by not in df.columns:
         raise ValueError(f'prediction file lacks column: {group_by} (needed by --group-by {group_by})')
     df['_变量'] = df['开始标签'].map(var_of)
@@ -416,7 +418,10 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         return _em_sort_key(row.get('_工位', ''))
     df['_工位序'] = df.apply(_row_sort, axis=1)
     df = df.sort_values(['_工位序', '_变量', '_序'], kind='mergesort').reset_index(drop=True)
-    hits = sum(1 for _, row in df.iterrows() if step_text(row, amap).startswith('动作变量'))
+    if is_trace:
+        hits = sum(bool(cell_str(value).strip()) for value in df.get('动作变量', []))
+    else:
+        hits = sum(1 for _, row in df.iterrows() if step_text(row, amap).startswith('动作变量'))
 
     # v9.18: blind-spot flags for human review highlighting.
     #   A=动作描述不完整(有动作变量但描述是模板文本)  -> 浅黄
@@ -498,7 +503,9 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     # v9.29: detect B-tier not processed (input.json exists but no result.json).
     # When True, rows with empty descriptions get 【B档未处理】 in the remark column.
     b_tier_pending = False
-    if run:
+    if is_trace:
+        b_tier_pending = any(row[4] == 'B档待处理' for row in desc_map.values())
+    elif run:
         bd = os.path.join(run, 'batches_desc')
         if os.path.isdir(bd):
             _bd_files = os.listdir(bd)
@@ -513,7 +520,13 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
               + (f' 备注列标记【待复核】=动作描述待完善(A={blind_counts["A"]})。'
                  if (blind_counts["A"]) else '')
               + (f' 【B档未处理】=动作描述B档待agent补充，请处理后重跑。' if b_tier_pending else ''))
-    ws.cell(row=1, column=2, value=f'{proc_name} 步序采集表（预测交付）').font = hfont
+    title = 'Trace观测交付' if is_trace else '预测交付'
+    if is_trace:
+        a_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('A档'))
+        b_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('B档'))
+        note = (f'{proc_name} | {len(df)}个观测状态对 | 源码注释{a_rows}行 | B档归纳待核{b_rows}行 | '
+                '时长为起始状态观测停留中位数，行时长合计仅供表内汇总。源码关系、估算和复核见备注。')
+    ws.cell(row=1, column=2, value=f'{proc_name} 步序采集表（{title}）').font = hfont
     nc = ws.cell(row=2, column=2, value=note)
     nc.font = nfont
     nc.alignment = left
@@ -535,7 +548,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             return d[0], d[1], d[3].startswith('B档')
         # No desc_map entry — use step_text only for the 动作变量 column (引用),
         # but leave the description itself empty (no variable names in desc column).
-        stxt = step_text(row, amap)
+        stxt = cell_str(row.get('动作变量', '')) if is_trace else step_text(row, amap)
         return '', stxt, False
 
     df['_dtxt'] = None
@@ -549,7 +562,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         df.at[i, '_vtxt'] = vtxt
 
     # v9.18: load network comments for the 备注 column
-    nc_map = load_network_comments(run)
+    nc_map = {} if is_trace else load_network_comments(run)
     # v9.23: trace_rt already loaded above (before note construction).
 
     r = 4
@@ -560,6 +573,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     data_align = Alignment(horizontal='left', vertical='center', wrap_text=False)
     center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
     total_fill = PatternFill('solid', start_color='F0F0F0')
+    trace_review_rows = 0
     for wsname, g in df.groupby('_工位', sort=False):
         b0 = r
         block_dur_sum = 0
@@ -583,6 +597,17 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             ws.cell(row=r, column=7, value=row['结束标签'])
             # 备注：网络注释（取最具体的1条）+ 待复核标记
             remark_parts = []
+            trace_needs_review = False
+            if is_trace:
+                remark = cell_str(row.get('备注', '')).strip()
+                if remark:
+                    remark_parts.append(remark)
+                desc_entry = desc_map.get(rt_key)
+                desc_status = desc_entry[4] if desc_entry else ''
+                trace_needs_review = row.get('源码关系') != 'direct' or desc_status != '源码注释'
+                if trace_needs_review:
+                    trace_review_rows += 1
+                    remark_parts.append(f'【{desc_status or "描述待核验"}】')
             if nc_map:
                 comp = str(row.get('构成要素', '') or '')
                 best_nc = ''
@@ -602,7 +627,9 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             if needs_review:
                 remark_parts.append('【待复核】')
             # v9.29: B档未处理标记——有动作变量但描述为空且B档待agent补充
-            if b_tier_pending and not str(row['_dtxt']).strip() and str(row['_vtxt']).strip() and str(row['_vtxt']) not in ('nan', 'None'):
+            legacy_b_pending = (not is_trace and b_tier_pending and not str(row['_dtxt']).strip()
+                                and str(row['_vtxt']).strip() and str(row['_vtxt']) not in ('nan', 'None'))
+            if legacy_b_pending:
                 remark_parts.append('【B档未处理】')
             if remark_parts:
                 ws.cell(row=r, column=8, value=' | '.join(remark_parts))
@@ -613,13 +640,13 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
                 c.border = border
                 c.alignment = center_align if j == 2 else data_align
             # 待复核行/B档未处理行的备注列用红色字体
-            if needs_review or (b_tier_pending and not str(row['_dtxt']).strip() and str(row['_vtxt']).strip() and str(row['_vtxt']) not in ('nan', 'None')):
+            if needs_review or trace_needs_review or legacy_b_pending:
                 ws.cell(row=r, column=8).font = Font(name='Arial', size=9, color='FF0000', bold=True)
             # 统一行高
             ws.row_dimensions[r].height = 18
             r += 1
         # 块尾"总时长"行
-        ws.cell(row=r, column=3, value='总时长')
+        ws.cell(row=r, column=3, value='行时长合计' if is_trace else '总时长')
         # v9.23: 有trace数据时填入该工位组时长合计
         if has_trace_dur:
             ws.cell(row=r, column=4, value=block_dur_sum)
@@ -648,10 +675,10 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     return {'proc_name': proc_name, 'rows': len(df), 'action_variable_rows': hits,
             'workstation_groups': len(blocks), 'group_by': group_by,
             'b_desc_rows': _bcount if desc_stats else None, 'desc_sources': desc_stats,
-            'blind_spot_counts': blind_counts,
             'b_tier_pending': b_tier_pending,
             'source_sha16': sha16, 'amap_keys': len(amap), 'out': out,
-            'trace_duration_backfilled': bool(trace_rt)}
+            'trace_duration_backfilled': bool(trace_rt),
+            **({'trace_review_rows': trace_review_rows} if is_trace else {'blind_spot_counts': blind_counts})}
 
 
 def main():

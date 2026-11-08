@@ -10,13 +10,22 @@ B档=LLM工艺语义增强（批次机制+白名单校验+A档兜底）。
   python action_describe.py validate --run outputs/X    # 校验合并 -> action_desc_final.csv + action_desc_review.csv
 """
 import argparse, json, os, re, sys, glob
+from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_workstation_xlsx import load_action_map, var_of, load_var_docs
+from trace_source_evidence import RELATION_TEXT, read_trace_evidence
 
 WORDBOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'action_wordbook.json')
 DASH_RE = re.compile(r'^[—…\-–\s]*$')
+_A_FIELDS = ['行号', '开始标签', '结束标签', '动作变量', 'A档描述', '行性质']
+_TRACE_DETAIL = re.compile(r'焊接|伸出|缩回|上升|下降|夹紧|松开|正转|反转|到位|完成')
+
+
+def _tokens(value):
+    return [s for item in str(value).split(';')
+            if (s := item.strip()) and s.casefold() not in ('nan', 'none')]
 
 
 def load_wb():
@@ -255,10 +264,6 @@ def clean_step_comment(raw: str):
 
 
 def cmd_a(run):
-    wb = load_wb()
-    docs = load_full_docs(run)
-    amap = load_action_map(run)
-    sc_map = load_step_comments(run)  # v9.21: step_comments.json
     # v9.24: read prediction_collection_pairs.csv (available after predict,
     # before finish) so A-tier can be generated in the predict phase.
     # Fallback to final_prediction_pairs.csv for older runs that only have it.
@@ -269,7 +274,28 @@ def cmd_a(run):
         src_csv = os.path.join(run, 'prediction_collection_pairs.csv')
     if not os.path.exists(src_csv):
         src_csv = os.path.join(run, 'final_prediction_pairs.csv')
-    df = pd.read_csv(src_csv, dtype=str, encoding='utf-8-sig')
+    df = pd.read_csv(src_csv, dtype=str, encoding='utf-8-sig', keep_default_na=False)
+    trace_evidence = read_trace_evidence(run)
+    p = os.path.join(run, 'action_desc_a.csv')
+    if trace_evidence is not None:
+        rows = []
+        for i, r in df.iterrows():
+            key = f"{r['开始标签']}|||{r['结束标签']}"
+            evidence = trace_evidence.get(key, {})
+            desc = evidence.get('description', '')
+            rows.append({
+                '行号': i, '开始标签': r['开始标签'], '结束标签': r['结束标签'],
+                '动作变量': r.get('动作变量', ''), 'A档描述': desc,
+                '行性质': '源码步序' if desc else '待核验',
+            })
+        pd.DataFrame(rows, columns=_A_FIELDS).to_csv(p, index=False, encoding='utf-8-sig')
+        print(f"Trace A档: {sum(bool(r['A档描述']) for r in rows)}/{len(rows)}行有对齐源码注释")
+        return p
+
+    wb = load_wb()
+    docs = load_full_docs(run)
+    amap = load_action_map(run)
+    sc_map = load_step_comments(run)
     rows = []
     n_step_json = 0   # descriptions from step_comments.json (source ST // comments)
     n_csv_comment = 0  # descriptions from CSV 动作描述 column (codesys step comments)
@@ -304,8 +330,7 @@ def cmd_a(run):
                 n_empty += 1
         rows.append({'行号': i, '开始标签': s, '结束标签': e,
                      '动作变量': '; '.join(toks), 'A档描述': desc, '行性质': kind})
-    out = pd.DataFrame(rows)
-    p = os.path.join(run, 'action_desc_a.csv')
+    out = pd.DataFrame(rows, columns=_A_FIELDS)
     out.to_csv(p, index=False, encoding='utf-8-sig')
     stat = out['行性质'].value_counts().to_dict() if '行性质' in out.columns and len(out) > 0 else {}
     print(f'A档完成: {len(out)}行 -> {p}')
@@ -316,20 +341,26 @@ def cmd_a(run):
 
 def cmd_build(run, batch_size=40):
     p = os.path.join(run, 'action_desc_a.csv')
-    df = pd.read_csv(p, dtype=str, encoding='utf-8-sig')
+    df = pd.read_csv(p, dtype=str, encoding='utf-8-sig', keep_default_na=False)
     # v9.21: only build B-tier batches for rows where A-tier description is empty
     # (i.e. no step comment was found).  Rows with step comments keep their A-tier desc.
     df = df[df['A档描述'].fillna('').str.strip() == ''].reset_index(drop=True)
+    outdir = Path(run) / 'batches_desc'
+    outdir.mkdir(exist_ok=True)
+    # Rebuild only the inputs. Results are matched to the current batch and source basis.
+    for f in outdir.glob('*.input.json'):
+        f.unlink()
+    trace_evidence = read_trace_evidence(run)
+    if trace_evidence is not None:
+        return _build_trace_batches(df, outdir, trace_evidence, batch_size)
     if len(df) == 0:
         print(f'B档批次: 0行需LLM补充（全部有步注释）')
-        outdir = os.path.join(run, 'batches_desc')
-        os.makedirs(outdir, exist_ok=True)
         return 0
     docs = load_full_docs(run)
     wb = load_wb()
     sc_map = load_step_comments(run)
     # 跨行上下文：全表相邻行（工位+A档描述+步注释）
-    full = pd.read_csv(p, dtype=str, encoding='utf-8-sig')
+    full = pd.read_csv(p, dtype=str, encoding='utf-8-sig', keep_default_na=False)
     ctx = []
     for _, r in full.iterrows():
         ws = classify_root_word(str(r['开始标签']).split('.')[0], docs, wb)[0]
@@ -338,13 +369,6 @@ def cmd_build(run, batch_size=40):
         start_sc = sc_map.get(str(r['开始标签']), '')
         end_sc = sc_map.get(str(r['结束标签']), '')
         ctx.append({'ws': ws, 'a': a_desc, 'sc': start_sc or end_sc})
-    outdir = os.path.join(run, 'batches_desc')
-    os.makedirs(outdir, exist_ok=True)
-    # v9.22: do NOT delete existing result.json — finish re-runs cmd_build()
-    # each time, and agent's results must survive until cmd_validate() merges them.
-    # Only clear stale input.json (they are regenerated every time).
-    for f in glob.glob(os.path.join(outdir, '*.input.json')):
-        os.remove(f)
     nb = 0
     for bi in range(0, len(df), batch_size):
         chunk = df.iloc[bi:bi + batch_size]
@@ -357,7 +381,7 @@ def cmd_build(run, batch_size=40):
             # v9.29: id uses stable label key "start|||end" so result.json survives
             # re-runs even if row order shifts.  rid (行号) kept for review display.
             label_key = f"{r['开始标签']}|||{r['结束标签']}"
-            toks = [t.strip() for t in str(r['动作变量']).split(';') if t.strip()]
+            toks = _tokens(r['动作变量'])
             tdocs = []
             for t in toks:
                 d = describe_token(t, docs, wb)
@@ -391,7 +415,155 @@ def cmd_build(run, batch_size=40):
     return nb
 
 
-def cmd_validate(run):
+def _build_trace_batches(df, outdir, evidence, batch_size):
+    rows = []
+    for _, row in df.iterrows():
+        key = f"{row['开始标签']}|||{row['结束标签']}"
+        info = evidence.get(key, {})
+        if not info.get('b_evidence'):
+            continue
+        rows.append({
+            'id': key, 'basis': info['basis'], 'start': row['开始标签'], 'end': row['结束标签'],
+            'direct_source': info['direct'], 'command_evidence': info['b_evidence'],
+        })
+    count = 0
+    for offset in range(0, len(rows), batch_size):
+        count += 1
+        payload = {
+            'batch_id': count, 'schema': 'trace-description-evidence-v1',
+            'rows': rows[offset:offset + batch_size],
+            'task': (
+                '按本行指令和门控归纳一句不超过30字的中文候选描述。'
+                '保留basis，evidence_refs填写一条主指令ID，kind与该指令一致，'
+                '描述包含该指令的operation。仅以description_comment支持方向、工艺和完成状态。'
+                '证据不足时返回ok=false及reason。'
+            ),
+        }
+        path = outdir / f'batch_{count:03d}.input.json'
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
+    print(f'Trace B档: {len(rows)}行具备指令证据，{count}批，另有{len(df) - len(rows)}行待核验')
+    return count
+
+
+def _description_issue(desc, vocabulary):
+    if not desc:
+        return '空描述'
+    if len(desc) > 30:
+        return f'超长{len(desc)}'
+    identifiers = re.findall(r'[A-Za-z_][A-Za-z0-9_\[\]\.]*', desc)
+    if any(len(word) >= 2 for word in identifiers):
+        return '描述含英文或变量名'
+    fragments = re.findall(r'[\u4e00-\u9fff]{2,}', desc)
+    unknown = [part for part in fragments
+               if not any(part in word or word in part for word in vocabulary)]
+    return f'词汇待核: {unknown[:3]}' if unknown else ''
+
+
+def _trace_results(run):
+    results, missing, invalid = {}, [], []
+    inputs = sorted((run / 'batches_desc').glob('*.input.json'))
+    for path in inputs:
+        batch = json.loads(path.read_text(encoding='utf-8-sig'))
+        result_path = path.with_name(path.name.replace('.input.json', '.result.json'))
+        if not result_path.is_file():
+            missing.append(result_path.name)
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding='utf-8-sig'))
+            if result['batch_id'] != batch['batch_id'] or not isinstance(result['descs'], dict):
+                raise ValueError('batch mismatch')
+        except (OSError, ValueError, KeyError, TypeError):
+            invalid.append(result_path.name)
+            continue
+        for row in batch['rows']:
+            if row['id'] in result['descs']:
+                results[row['id']] = result['descs'][row['id']]
+    return results, {
+        'b_tier_input_count': len(inputs),
+        'b_tier_result_count': len(inputs) - len(missing) - len(invalid),
+        'missing_b_tier_batches': missing,
+        'invalid_b_tier_batches': invalid,
+    }
+
+
+def _validate_trace_result(result, evidence, allowed):
+    if not isinstance(result, dict) or result.get('basis') != evidence['basis']:
+        return None, 'B档证据版本不匹配'
+    if result.get('ok') is not True:
+        return None, str(result.get('reason') or 'B档证据不足')
+    refs = result.get('evidence_refs')
+    if not isinstance(refs, list) or len(refs) != 1 or not isinstance(refs[0], str):
+        return None, 'B档须引用一条本行主指令证据'
+    command = next((c for c in evidence['b_evidence'] if c['id'] == refs[0]), None)
+    if command is None or result.get('kind') != command['kind']:
+        return None, 'B档引用或指令类别与本行证据不符'
+    desc = result.get('desc')
+    if not isinstance(desc, str) or command['operation'] not in desc:
+        return None, 'B档描述缺少指令对应的动作'
+    comment = command['description_comment']
+    if any(word not in comment for word in _TRACE_DETAIL.findall(desc)):
+        return None, 'B档描述的方向、工艺或完成状态缺少源码注释支持'
+    words = set(re.findall(r'[\u4e00-\u9fff]{2,}', comment)) | {command['operation']}
+    issue = _description_issue(desc.strip(), allowed | words)
+    if issue:
+        return None, issue
+    return {'desc': desc.strip(), 'kind': command['kind'], 'refs': refs}, ''
+
+
+def _validate_trace(run, a, evidence, allowed, stats):
+    run = Path(run)
+    results, counts = _trace_results(run)
+    counts.update(a_sourced=0, b_candidates=0, unresolved_rows=0, b_tier_pending_rows=0)
+    rows, review = [], []
+    for row in a.to_dict('records'):
+        key = f"{row['开始标签']}|||{row['结束标签']}"
+        info = evidence.get(key, {})
+        desc, kind, refs = info.get('description', ''), row['行性质'], info.get('description_refs', [])
+        source = info.get('description_source', '') or '待核验'
+        status, reason = '证据待核验', ''
+        if desc:
+            counts['a_sourced'] += 1
+            status = '源码注释'
+        elif info.get('b_evidence'):
+            if key not in results:
+                status, reason = 'B档待处理', '缺少本行B档结果'
+                counts['b_tier_pending_rows'] += 1
+            else:
+                candidate, reason = _validate_trace_result(results[key], info, allowed)
+                if candidate:
+                    desc, kind, refs = candidate['desc'], candidate['kind'], candidate['refs']
+                    source, status = 'B档(证据归纳待核)', 'B档归纳待核验'
+                    reason = 'B档引用通过，工艺语义待核验'
+                    counts['b_candidates'] += 1
+                else:
+                    counts['unresolved_rows'] += 1
+        else:
+            relation = info.get('relation')
+            reason = ('缺少可用于描述的本网络证据' if relation == 'direct'
+                      else RELATION_TEXT.get(relation, '缺少Trace源码证据，需重跑'))
+            counts['unresolved_rows'] += 1
+        record = {k: row[k] for k in ('行号', '开始标签', '结束标签', '动作变量')}
+        rows.append({
+            **record, '动作描述': desc, '行性质': kind, '描述来源': source,
+            '描述状态': status, '证据引用': '; '.join(refs),
+        })
+        if reason:
+            review.append({**record, '描述状态': status, '原因': reason})
+    fields = ['行号', '开始标签', '结束标签', '动作变量']
+    out = run / 'action_desc_final.csv'
+    pd.DataFrame(rows, columns=fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用']).to_csv(
+        out, index=False, encoding='utf-8-sig')
+    pd.DataFrame(review, columns=fields + ['描述状态', '原因']).to_csv(
+        run / 'action_desc_review.csv', index=False, encoding='utf-8-sig')
+    counts['description_review_count'] = len(review)
+    if stats is not None:
+        stats.update(counts)
+    print(f'Trace动作描述: 源码注释{counts["a_sourced"]}行，B档候选{counts["b_candidates"]}行，'
+          f'证据待核{counts["unresolved_rows"]}行，B档待处理{counts["b_tier_pending_rows"]}行')
+    return str(out)
+
+
+def cmd_validate(run, *, stats=None):
     """读 batches_desc/*.result.json -> 白名单校验 -> action_desc_final.csv(全行) + review。"""
     wb = load_wb()
     verbs = set(wb['verbs_whitelist'])
@@ -420,9 +592,11 @@ def cmd_validate(run):
         '步进过渡', '信号触发', '待人工补充',
     }
     allowed = verbs | word_allow | _GENERIC_MECH
-    a = pd.read_csv(os.path.join(run, 'action_desc_a.csv'), dtype=str, encoding='utf-8-sig')
+    a = pd.read_csv(os.path.join(run, 'action_desc_a.csv'), dtype=str, encoding='utf-8-sig', keep_default_na=False)
+    evidence = read_trace_evidence(run)
+    if evidence is not None:
+        return _validate_trace(run, a, evidence, allowed, stats)
     docs = load_full_docs(run)
-    ascii_id = re.compile(r'[A-Za-z_][A-Za-z0-9_\[\]\.]*')
     # 每行重算机构词/动作词集合（与A档同源），作为子代理可引用词汇
     # v9.29: row_lex keyed by BOTH label_key "start|||end" (stable) and 行号 (legacy).
     # Matching prefers label_key so result.json survives row-order changes on re-run.
@@ -430,7 +604,7 @@ def cmd_validate(run):
     row_lex_by_rid = {}
     label_to_rid = {}
     for _, r in a.iterrows():
-        toks = [t.strip() for t in str(r['动作变量']).split(';') if t.strip()]
+        toks = _tokens(r['动作变量'])
         words, actions = [], []
         for t in toks:
             d = describe_token(t, docs, wb)
@@ -454,12 +628,6 @@ def cmd_validate(run):
                 continue
             desc = str(d.get('desc', '')).strip()
             refs = [str(x).strip() for x in d.get('refs', [])]
-            if not desc:
-                issues.append((rid, '空描述'))
-                continue
-            if len(desc) > 30:
-                issues.append((rid, f'超长{len(desc)}'))
-                continue
             # v9.29: match by label_key first, fall back to 行号 (legacy result.json)
             if rid in row_lex:
                 toks, words, actions = row_lex[rid]
@@ -474,22 +642,12 @@ def cmd_validate(run):
             if bad:
                 issues.append((rid, f'引用超出该行动作变量: {bad[:2]}'))
                 continue
-            # v9.21: desc must be Chinese-only — reject ANY ASCII identifier (≥2 chars)
-            # This is stricter than before: no variable names in description column.
-            en_in_desc = {x for x in ascii_id.findall(desc) if len(x) >= 2}
-            if en_in_desc:
-                issues.append((rid, f'描述含英文/变量名: {sorted(en_in_desc)[:3]}'))
-                continue
-            # 中文词白名单：desc 中每个连续中文串(≥2字)须命中 白名单词(含通用机构词)
-            # 或该行机构词/A档描述词；否则视为编造工艺词。
-            zh_segs = re.findall(r'[\u4e00-\u9fff]{2,}', desc)
             row_words = set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(words)))
             row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(actions)))
             row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', str(a[a['行号'] == match_rid]['A档描述'].iloc[0])))
-            bad_zh = [z for z in zh_segs
-                      if not any(z in w or w in z for w in (allowed | row_words))]
-            if bad_zh:
-                issues.append((rid, f'编造中文词: {bad_zh[:3]}'))
+            issue = _description_issue(desc, allowed | row_words)
+            if issue:
+                issues.append((rid, issue))
                 continue
             bmap[match_rid] = {'desc': desc, 'refs': refs, 'kind': d.get('kind') or a[a['行号'] == match_rid]['行性质'].iloc[0]}
     rows = []
@@ -502,7 +660,7 @@ def cmd_validate(run):
             d = bmap[rid]
             desc, kind, src = d['desc'], d['kind'], 'B档(LLM工艺语义)'
             n_b += 1
-        elif str(r['A档描述']).strip():
+        elif str(r['A档描述']).strip().casefold() not in ('', 'nan', 'none'):
             desc, kind, src = r['A档描述'], r['行性质'], 'A档(源码步注释)'
             n_a += 1
         else:
