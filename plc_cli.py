@@ -121,45 +121,103 @@ def _run_tagvars(src,out,args):
   print(json.dumps(stats,ensure_ascii=False,indent=2));sys.exit(2)
  print(json.dumps(stats,ensure_ascii=False,indent=2))
 
+_TRACE_PREPARED = 'trace_prepared.json'
+_TRACE_STATS = ('variables_total', 'variables_active', 'total_jumps', 'cycles_detected',
+                'unique_pairs', 'pairs_with_action_vars', 'pairs_with_step_comment',
+                'pairs_reset_exit', 'review_count', 'source_relations', 'proc_name', 'trace_input')
+
+
+def _trace_inputs(src, trace, args):
+ from trace_to_pairs import trace_input_digest
+ from trace_description_context import SCHEMA
+ root = Path(__file__).resolve().parent
+ code = sorted(root.glob('trace_*.py')) + [
+     root/name for name in ('VERSION', 'plc_cli.py', 'workflow.py', 'action_describe.py', 'action_wordbook.json')
+ ]
+ return {
+     'source': str(src), 'source_sha256': fingerprint(src),
+     'trace': str(trace), 'trace_sha256': trace_input_digest(trace),
+     'description_schema': SCHEMA, 'code': {p.name: fingerprint(p) for p in code},
+     'options': {name: getattr(args, name) for name in ('batch_size', 'pattern', 'proc_name', 'sample_interval_ms')},
+ }
+
+
+def _trace_prepared_files(out):
+ files = sorted(p for suffix in ('csv', 'json') for p in out.glob(f'trace_*.{suffix}')
+                if p.name != _TRACE_PREPARED)
+ files += [out/'action_desc_a.csv', out/'workflow_manifest.json']
+ for name in ('variable_documentation.json', 'step_comments.json', 'station_identity.json',
+              'native_command_evidence.csv', 'plcopen_action_trace.csv', 'source_stage_candidates.csv',
+              'source_transition_edges.csv', 'indexed_candidates.csv', 'indexed_events.csv'):
+  if (out/name).is_file():
+   files.append(out/name)
+ files += sorted((out/'batches_desc').glob('*.input.json'))
+ return {p.relative_to(out).as_posix(): fingerprint(p) for p in files}
+
+
 def _run_trace_mode(src,out,args):
- """Prepare observed Trace pairs, source evidence and a reviewable workbook."""
- trace = Path(args.trace)
+ """Prepare observed Trace pairs, then validate descriptions and render."""
+ trace = Path(args.trace).resolve()
  if not src.is_file():
   raise FileNotFoundError(f'PLC源码不存在：{src}')
  if not trace.exists():
   raise FileNotFoundError(f'Trace输入不存在：{trace}')
- if src.is_relative_to(out) or trace.resolve().is_relative_to(out):
+ if src.is_relative_to(out) or trace.is_relative_to(out):
   raise ValueError('输出目录须与PLC源码和Trace输入分开')
  out.mkdir(parents=True,exist_ok=True)
- _check_isolation(out,args,'trace')
- stats = {'mode':'trace','source':str(src),'trace':str(trace),'out':str(out)}
+ cache_path = out/_TRACE_PREPARED
+ inputs = _trace_inputs(src, trace, args)
+ cached = None
+ if cache_path.is_file() and not args.force:
+  try:
+   cached = json.loads(cache_path.read_text(encoding='utf-8'))
+   if (cached['inputs'] != inputs or cached['files'] != _trace_prepared_files(out)
+       or not set((*_TRACE_STATS, 'candidate_count')) <= cached['stats'].keys()
+       or (out/'final_prediction_pairs.csv').exists()):
+    raise ValueError('输入或准备产物已变化')
+  except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+   raise SystemExit(f'Trace准备结果无法复用（{exc}）。请用新目录或显式 --force 重建。') from exc
+ else:
+  _check_isolation(out,args,'trace')
+ stats = {'mode':'trace','source':str(src),'trace':str(trace),'out':str(out),
+          'preparation_reused': cached is not None}
  stage = 'source'
  try:
-  print('Trace [1/4] 解析 PLC 源码并准备候选批次', file=sys.stderr, flush=True)
-  manifest = create(str(src),str(out),batch_size=args.batch_size,
-                    pattern=args.pattern,force=True,manual=None,trace=None)
-  stats['candidate_count'] = manifest.get('candidate_count',0)
+  if cached is None:
+   print('Trace [1/4] 解析 PLC 源码并准备候选批次', file=sys.stderr, flush=True)
+   manifest = create(str(src),str(out),batch_size=args.batch_size,
+                     pattern=args.pattern,force=True,manual=None,trace=None)
+   stats['candidate_count'] = manifest.get('candidate_count',0)
 
-  stage = 'source_evidence'
-  print('Trace [2/4] 提取变量文档、步注释和工位身份', file=sys.stderr, flush=True)
-  _extract_source_evidence(src,out,include_comments=True)
+   stage = 'source_evidence'
+   print('Trace [2/4] 提取变量文档、步注释和工位身份', file=sys.stderr, flush=True)
+   _extract_source_evidence(src,out,include_comments=True)
 
-  stage = 'trace'
-  print('Trace [3/4] 解析采集数据并汇总状态对', file=sys.stderr, flush=True)
-  from trace_to_pairs import generate as gen_trace_pairs
-  trace_stats = gen_trace_pairs(str(trace),str(out),source=str(src),pattern=args.pattern,
-                                proc_name=args.proc_name,
-                                sample_interval_ms=args.sample_interval_ms)
-  stats.update({k:trace_stats[k] for k in ('variables_total','variables_active',
-      'total_jumps','cycles_detected','unique_pairs','pairs_with_action_vars',
-      'pairs_with_step_comment','pairs_reset_exit','review_count','source_relations',
-      'proc_name','trace_input')})
+   stage = 'trace'
+   print('Trace [3/4] 解析采集数据并汇总状态对', file=sys.stderr, flush=True)
+   from trace_to_pairs import generate as gen_trace_pairs
+   trace_stats = gen_trace_pairs(str(trace),str(out),source=str(src),pattern=args.pattern,
+                                 proc_name=args.proc_name,
+                                 sample_interval_ms=args.sample_interval_ms)
+   stats.update({k: trace_stats[k] for k in _TRACE_STATS})
+   stage = 'description'
+   print('Trace [4/4] 准备动作描述批次', file=sys.stderr, flush=True)
+   from action_describe import cmd_a, cmd_build
+   cmd_a(str(out))
+   cmd_build(str(out))
+   if _trace_inputs(src, trace, args) != inputs:
+    raise ValueError('准备过程中源码、Trace或程序发生变化，请重建')
+   prepared = {'inputs': inputs, 'files': _trace_prepared_files(out),
+               'stats': {k: stats[k] for k in (*_TRACE_STATS, 'candidate_count')}}
+   tmp_path = cache_path.with_suffix('.tmp')
+   tmp_path.write_text(json.dumps(prepared, ensure_ascii=False, indent=2), encoding='utf-8')
+   tmp_path.replace(cache_path)
+  else:
+   print('Trace 续跑：准备产物已核验，合并 B 档结果并刷新交付表', file=sys.stderr, flush=True)
+   stats.update(cached['stats'])
 
   stage = 'description'
-  print('Trace [4/4] 准备动作描述和交付表', file=sys.stderr, flush=True)
-  from action_describe import cmd_a, cmd_build, cmd_validate
-  cmd_a(str(out))
-  cmd_build(str(out))
+  from action_describe import cmd_validate
   cmd_validate(str(out), stats=stats)
 
   stage = 'workbook'
@@ -345,7 +403,7 @@ def main():
  x.add_argument('--out',required=True,help='输出目录')
  x.add_argument('--pattern',default=None,help='可选：变量名称过滤模式（glob或re:前缀正则）')
  x.add_argument('--batch-size',type=int,default=120)
- x.add_argument('--force',action='store_true',help='强制清理残留产物后重跑')
+ x.add_argument('--force',action='store_true',help='强制重建准备产物；同一运行合并B档时可直接续跑')
  x.set_defaults(func=lambda a:_run_trace_mode(Path(a.source).resolve(),Path(a.out).resolve(),a))
  a=p.parse_args();a.func(a)
 if __name__=='__main__':main()

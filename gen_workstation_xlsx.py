@@ -23,6 +23,8 @@ SHA256戳与分组方式；排序仅为展示查找便利，不代表执行顺�
 该xlsx仅供人阅读，评价仍直接读CSV。finish(workflow.validate)成功后自动生成本表。
 """
 import argparse, hashlib, json, re, os
+from math import ceil
+from unicodedata import east_asian_width
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -511,7 +513,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     # When True, rows with empty descriptions get 【B档未处理】 in the remark column.
     b_tier_pending = False
     if is_trace:
-        b_tier_pending = any(row[4] == 'B档待处理' for row in desc_map.values())
+        b_tier_pending = any(row[4] in ('B档待处理', 'B档待修订') for row in desc_map.values())
     elif run:
         bd = os.path.join(run, 'batches_desc')
         if os.path.isdir(bd):
@@ -607,8 +609,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             trace_needs_review = False
             if is_trace:
                 remark = cell_str(row.get('备注', '')).strip()
-                if remark:
-                    remark_parts.append(remark)
+                remark_parts.extend(part for part in remark.split(' | ')
+                                    if part and part != '无步注释，等待LLM综合上下文描述')
                 desc_entry = desc_map.get(rt_key)
                 desc_status = desc_entry[4] if desc_entry else ''
                 trace_needs_review = row.get('源码关系') != 'direct' or desc_status != '源码注释'
@@ -651,8 +653,13 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             # 待复核行/B档未处理行的备注列用红色字体
             if needs_review or trace_needs_review or legacy_b_pending:
                 ws.cell(row=r, column=8).font = Font(name='Arial', size=9, color='FF0000', bold=True)
-            # 统一行高
-            ws.row_dimensions[r].height = 18
+            height = 18
+            if is_trace and dtxt:
+                ws.cell(row=r, column=3).alignment = left
+                lines = sum(max(1, ceil(sum(2 if east_asian_width(ch) in ('W', 'F') else 1
+                                            for ch in line) / 38)) for line in dtxt.splitlines())
+                height = min(409, max(height, 18 * lines))
+            ws.row_dimensions[r].height = height
             r += 1
         # 块尾"总时长"行
         ws.cell(row=r, column=3, value='行时长合计' if is_trace else '总时长')

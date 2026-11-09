@@ -6,6 +6,7 @@ from pathlib import Path
 import test_trace_to_pairs as fixtures
 from action_describe import cmd_a, cmd_build, cmd_validate
 from gen_workstation_xlsx import generate as workbook
+from trace_description_context import validate_context_result
 from trace_to_pairs import generate
 from utils import infer_proc_name
 
@@ -96,9 +97,10 @@ class TraceDescriptionTests(unittest.TestCase):
             'EM01.Cy_Up1': '上料气缸伸出位置', 'EM02.Cy_Up1': '伺服电机'}}, ensure_ascii=False))
         return self.prepare()[1]
 
-    def write_result(self, row, refs, desc='气缸动作'):
-        result = {'basis': row['basis'], 'ok': True, 'desc': desc, 'kind': '机械动作',
-                  'evidence_refs': refs, 'reasoning': '本步调用绑定该变量，同命名族文档支持气缸类别，方向未知'}
+    def write_result(self, row, refs, action='启动循环'):
+        result = {'basis': row['basis'], 'ok': True, 'kind': '机械动作',
+                  'actions': [{'subject': '气缸', 'action': action, 'evidence_refs': refs}],
+                  'reasoning': '本步调用绑定该变量，同命名族文档支持气缸类别，方向未知'}
         data = {'batch_id': 1, 'descs': {'Step[1]=10|||Step[1]=20': result}}
         (self.run / 'batches_desc/batch_001.result.json').write_text(json.dumps(data, ensure_ascii=False))
         return result, data
@@ -124,7 +126,7 @@ class TraceDescriptionTests(unittest.TestCase):
         remarks = [str(row[0]) for row in book.active.iter_rows(min_col=8, max_col=8, values_only=True)]
         book.close()
         self.assertTrue(any('同类命名推断' in text and '方向未知' in text for text in remarks))
-        result['desc'] = '气缸伸出'
+        result['actions'][0]['action'] = '伸出'
         (self.run / 'batches_desc/batch_001.result.json').write_text(json.dumps(data, ensure_ascii=False))
         cmd_validate(self.run, stats=stats)
         self.assertEqual(stats['b_candidates'], 0)
@@ -173,8 +175,66 @@ class TraceDescriptionTests(unittest.TestCase):
         path.write_text(json.dumps(result))
         stats = {}
         cmd_validate(self.run, stats=stats)
-        self.assertEqual(stats['b_tier_pending_rows'], 0)
+        self.assertEqual(stats['b_tier_pending_rows'], 1)
+        self.assertEqual(stats['b_tier_invalid_rows'], 1)
         self.assertEqual(stats['b_candidates'], 0)
+        result['descs']['Step[1]=10|||Step[1]=30'] = {
+            'basis': info['basis'], 'ok': False, 'reason': '采样只提供状态对，缺少源码指令'}
+        path.write_text(json.dumps(result, ensure_ascii=False))
+        cmd_validate(self.run, stats=stats)
+        self.assertEqual((stats['b_tier_pending_rows'], stats['unresolved_rows']), (0, 1))
+
+    def test_bound_effects_keep_both_objects_and_select_literal_direction(self):
+        self.record(10, 30)
+        self.source_edges(self.run, [(10, 0), (0, 30)])
+        call = self.command(10, 1, 'ControlTwo', 'CY_1=Cylinder[3];CY_2=Cylinder[4];D1=0;D2=1;Mode=Manual')
+        call['comment'] = '5-松开AB夹子'
+        rows = [call]
+        for index, label in [(3, '下料_A夹子气缸'), (4, '下料_B夹子气缸')]:
+            binding = self.command(0, index, 'BindDevice', f'CY=Cylinder[{index}]')
+            binding.update(scope='Program::Bindings', start='', comment=label)
+            rows.append(binding)
+        rows.append(dict(rows[1], scope='OtherProgram::Bindings', comment='其他工位气缸'))
+        for slot in (1, 2):
+            for member, term in [('AutoAnastole', f'NOT D{slot}'), ('AutoStrOut', f'D{slot}')]:
+                write = self.command(0, len(rows), 'coil_set', f'CY_{slot}.{member}')
+                write.update(scope='ControlTwo::body', start='', guard=f'{term} AND NOT Mode AND EN')
+                rows.append(write)
+        self.write_csv(self.run / 'native_command_evidence.csv', rows)
+        _, info = self.prepare()
+        self.assertEqual(info['relation'], 'path_via_zero_candidate')
+        self.assertEqual([e['to'] for e in info['candidate_path']], [0, 30])
+        context = info['description_context']
+        writes = [e['data'] for e in context['evidence'] if e['category'] == 'bound_write']
+        self.assertEqual({e['target'] for e in writes}, {'Cylinder[3].AutoAnastole', 'Cylinder[4].AutoStrOut'})
+        self.assertTrue(all('NOT (Manual)' in e['bound_guard'] for e in writes))
+        anchors = context['required_actions']
+        result = {'ok': True, 'basis': info['basis'], 'kind': '机械动作', 'reasoning': '按绑定后的条件写入'}
+        result['actions'] = [{'action_ref': anchors[0]}]
+        self.assertIn('B侧夹子气缸', validate_context_result(result, context)[1])
+        result['actions'].append({'action_ref': anchors[1]})
+        candidate, issue = validate_context_result(result, context)
+        self.assertFalse(issue)
+        self.assertEqual(candidate['desc'], '向下料A侧夹子气缸发出回原位请求，向下料B侧夹子气缸发出工位侧请求')
+        ids = [e['id'] for e in context['evidence'] if e['category'] in {'current_command', 'candidate_path', 'object_binding'}]
+        result['actions'].append({'subject': '下料A侧夹子气缸', 'action': '松开', 'evidence_refs': ids})
+        self.assertIn('松开', validate_context_result(result, context)[1])
+
+    def test_timeout_monitoring_evidence_does_not_support_a_fixed_dwell(self):
+        self.record(10, 20)
+        self.source_edges(self.run, [(10, 20)])
+        timer = self.command(10, 1, 'TON', 'PT=T#5S')
+        coil = self.command(10, 1, 'coil_set', 'Alarm[1]')
+        coil.update(node='2', path='1')
+        self.write_csv(self.run / 'native_command_evidence.csv', [timer, coil])
+        _, info = self.prepare()
+        context = info['description_context']
+        monitor, = [e for e in context['evidence'] if e['category'] == 'timer_alarm']
+        result = {'ok': True, 'basis': info['basis'], 'kind': '内部辅助', 'reasoning': '定时器输出接报警线圈',
+                  'actions': [{'subject': '取料条件', 'action': '超时监控', 'evidence_refs': [monitor['id']]}]}
+        self.assertEqual(validate_context_result(result, context)[0]['desc'], '取料条件超时监控')
+        result['actions'][0].update(action='等待', target='5秒')
+        self.assertIn('5秒', validate_context_result(result, context)[1])
 
     def test_context_includes_guarded_call_and_shared_symbol_binding(self):
         self.record(10, 20)

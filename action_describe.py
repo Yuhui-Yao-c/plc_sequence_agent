@@ -348,12 +348,12 @@ def cmd_build(run, batch_size=40):
     df = df[df['A档描述'].fillna('').str.strip() == ''].reset_index(drop=True)
     outdir = Path(run) / 'batches_desc'
     outdir.mkdir(exist_ok=True)
-    # Rebuild only the inputs. Results are matched to the current batch and source basis.
-    for f in outdir.glob('*.input.json'):
-        f.unlink()
     trace_evidence = read_trace_evidence(run)
     if trace_evidence is not None:
         return _build_trace_batches(df, outdir, trace_evidence, batch_size)
+    # Rebuild only the inputs. Results are matched to the current batch and source basis.
+    for f in outdir.glob('*.input.json'):
+        f.unlink()
     if len(df) == 0:
         print(f'B档批次: 0行需LLM补充（全部有步注释）')
         return 0
@@ -424,11 +424,10 @@ def _build_trace_batches(df, outdir, evidence, batch_size):
         key = f"{row['开始标签']}|||{row['结束标签']}"
         info = evidence.get(key, {})
         context = info.get('description_context', {})
-        if not context:
-            raise ValueError('Trace描述上下文缺失，请先用当前版本重跑trace以生成证据包')
+        if context.get('schema') != TRACE_CONTEXT_SCHEMA:
+            raise ValueError('Trace描述上下文需更新，请用当前版本运行trace --force以重建证据包')
         rows.append({
             'id': key, 'basis': info['basis'], 'start': row['开始标签'], 'end': row['结束标签'],
-            'direct_source': info['direct'], 'command_evidence': info['start_commands'],
             'context': context,
         })
     chunks, chunk, size = [], [], 0
@@ -439,18 +438,20 @@ def _build_trace_batches(df, outdir, evidence, batch_size):
         chunk.append(row); size += row_size
     if chunk:
         chunks.append(chunk)
+    for path in outdir.glob('*.input.json'):
+        path.unlink()
     count = 0
     for count, chunk in enumerate(chunks, 1):
         payload = {
             'batch_id': count, 'schema': TRACE_CONTEXT_SCHEMA,
             'rows': chunk,
             'task': (
-                '为起始步生成一句不超过40字的中文动作或等待描述。'
-                '综合context.evidence中的本步调用、实参、控制关系、源码邻接注释、中文映射及工程记忆。'
-                '静态路径不等于采样间实际执行路径；邻步注释只作上下文。'
-                '同类命名示例可辅助判断机构类别，方向和目标位须有本步证据或精确映射。'
-                '保留basis，evidence_refs引用context.evidence的ID，可引用多条；'
-                '回传kind及reasoning说明本步依据和推断限制。证据仍不足时返回ok=false及reason。'
+                '为起始步写中文动作分句actions。每个分句说明具体机构或处理对象及动作，保留有证据的目标位和多个动作对象。'
+                '逐项核验context.required_actions，为每个锚点提交{action_ref: ID}。锚点包含对象、指令、目标及原始证据引用。'
+                '需补充的判断、等待、交接等提交{subject, action, target, evidence_refs}，target可为空。'
+                '结合调用实参、条件写入、控制关系与中文映射。仅借用同类命名的机构类别。'
+                '步号不匹配的注释仅作上下文。区分指令、反馈与完成，区分超时监控和正常等待。'
+                '保留basis、kind及reasoning。缺证据时提交ok=false和明确的reason。交付描述由通过的分句合成。'
             ),
         }
         path = outdir / f'batch_{count:03d}.input.json'
@@ -529,7 +530,8 @@ def _validate_trace_result(result, evidence, allowed):
 def _validate_trace(run, a, evidence, allowed, stats):
     run = Path(run)
     results, counts = _trace_results(run)
-    counts.update(a_sourced=0, b_candidates=0, unresolved_rows=0, b_tier_pending_rows=0)
+    counts.update(a_sourced=0, b_candidates=0, unresolved_rows=0, b_tier_pending_rows=0,
+                  b_tier_invalid_rows=0)
     rows, review = [], []
     for row in a.to_dict('records'):
         candidate = {}
@@ -552,6 +554,13 @@ def _validate_trace(run, a, evidence, allowed, stats):
                     source, status = 'B档(上下文推断)', 'LLM推断待核验'
                     reason = 'B档引用通过，工艺语义待核验'
                     counts['b_candidates'] += 1
+                elif (info.get('description_context', {}).get('schema') == TRACE_CONTEXT_SCHEMA
+                      and not (isinstance(results[key], dict) and results[key].get('basis') == info['basis']
+                               and results[key].get('ok') is False and isinstance(results[key].get('reason'), str)
+                               and results[key]['reason'].strip())):
+                    status = 'B档待修订'
+                    counts['b_tier_invalid_rows'] += 1
+                    counts['b_tier_pending_rows'] += 1
                 else:
                     counts['unresolved_rows'] += 1
         else:

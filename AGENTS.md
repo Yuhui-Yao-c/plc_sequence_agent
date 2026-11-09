@@ -130,15 +130,15 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 
 **执行与续跑**
 
-1. 使用 `plc-trace-jump-analysis` 的输入格式、跳变和审计规则。其预测对匹配与平均时长回填属于入口一的 `predict --trace`。入口四的 `trace_collection_pairs.csv` 保留原始观测对，`trace_source_evidence.json` 分开记录源码直跳、静态候选路径和待核验关系。候选路径中的中间步及耗时需要独立验证。
-2. A 档优先使用完整状态变量和起始步对应的源码注释；即使观测跨步或迁移尚未对齐，也填写已知起始步注释并保留迁移复核。全部缺 A 档的行进入 `trace-description-context-v2` 批次。加载 `plc-action-description` 的 Trace 协议，综合本步指令实参、源码控制关系、邻步注释、调用关联、变量映射及同工程命名族记忆，逐行回传 `basis`、多条证据引用、中文描述与 `reasoning`，或明确证据不足原因。B 档推断和源码注释分开标识。
-3. 使用相同源码、Trace、变量范围和输出目录执行 `plc_cli.py trace ... --force`。程序保留 B 档结果，重建证据并校验每个结果的 `basis`。输入变动时另开输出目录。入口一的预测批次由 `finish` 合并。
+1. 使用 `plc-trace-jump-analysis` 的输入格式、跳变和审计规则。入口四按观测跳变生成状态对和起始步停留时长的中位数。源码关系单列核验，区分直跳、多步路径及经步 0 的静态候选。候选路径只用于源码对照。
+2. A 档按完整变量、数组下标和起始步填源码注释。无适用注释的每一行进入 `trace-description-context-v3`。使用 `plc-action-description` 的 Trace 协议逐项核验本步指令、实参绑定、条件写入、控制关系及中文映射。B 档回传 `actions`、`basis`、`kind` 和 `reasoning`，或具体的证据不足原因。描述保留执行机构或处理对象、动作及已知目标位。一个调用涉及多个对象时逐项覆盖。
+3. 写完当前批次结果后，以相同源码、Trace、选项和输出目录执行同一条命令。续跑校验输入和准备产物指纹，合并结果并刷新工作簿。旧版 v1/v2 批次升级时使用新目录，或加 `--force` 重建一次并按新证据重新填写。入口一的预测批次由 `finish` 合并。
 
 ```powershell
-python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" --out "outputs/PLC_trace" --force
+python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" --out "outputs/PLC_trace"
 ```
 
-核验 `workflow_status.json`、状态对、动作描述和实际工作簿。`prepared_b_tier_pending` 表示有未回答的 B 档行。`done_with_review` 表示工作簿已出且仍有源码或描述待核。分别报告源码注释行、B 档候选、证据待核行和未完成批次，逐项查 `trace_pairs_review.csv` 和 `action_desc_review.csv`。
+核验 `workflow_status.json`、状态对、动作描述和工作簿。`prepared_b_tier_pending` 表示有缺失、过期或需修订的 B 档结果。`done_with_review` 表示工作簿已出且有源码或描述待核。源码迁移项见 `trace_pairs_review.csv`，动作描述项见 `action_desc_review.csv`。工作簿按状态对合计待核行。
 
 ### 隔离与数据规则
 - 预测与评价建议在独立会话执行；提示词隔离不是操作系统沙箱。
@@ -300,7 +300,7 @@ gen_workstation_xlsx.py load_trace_runtime 扩展：优先读 trace_collection_p
 2. `plc_cli.py _run_trace_mode`：cmd_build 后检测 result.json——不存在则复制A档为final、渲染A档兜底交付表（备注列标【B档未处理】）、status=`prepared_b_tier_pending`、停止；存在则 cmd_validate 合并+完整交付表。当前续跑按入口四执行，核验现有 B 档结果与本次证据。
 3. `workflow.py validate`：result.json 缺失时保留复制A档兼容行为，新增 `b_tier_incomplete` 强制标记，stderr 报警。
 4. `gen_workstation_xlsx.py`：检测 batches_desc 有 input.json 无 result.json → `b_tier_pending=True`；有动作变量但描述为空的行备注列标【B档未处理】（红色加粗）；note 行追加图例。
-预测经 `finish` 合并，Trace 经同次 `trace --force` 续跑合并。以当前输入批次逐一核验 B 档结果。
+预测经 `finish` 合并。Trace 按入口四的当前续跑规则合并。以当前输入批次逐一核验 B 档结果。
 **零退化**：cmd_a/cmd_build/cmd_validate 三个核心函数不动；gen_workstation_xlsx fallback 链不动；A档142行步注释重跑不变。
 
 ## v9.30 omron Sysmac trace 适配（详变更见 CHANGELOG_V9.30.md）

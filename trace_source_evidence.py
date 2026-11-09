@@ -8,12 +8,14 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from atomic_boundaries import PROVEN, atomic, stable_id
+from trace_call_evidence import CallEvidence
 
 EVIDENCE_FILE = 'trace_source_evidence.json'
 RELATION_TEXT = {
     'direct': '源码直跳有证据',
     'direct_unverified': '源码直跳门控待核',
     'path_candidate': '源码多步路径待核',
+    'path_via_zero_candidate': '源码经步0路径待核',
     'ambiguous_scope': '源码控制器作用域待核',
     'unresolved': '源码迁移未对齐',
 }
@@ -69,7 +71,7 @@ def _command_role(command):
     return 'source_call', '', ''
 
 
-def _path(adjacency, source, target, *, proved_only):
+def _path(adjacency, source, target, *, proved_only, allow_zero=False):
     pending = deque([source])
     previous = {source: None}
     while pending and target not in previous:
@@ -78,7 +80,7 @@ def _path(adjacency, source, target, *, proved_only):
             if proved_only and not edge['guard_complete']:
                 continue
             dest = edge['to']
-            if dest == 0 and dest != target:
+            if dest == 0 and dest != target and not allow_zero:
                 continue
             if dest not in previous:
                 previous[dest] = edge
@@ -100,6 +102,7 @@ class TraceSourceIndex:
         self.bindings = defaultdict(set)
         self.commands = defaultdict(list)
         self.notes = defaultdict(list)
+        self.call_evidence = CallEvidence()
         wanted = {name.casefold() for name in variables}
         run = Path(run)
         edges_by_id = {}
@@ -147,6 +150,7 @@ class TraceSourceIndex:
                 })
 
         for row in _read_csv(run / 'native_command_evidence.csv'):
+            self.call_evidence.add(row)
             start = _state(row['start'])
             if start and start[0] in wanted:
                 role, kind, operation = _command_role(row['command'])
@@ -214,14 +218,14 @@ class TraceSourceIndex:
             elif direct:
                 relation = 'direct_unverified'
             else:
-                for proved_only in (True, False):
+                for allow_zero, proved_only in ((False, True), (False, False), (True, True), (True, False)):
                     paths = [
-                        _path(graph, value, end[1], proved_only=proved_only)
+                        _path(graph, value, end[1], proved_only=proved_only, allow_zero=allow_zero)
                         for graph in self.graphs[variable].values()
                     ]
                     path = min((p for p in paths if len(p) > 1), key=len, default=[])
                     if path:
-                        relation = 'path_candidate'
+                        relation = 'path_via_zero_candidate' if allow_zero else 'path_candidate'
                         break
 
             commands = self.commands.get(start, [])

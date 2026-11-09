@@ -171,41 +171,45 @@ class SysmacRecordingTests(unittest.TestCase):
         self.assertEqual(cmd_build(run, batch_size=1), 3)
         batch_dir = run / 'batches_desc'
         batch = json.loads((batch_dir / 'batch_002.input.json').read_text(encoding='utf-8'))
-        self.assertEqual(batch['schema'], 'trace-description-context-v2')
+        self.assertEqual(batch['schema'], 'trace-description-context-v3')
         row, = batch['rows']
         command = next(e for e in row['context']['evidence'] if e['category'] == 'current_command')
-        result = {'basis': row['basis'], 'ok': True, 'desc': '焊接',
-                  'kind': '机械动作', 'evidence_refs': [], 'reasoning': '测试证据约束'}
+        anchor, = row['context']['required_actions']
+        result = {'basis': row['basis'], 'ok': True, 'kind': '机械动作',
+                  'actions': [{'subject': '轴', 'action': '动作', 'evidence_refs': [command['id']]}],
+                  'reasoning': '测试证据约束'}
         path = batch_dir / 'batch_002.result.json'
         data = {'batch_id': 2, 'descs': {row['id']: result}}
         path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         stats = {}
         final = cmd_validate(run, stats=stats)
         self.assertEqual((stats['b_candidates'], stats['unresolved_rows'], stats['b_tier_pending_rows']),
-                         (0, 1, 2))
+                         (0, 0, 3))
+        self.assertEqual(stats['b_tier_invalid_rows'], 1)
         self.assertEqual(stats['missing_b_tier_batches'], ['batch_001.result.json', 'batch_003.result.json'])
         self.assertTrue(all(not r['动作描述'] for r in self.read_csv(final)))
         self.assertNotIn('nan', (batch_dir / 'batch_002.input.json').read_text(encoding='utf-8'))
 
-        result.update(desc='伺服定位', evidence_refs=[command['id']])
+        result['actions'] = [{'action_ref': anchor}]
         path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         final = cmd_validate(run, stats=stats)
         self.assertEqual(stats['b_candidates'], 1)
         described, = [r for r in self.read_csv(final) if r['动作描述']]
         self.assertEqual(described['描述来源'], 'B档(上下文推断)')
-        self.assertEqual(described['证据引用'], command['id'])
+        self.assertEqual(described['动作描述'], '1号轴定位至3号位')
+        self.assertEqual(set(described['证据引用'].split('; ')), {anchor, command['id']})
 
         (batch_dir / 'batch_003.result.json').write_text('{"batch_id":3,"descs":{}}', encoding='utf-8')
         cmd_validate(run, stats=stats)
         self.assertEqual(stats['b_tier_result_count'], 2)
         self.assertEqual(stats['b_tier_pending_rows'], 2)
 
-        result['desc'] = '焊接定位'
+        result['actions'].append({'subject': '轴', 'action': '焊接定位', 'evidence_refs': [command['id']]})
         path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         cmd_validate(run, stats=stats)
         self.assertEqual(stats['b_candidates'], 0)
 
-        result['desc'] = '伺服定位'
+        result['actions'] = [{'action_ref': anchor}]
         result['basis'] = 'old-source'
         path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         cmd_validate(run, stats=stats)

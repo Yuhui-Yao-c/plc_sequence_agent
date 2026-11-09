@@ -892,23 +892,15 @@ def generate(trace_path, run, source=None, proc_name=None,
         if estimated_count:
             remark.append(f'含估算时长（{estimated_count}/{len(durs)} 次）')
         start_context = evidence['start_comment']
-        if not start_context and evidence['candidate_path']:
-            start_context = evidence['candidate_path'][0]['comment']
         if start_context and not evidence['description']:
             remark.append(f'起始步注释参考 {start_context.splitlines()[0]}')
-        review_type, review_note = '', ''
         if relation != 'direct':
-            review_type, review_note = relation, RELATION_TEXT[relation]
-        elif not evidence['description']:
-            review_type, review_note = 'description_pending', '无步注释，等待LLM综合上下文描述'
-            remark.append(review_note)
-        if review_type:
             review_rows.append({
-                '类型': review_type,
+                '类型': relation,
                 '变量': var_name,
                 '开始标签': start_label,
                 '结束标签': end_label,
-                '说明': review_note,
+                '说明': RELATION_TEXT[relation],
             })
 
         rows.append({

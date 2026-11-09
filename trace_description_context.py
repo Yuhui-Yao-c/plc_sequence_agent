@@ -14,12 +14,26 @@ from collections import defaultdict
 from pathlib import Path
 
 from atomic_boundaries import stable_id
+from trace_call_evidence import action_specs, device_label, named_arguments
+from trace_source_evidence import _comment_text
 
 MEMORY_FILE = 'trace_semantic_memory.json'
-SCHEMA = 'trace-description-context-v2'
+SCHEMA = 'trace-description-context-v3'
 _SYMBOL = re.compile(r'[A-Za-z_][\w]*(?:\[\d+\])?(?:\.[A-Za-z_]\w*(?:\[\d+\])?)*')
 _CLASSES = ('气缸', '伺服', '电机', '机器人', '吸盘', '真空', '定时器')
 _KINDS = {'机械动作', '加工保持', '检测测量', '工艺等待', '交接数据', '周期汇总', '内部辅助', '信号/标志', '步进', '未分类'}
+_SPECIFIC = re.compile(
+    r'破真空|吸附|吹气|停止吸气|松开|夹紧|夹取|张开|闭合|伸出|缩回|上升|下降|'
+    r'正转|反转|回原位|回零|焊接|点胶|贴胶|到位|完成|超时监控|定时等待|延时'
+)
+_VERB = re.compile(
+    r'判断|选择|检测|测量|检查|监控|等待|定位|运行|搬运|移载|移动|保持|计时|'
+    r'请求|发出|置位|复位|写入|清零|保存|读取|记录|发送|接收|传递|允许|确认|'
+    r'启动|停止|切换|报警|屏蔽|触发|进入|退出|取料|放料|取件|放件|'
+    r'扫码|拍照|前进|后退|旋转|伸出|缩回|回原位|回零|夹紧|松开|闭合|张开|'
+    r'吸附|破真空|吹气|上升|下降|正转|反转|焊接|点胶|贴胶|剪切|贴合|握手'
+)
+_GENERIC_SUBJECTS = {'本步', '步骤', '设备', '机构', '系统', '工艺', '动作', '信号', '流程', '状态'}
 
 
 def _read(path):
@@ -63,6 +77,21 @@ def _compact_command(command):
     fields = ('id', 'scope', 'network', 'source_line', 'node', 'command', 'arguments',
               'guard', 'guard_complete', 'comment', 'issue', 'role', 'kind', 'operation')
     return {key: command.get(key, '') for key in fields}
+
+
+def _object_label(docs, binding, actual, mechanism):
+    doc = docs.get(actual.casefold())
+    if doc and re.search(r'[\u4e00-\u9fff]', doc[1]):
+        return device_label(doc[1]), doc[1]
+    if binding:
+        return binding['label'], binding['text']
+    indexed = re.fullmatch(r'(Cylinder|Vacuum)\[(\d+)\]', actual, re.I)
+    if indexed:
+        mechanism = {'cylinder': '气缸', 'vacuum': '真空通道'}[indexed[1].casefold()]
+        return f'{indexed[2]}号{mechanism}', ''
+    # An axis with no Chinese documentation can still retain its channel index.
+    number = re.search(r'\d+', actual.rsplit('.', 1)[-1])
+    return (f'{int(number[0])}号{mechanism}' if number and mechanism else mechanism), ''
 
 
 class DescriptionContext:
@@ -173,11 +202,54 @@ class DescriptionContext:
             return item['id']
 
         add('observed_pair', {'variable': variable, 'from': number, 'to': end[1]}, local=True)
-        for command in commands[:24]:
+        command_refs, action_keys, required = {}, set(), []
+        for command in commands:
             c = _compact_command(command)
+            actuals = named_arguments(c['arguments'])
+            effects = list(self.index.call_evidence.effects(c, actuals)) if actuals else []
+            specs = list(action_specs(c, actuals, effects)) if relation != 'ambiguous_scope' else []
+            if len(command_refs) >= 24 and not specs:
+                continue
             prefix = re.match(r'^\s*(?:步\s*)?(\d+)\s*[-—:：>]', c['comment'])
             usable_comment = not prefix or int(prefix[1]) == number
-            add('current_command', c, local=True, comment_matches_step=usable_comment)
+            ref = add('current_command', c, local=True, comment_matches_step=usable_comment)
+            command_refs[command['id']] = ref
+            effect_refs = {}
+            for effect in effects:
+                effect_refs[effect['target'], effect['callee_node']] = add(
+                    'bound_write', {'call_ref': ref, **effect}, local=True,
+                    caveat='实参代入后的源码条件写入，保留门控，不能证明现场输出或到位')
+            for actual, mechanism, operation, target, writes in specs:
+                binding = self.index.call_evidence.binding(c['scope'], actual)
+                label, doc = _object_label(self.docs, binding, actual, mechanism)
+                if not label:
+                    continue
+                key = (c['scope'], actual.casefold(), operation, target)
+                if key in action_keys:
+                    continue
+                action_keys.add(key)
+                label_ref = add('object_binding', binding) if binding else ''
+                if operation == '原位侧请求' and label.endswith('气缸'):
+                    operation = '回原位请求'
+                phrase = f'向{label}发出{operation}' if operation.endswith('请求') else f'{label}{operation}{target}'
+                required.append(add('action_anchor', {
+                    'call_ref': ref, 'actual': actual, 'object': label, 'operation': operation,
+                    'target': target, 'phrase': phrase, 'object_documentation': doc, 'label_ref': label_ref,
+                    'write_refs': [effect_refs[e['target'], e['callee_node']] for e in writes],
+                }, local=True))
+        # A timer that drives an alarm coil is evidence of monitoring. Its
+        # preset must not become the observed dwell or a normal branch delay.
+        included = [c for c in commands if c['id'] in command_refs]
+        for timer in included:
+            if timer['role'] != 'timer' or not timer['node']:
+                continue
+            for coil in included:
+                if (coil['command'] == 'coil_set' and coil['scope'] == timer['scope']
+                        and coil['network'] == timer['network']
+                        and re.search(r'alarm|timeout', coil['arguments'], re.I)
+                        and (';' + timer['node'] + ';') in (';' + coil['path'] + ';')):
+                    add('timer_alarm', {'timer_ref': command_refs[timer['id']], 'alarm_ref': command_refs[coil['id']],
+                                        'target': coil['arguments'], 'operation': '超时监控'}, local=True)
         for note in notes[:12]:
             add('start_comment', note, local=True)
         for edge in direct[:12]:
@@ -215,7 +287,7 @@ class DescriptionContext:
         symbols = set()
         for item in evidence:
             data = item['data']
-            for key in ('arguments', 'guard', 'feedback', 'next_state'):
+            for key in ('arguments', 'guard', 'feedback', 'next_state', 'target'):
                 symbols.update(_symbols(data.get(key, '')))
         local_symbols = set()
         for command in commands:
@@ -265,12 +337,124 @@ class DescriptionContext:
         packet = {'schema': SCHEMA, 'relation': relation,
                   'memory_file': MEMORY_FILE,
                   'source_fingerprint': self.fingerprint, 'evidence': evidence,
+                  'required_actions': required,
                   'available_kinds': sorted(_KINDS),
                   'limitations': ['描述起始步；结束步注释和静态路径只作上下文',
                                  '调用实参、门控和映射可共同支持推断；机构同类命名只支持类别推断',
                                  '不得仅按步号大小、0值、工位名或相邻展示行猜动作']}
-        packet['basis'] = stable_id('TB2', [start, end, packet])
+        packet['basis'] = stable_id('TB3', [start, end, packet])
         return packet
+
+
+def _clause_refs(refs, catalog):
+    if not isinstance(refs, list) or any(not isinstance(ref, str) or ref not in catalog for ref in refs):
+        return None
+    return [catalog[ref] for ref in dict.fromkeys(refs)]
+
+
+def _clause_evidence(selected, step):
+    """Separate names from evidence of an operation at the starting state."""
+    local = [e for e in selected if e['local'] and e['category'] in {
+        'current_command', 'guarded_call', 'bound_write', 'timer_alarm', 'start_comment', 'direct_control',
+    }]
+    facts, objects, asserted = [], [], set()
+    symbols = set()
+    for item in local:
+        data = item['data']
+        for key in ('arguments', 'guard', 'feedback', 'target'):
+            symbols.update(s.casefold() for s in _symbols(data.get(key, '')))
+        if item['category'] == 'start_comment':
+            facts.append(data['text'])
+        elif item['category'] == 'timer_alarm':
+            facts.append(data['operation'])
+        elif item['category'] in {'current_command', 'guarded_call', 'direct_control'}:
+            facts.append(_comment_text(data.get('comment', ''), step))
+            if item['category'] == 'current_command' and data['command'].casefold() == 'coil_set':
+                asserted.add(data['arguments'].casefold())
+        elif data.get('write') == 'coil_set':
+            asserted.add(data['target'].casefold())
+    for item in selected:
+        data = item['data']
+        name = data.get('symbol', data.get('target', '')).casefold()
+        if name not in symbols:
+            continue
+        if item['category'] in {'exact_mapping', 'object_binding', 'wordbook_mapping'}:
+            objects.append(data.get('label', data.get('text', '')))
+        if item['category'] in {'naming_analogy', 'annotated_mapping'}:
+            objects.extend(data.get('mechanism_classes', ()))
+        if item['category'] == 'wordbook_mapping' and name in asserted:
+            facts.append(data['text'])
+    return bool(local), '\n'.join(facts), '\n'.join(objects)
+
+
+def _validate_action_clauses(result, context):
+    catalog = {item['id']: item for item in context['evidence']}
+    required = set(context['required_actions'])
+    actions = result.get('actions')
+    if not isinstance(actions, list) or not actions:
+        return None, 'B档须提交动作分句actions，逐项交代对象和动作'
+    reasoning = result.get('reasoning')
+    if result.get('kind') not in _KINDS or not isinstance(reasoning, str) or not reasoning.strip():
+        return None, '须回传行性质和基于引用的推断说明reasoning'
+
+    step = next(item['data']['from'] for item in catalog.values() if item['category'] == 'observed_pair')
+    used, refs, phrases = set(), [], []
+    for clause in actions:
+        if not isinstance(clause, dict):
+            return None, '动作分句须为JSON对象'
+        selected = _clause_refs(clause.get('evidence_refs', []), catalog)
+        if selected is None:
+            return None, '动作分句须引用本行证据包中的有效证据ID'
+        anchor = clause.get('action_ref')
+        if anchor is not None:
+            if not isinstance(anchor, str) or anchor not in required or anchor in used:
+                return None, 'action_ref须为本行未重复的动作锚点'
+            used.add(anchor)
+            data = catalog[anchor]['data']
+            phrases.append(data['phrase'])
+            refs.extend([anchor, data['call_ref'], *data['write_refs']])
+            if data['label_ref']:
+                refs.append(data['label_ref'])
+        else:
+            values = [clause.get(key, '') for key in ('subject', 'action', 'target')]
+            if any(not isinstance(v, str) or len(v) > 80 or '\n' in v or '\r' in v for v in values):
+                return None, '对象、动作、目标字段须为单行短语'
+            subject, action, target = (v.strip() for v in values)
+            if not re.search(r'[\u4e00-\u9fff]', subject) or subject in _GENERIC_SUBJECTS:
+                return None, '分句缺少执行机构、处理对象或具体条件'
+            if not _VERB.search(action):
+                return None, '分句缺少明确动作，机构名称或“动作、控制”不足以交付'
+            local, facts, objects = _clause_evidence(selected, step)
+            if not local:
+                return None, '分句缺少本步指令、注释或控制证据'
+            if any(token not in facts + objects for token in _CLASSES if token in subject):
+                return None, '分句中的机构类别缺少本步绑定或中文映射'
+            for detail in _SPECIFIC.findall(action + target):
+                if detail not in facts:
+                    return None, f'具体动作“{detail}”缺少同一步的指令效果或注释支持'
+            target_name = re.sub(r'^(?:至|到)\s*', '', target)
+            for detail in re.findall(r'\d+(?:\.\d+)?\s*(?:号位|毫秒|秒|分钟)|[\u4e00-\u9fff]{2,}(?:位置|工位|料位|安全位)', target_name):
+                if detail not in facts:
+                    return None, f'目标或时间“{detail}”缺少本步证据'
+            phrase = subject + action + target
+            for token in re.findall(r'[A-Za-z_][A-Za-z_0-9.\[\]]*', phrase):
+                if not token.isupper() or (len(token) > 1 and token not in facts + objects):
+                    return None, '分句含未映射的变量名或英文'
+            phrases.append(phrase)
+        refs.extend(item['id'] for item in selected)
+    if missing := required - used:
+        labels = [catalog[ref]['data']['object'] for ref in context['required_actions'] if ref in missing]
+        return None, '遗漏本步已绑定的动作对象 ' + '、'.join(dict.fromkeys(labels))
+
+    # The same actuator may have alternative commands under different guards.
+    # Keep those phrases conditional instead of implying a sequence of moves.
+    objects = [catalog[ref]['data']['actual'].casefold() for ref in used]
+    prefix = '按分支条件执行，' if len(objects) != len(set(objects)) else ''
+    level = ('同类命名推断' if any(catalog[ref]['category'] == 'naming_analogy' for ref in refs)
+             else '上下文证据推断')
+    return {'desc': prefix + '，'.join(phrases), 'kind': result['kind'],
+            'refs': list(dict.fromkeys(refs)), 'reasoning': reasoning.strip(),
+            'evidence_level': level}, ''
 
 
 def validate_context_result(result, context):
@@ -279,6 +463,9 @@ def validate_context_result(result, context):
         return None, 'B档证据版本不匹配'
     if result.get('ok') is not True:
         return None, str(result.get('reason') or 'B档证据不足')
+    if context.get('schema') == SCHEMA:
+        return _validate_action_clauses(result, context)
+    # Keep earlier saved v2 runs readable. A v3 packet has a different basis.
     refs = result.get('evidence_refs')
     catalog = {item['id']: item for item in context['evidence']}
     if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or ref not in catalog for ref in refs):
