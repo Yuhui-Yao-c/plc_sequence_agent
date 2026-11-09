@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import test_trace_to_pairs as fixtures
 from action_describe import cmd_a, cmd_build, cmd_validate
@@ -92,14 +93,17 @@ class TraceDescriptionTests(unittest.TestCase):
         self.source_edges(self.run, [(10, 20)])
         command = self.command(10, 1, 'CustomCycle', 'Device=EM01.Cy_Up2;Enable=RunSignal')
         command['guard_complete'] = False
-        self.write_csv(self.run / 'native_command_evidence.csv', [command])
+        effect = self.command(0, 2, 'coil_set', 'Device.CycleRequest')
+        effect.update(scope='CustomCycle::body', start='', guard='Enable')
+        self.write_csv(self.run / 'native_command_evidence.csv', [command, effect])
         (self.run / 'variable_documentation.json').write_text(json.dumps({'all': {
             'EM01.Cy_Up1': '上料气缸伸出位置', 'EM02.Cy_Up1': '伺服电机'}}, ensure_ascii=False))
         return self.prepare()[1]
 
-    def write_result(self, row, refs, action='启动循环'):
+    def write_result(self, row, refs, action='启动循环', *, source_ref='', subject_symbol=''):
         result = {'basis': row['basis'], 'ok': True, 'kind': '机械动作',
-                  'actions': [{'subject': '气缸', 'action': action, 'evidence_refs': refs}],
+                  'actions': [{'subject': '气缸', 'action': action, 'evidence_refs': refs,
+                               'source_ref': source_ref, 'subject_symbol': subject_symbol}],
                   'reasoning': '本步调用绑定该变量，同命名族文档支持气缸类别，方向未知'}
         data = {'batch_id': 1, 'descs': {'Step[1]=10|||Step[1]=20': result}}
         (self.run / 'batches_desc/batch_001.result.json').write_text(json.dumps(data, ensure_ascii=False))
@@ -109,12 +113,14 @@ class TraceDescriptionTests(unittest.TestCase):
         info = self.analogy_fixture()
         items = info['description_context']['evidence']
         command = next(e for e in items if e['category'] == 'current_command')
+        effect = next(e for e in items if e['category'] == 'bound_write')
         analogies = [e for e in items if e['category'] == 'naming_analogy']
         self.assertEqual(len(analogies), 1)
         self.assertEqual(analogies[0]['data']['example_symbol'], 'EM01.Cy_Up1')
-        self.assertNotIn('伸出', json.dumps(analogies, ensure_ascii=False))
+        self.assertIn('上料气缸伸出位置', analogies[0]['data']['example_text'])
+        self.assertFalse(analogies[0]['local'])
         refs = [command['id'], analogies[0]['id']]
-        result, data = self.write_result(info, refs)
+        result, data = self.write_result(info, refs, source_ref=effect['id'], subject_symbol='EM01.Cy_Up2')
         stats = {}
         final = cmd_validate(self.run, stats=stats)
         self.assertEqual(stats['b_candidates'], 1)
@@ -126,11 +132,13 @@ class TraceDescriptionTests(unittest.TestCase):
         remarks = [str(row[0]) for row in book.active.iter_rows(min_col=8, max_col=8, values_only=True)]
         book.close()
         self.assertTrue(any('同类命名推断' in text and '方向未知' in text for text in remarks))
-        result['actions'][0]['action'] = '伸出'
+        result['actions'][0].update(action='伸出', source_ref=analogies[0]['id'])
         (self.run / 'batches_desc/batch_001.result.json').write_text(json.dumps(data, ensure_ascii=False))
         cmd_validate(self.run, stats=stats)
         self.assertEqual(stats['b_candidates'], 0)
-        self.assertIn('伸出', self.read_csv(self.run / 'action_desc_review.csv')[0]['原因'])
+        self.assertIn('本步', self.read_csv(self.run / 'action_desc_review.csv')[0]['原因'])
+        result['actions'][0]['source_ref'] = command['id']
+        self.assertIn('缺少本步动作效果', validate_context_result(result, info['description_context'])[1])
 
     def test_source_change_invalidates_old_context_results(self):
         info = self.analogy_fixture()
@@ -153,13 +161,15 @@ class TraceDescriptionTests(unittest.TestCase):
         known = self.command(5, 1, 'oneCyControl', 'CY=EM01.Cy_Up1;Enable=RunSignal')
         known['comment'] = '5-升降气缸伸出'
         unknown = self.command(10, 2, 'oneCyControl', 'CY=EM01.Cy_Up2;Enable=RunSignal')
-        self.write_csv(self.run / 'native_command_evidence.csv', [known, unknown])
+        effect = self.command(0, 3, 'coil_set', 'CY.AutoStrOut')
+        effect.update(scope='OneCyControl::body', start='', guard='Enable')
+        self.write_csv(self.run / 'native_command_evidence.csv', [known, unknown, effect])
         _, info = self.prepare()
         self.assertEqual(info['description'], '')
         examples = [e for e in info['description_context']['evidence'] if e['category'] == 'naming_analogy']
         self.assertTrue(any(e['data']['example_symbol'] == 'EM01.Cy_Up1' and
-                            e['data']['mechanism_classes'] == ['气缸'] for e in examples))
-        self.assertTrue(all('伸出' not in json.dumps(e, ensure_ascii=False) for e in examples))
+                            e['data']['example_text'] == known['comment'] for e in examples))
+        self.assertTrue(all(not e['local'] for e in examples))
 
     def test_all_unannotated_rows_are_batched_even_without_source_match(self):
         self.record()
@@ -216,9 +226,13 @@ class TraceDescriptionTests(unittest.TestCase):
         candidate, issue = validate_context_result(result, context)
         self.assertFalse(issue)
         self.assertEqual(candidate['desc'], '向下料A侧夹子气缸发出回原位请求，向下料B侧夹子气缸发出工位侧请求')
-        ids = [e['id'] for e in context['evidence'] if e['category'] in {'current_command', 'candidate_path', 'object_binding'}]
-        result['actions'].append({'subject': '下料A侧夹子气缸', 'action': '松开', 'evidence_refs': ids})
-        self.assertIn('松开', validate_context_result(result, context)[1])
+        call_ref = next(e['id'] for e in context['evidence'] if e['category'] == 'current_command')
+        result['actions'].append({'subject': '下料A侧夹子气缸', 'action': '松开', 'source_ref': call_ref,
+                                  'subject_symbol': 'Cylinder[3]'})
+        self.assertIn('已由动作锚点覆盖', validate_context_result(result, context)[1])
+        result['actions'][-1]['source_ref'] = next(
+            e['id'] for e in context['evidence'] if e['category'] == 'candidate_path')
+        self.assertIn('仅可作上下文', validate_context_result(result, context)[1])
 
     def test_timeout_monitoring_evidence_does_not_support_a_fixed_dwell(self):
         self.record(10, 20)
@@ -231,10 +245,48 @@ class TraceDescriptionTests(unittest.TestCase):
         context = info['description_context']
         monitor, = [e for e in context['evidence'] if e['category'] == 'timer_alarm']
         result = {'ok': True, 'basis': info['basis'], 'kind': '内部辅助', 'reasoning': '定时器输出接报警线圈',
-                  'actions': [{'subject': '取料条件', 'action': '超时监控', 'evidence_refs': [monitor['id']]}]}
+                  'actions': [{'subject': '取料条件', 'action': '超时监控',
+                               'source_ref': monitor['id'], 'subject_symbol': 'Alarm[1]'}]}
         self.assertEqual(validate_context_result(result, context)[0]['desc'], '取料条件超时监控')
         result['actions'][0].update(action='等待', target='5秒')
         self.assertIn('5秒', validate_context_result(result, context)[1])
+
+    def test_unfamiliar_device_action_and_unit_use_bound_source_evidence(self):
+        self.record(10, 20)
+        self.source_edges(self.run, [(10, 20)])
+        call = self.command(10, 1, 'DepositCycle', 'Substrate=Cell.靶位2;FilmNm=REAL#25.5;Enable=RunSignal')
+        effect = self.command(0, 2, 'coil_set', 'Substrate.SputterRequest')
+        effect.update(scope='DepositCycle::body', start='', guard='Enable')
+        self.write_csv(self.run / 'native_command_evidence.csv', [call, effect])
+        (self.run / 'variable_documentation.json').write_text(
+            json.dumps({'all': {'Cell.靶位2': '氮化硅靶'}}, ensure_ascii=False))
+        _, info = self.prepare()
+        context = info['description_context']
+        self.assertEqual(context['required_actions'], [])
+        write, = [e for e in context['evidence'] if e['category'] == 'bound_write']
+        mapping, = [e for e in context['evidence'] if e['category'] == 'exact_mapping']
+        clause = {'subject': '氮化硅靶', 'action': '磁控溅射镀膜指令下发', 'target': '，膜厚设定25.5纳米',
+                  'source_ref': write['id'], 'subject_symbol': 'Cell.靶位2',
+                  'target_parameter': 'FilmNm', 'evidence_refs': [mapping['id']]}
+        result = {'ok': True, 'basis': info['basis'], 'kind': '薄膜沉积', 'actions': [clause],
+                  'reasoning': '实参绑定靶位2，SputterRequest置位，FilmNm设为25.5'}
+        path = self.run / 'batches_desc/batch_001.result.json'
+        path.write_text(json.dumps({'batch_id': 1, 'descs': {'Step[1]=10|||Step[1]=20': result}},
+                                   ensure_ascii=False))
+        with patch('action_describe.load_wb', side_effect=AssertionError('Trace v4 must not load a word list')):
+            final = cmd_validate(self.run)
+        row, = self.read_csv(final)
+        self.assertEqual(row['动作描述'], '氮化硅靶磁控溅射镀膜指令下发，膜厚设定25.5纳米')
+        self.assertEqual(row['描述状态'], 'LLM推断待核验')
+        self.assertEqual(row['行性质'], '薄膜沉积')
+        for key, value, issue in [
+            ('subject_symbol', 'Cell.靶位1', '不匹配'),
+            ('source_ref', mapping['id'], '本步'),
+            ('target', '至26纳米', '缺少本步'),
+            ('action', '', '对象和动作'),
+        ]:
+            changed = {**result, 'actions': [{**clause, key: value}]}
+            self.assertIn(issue, validate_context_result(changed, context)[1])
 
     def test_context_includes_guarded_call_and_shared_symbol_binding(self):
         self.record(10, 20)

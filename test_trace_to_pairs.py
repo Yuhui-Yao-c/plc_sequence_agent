@@ -171,7 +171,7 @@ class SysmacRecordingTests(unittest.TestCase):
         self.assertEqual(cmd_build(run, batch_size=1), 3)
         batch_dir = run / 'batches_desc'
         batch = json.loads((batch_dir / 'batch_002.input.json').read_text(encoding='utf-8'))
-        self.assertEqual(batch['schema'], 'trace-description-context-v3')
+        self.assertEqual(batch['schema'], 'trace-description-context-v4')
         row, = batch['rows']
         command = next(e for e in row['context']['evidence'] if e['category'] == 'current_command')
         anchor, = row['context']['required_actions']
@@ -204,7 +204,8 @@ class SysmacRecordingTests(unittest.TestCase):
         self.assertEqual(stats['b_tier_result_count'], 2)
         self.assertEqual(stats['b_tier_pending_rows'], 2)
 
-        result['actions'].append({'subject': '轴', 'action': '焊接定位', 'evidence_refs': [command['id']]})
+        result['actions'].append({'subject': '轴', 'action': '焊接定位', 'source_ref': command['id'],
+                                  'subject_symbol': 'Axis1'})
         path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         cmd_validate(run, stats=stats)
         self.assertEqual(stats['b_candidates'], 0)

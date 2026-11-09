@@ -1,9 +1,4 @@
-"""Bounded, source-backed context for Trace description batches.
-
-Memory is rebuilt from this project's documentation, annotated commands and
-wordbook. Naming analogies transfer a mechanism class, never a direction or
-target position. LLM candidates are not promoted back into source facts.
-"""
+"""Trace description evidence and checks independent of process vocabulary."""
 from __future__ import annotations
 
 import csv
@@ -11,29 +6,20 @@ import hashlib
 import json
 import re
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from atomic_boundaries import stable_id
-from trace_call_evidence import action_specs, device_label, named_arguments
+from boundary_logic import IDENT, symbol as normalize_symbol
+from trace_call_evidence import action_details, action_specs, named_arguments
 from trace_source_evidence import _comment_text
 
 MEMORY_FILE = 'trace_semantic_memory.json'
-SCHEMA = 'trace-description-context-v3'
-_SYMBOL = re.compile(r'[A-Za-z_][\w]*(?:\[\d+\])?(?:\.[A-Za-z_]\w*(?:\[\d+\])?)*')
-_CLASSES = ('气缸', '伺服', '电机', '机器人', '吸盘', '真空', '定时器')
-_KINDS = {'机械动作', '加工保持', '检测测量', '工艺等待', '交接数据', '周期汇总', '内部辅助', '信号/标志', '步进', '未分类'}
-_SPECIFIC = re.compile(
-    r'破真空|吸附|吹气|停止吸气|松开|夹紧|夹取|张开|闭合|伸出|缩回|上升|下降|'
-    r'正转|反转|回原位|回零|焊接|点胶|贴胶|到位|完成|超时监控|定时等待|延时'
-)
-_VERB = re.compile(
-    r'判断|选择|检测|测量|检查|监控|等待|定位|运行|搬运|移载|移动|保持|计时|'
-    r'请求|发出|置位|复位|写入|清零|保存|读取|记录|发送|接收|传递|允许|确认|'
-    r'启动|停止|切换|报警|屏蔽|触发|进入|退出|取料|放料|取件|放件|'
-    r'扫码|拍照|前进|后退|旋转|伸出|缩回|回原位|回零|夹紧|松开|闭合|张开|'
-    r'吸附|破真空|吹气|上升|下降|正转|反转|焊接|点胶|贴胶|剪切|贴合|握手'
-)
-_GENERIC_SUBJECTS = {'本步', '步骤', '设备', '机构', '系统', '工艺', '动作', '信号', '流程', '状态'}
+SCHEMA = 'trace-description-context-v4'
+LEGACY_CLAUSE_SCHEMA = 'trace-description-context-v3'
+_SYMBOL = re.compile(IDENT)
+_NUMBER = r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
+_EXPRESSION_WORDS = {'and', 'or', 'xor', 'not', 'true', 'false', 'mod'}
 
 
 def _read(path):
@@ -68,7 +54,7 @@ def _symbols(text):
     out = set()
     text = re.sub(r'\b(?:T|TIME|LTIME)#[\w.]+', '', text or '', flags=re.I)
     for match in _SYMBOL.finditer(text or ''):
-        parts = match[0].split('.')
+        parts = normalize_symbol(match[0]).split('.')
         out.update('.'.join(parts[:i]) for i in range(1, len(parts) + 1))
     return out
 
@@ -79,71 +65,47 @@ def _compact_command(command):
     return {key: command.get(key, '') for key in fields}
 
 
-def _object_label(docs, binding, actual, mechanism):
-    doc = docs.get(actual.casefold())
-    if doc and re.search(r'[\u4e00-\u9fff]', doc[1]):
-        return device_label(doc[1]), doc[1]
-    if binding:
-        return binding['label'], binding['text']
-    indexed = re.fullmatch(r'(Cylinder|Vacuum)\[(\d+)\]', actual, re.I)
-    if indexed:
-        mechanism = {'cylinder': '气缸', 'vacuum': '真空通道'}[indexed[1].casefold()]
-        return f'{indexed[2]}号{mechanism}', ''
-    # An axis with no Chinese documentation can still retain its channel index.
-    number = re.search(r'\d+', actual.rsplit('.', 1)[-1])
-    return (f'{int(number[0])}号{mechanism}' if number and mechanism else mechanism), ''
-
-
 class DescriptionContext:
     def __init__(self, run, index, wanted):
         self.run, self.index = Path(run), index
         docs = _json(self.run / 'variable_documentation.json', {})
         self.docs = {key.casefold(): (key, _clean(value))
                      for key, value in (docs.get('all') or {}).items() if _clean(value)}
-        self.wordbook = _json(Path(__file__).with_name('action_wordbook.json'), {})
         self.families = defaultdict(list)
         entries = []
         for symbol, text in self.docs.values():
-            classes = [word for word in _CLASSES if word in text]
-            if not classes:
+            family = _family(symbol)
+            if not family:
                 continue
-            item = {'symbol': symbol, 'text': text, 'mechanism_classes': classes,
-                    'source': 'variable_documentation.json'}
+            item = {'symbol': symbol, 'text': text, 'source': 'variable_documentation.json'}
             item['id'] = stable_id('TM', item)
             entries.append(item)
-            if family := _family(symbol):
-                self.families[family].append(item)
-        # Learn object classes from annotated, explicitly bound actuator calls.
-        # Only their object parameter is learned; alarm/enable arguments are not
-        # cylinders just because they occur in the same invocation.
+            self.families[family].append(item)
+        # Find family examples by parameter binding or an observed source
+        # write. Keep the annotation as context, without extracting a noun class.
         for commands in index.commands.values():
             for command in commands:
-                classes = [word for word in _CLASSES if word in command.get('comment', '')]
-                kind = command.get('command', '').casefold()
-                if not classes:
+                if not command.get('comment'):
                     continue
-                if kind in ('axismove', 'mc_moveabsolute', 'mc_moverelative', 'mc_movevelocity'):
-                    parameter = r'_?Axis'
-                elif kind in ('onecycontrol', 'twocycontrol', 'fourcycontrol'):
-                    parameter = r'CY(?:_[1-4])?'
-                else:
-                    continue
-                for match in re.finditer(r'(?:^|;)\s*(' + parameter + r')\s*=\s*([^;]+)', command.get('arguments', ''), re.I):
-                    symbol = match[2].strip()
-                    if not _SYMBOL.fullmatch(symbol):
+                actuals = named_arguments(command['arguments'])
+                effects = list(index.call_evidence.effects(command, actuals))
+                objects = {effect['actual'] for effect in effects}
+                objects.update(spec[0] for spec in action_specs(command, actuals, effects))
+                for symbol in sorted(objects):
+                    family = _family(symbol)
+                    if not family:
                         continue
-                    item = {'symbol': symbol, 'text': command['comment'], 'mechanism_classes': classes,
+                    item = {'symbol': symbol, 'text': command['comment'],
                             'source': 'annotated_call', 'source_ref': command['id'], 'scope': command['scope']}
                     item['id'] = stable_id('TM', item)
                     entries.append(item)
-                    if family := _family(symbol):
-                        self.families[family].append(item)
+                    self.families[family].append(item)
         self.calls = defaultdict(list)
         self.related = defaultdict(list)
         used_symbols = set()
         for commands in index.commands.values():
             for command in commands:
-                used_symbols.update(m[0] for m in _SYMBOL.finditer(command.get('arguments', '')))
+                used_symbols.update(_symbols(command.get('arguments', '')))
         used_symbols = {s.casefold() for s in used_symbols
                         if ('.' in s or '[' in s or len(s) >= 6) and s.casefold() not in wanted}
         pattern = re.compile(r'(?<![\w.\[\]])(' + '|'.join(
@@ -158,7 +120,7 @@ class DescriptionContext:
                 self.calls[state].append(item)
             # One source-backed hop through an actual bound/shared symbol.
             # Common enables and bare station roots do not create a call graph.
-            event_symbols = {m[0].casefold() for m in _SYMBOL.finditer(' '.join(
+            event_symbols = {normalize_symbol(m[0]).casefold() for m in _SYMBOL.finditer(' '.join(
                 item.get(key, '') for key in ('arguments', 'guard', 'feedback', 'next_state')))}
             for symbol in event_symbols & used_symbols:
                 if len(self.related[symbol]) < 24:
@@ -176,12 +138,10 @@ class DescriptionContext:
             digest.update(name.encode())
             if path.is_file():
                 digest.update(path.read_bytes())
-        digest.update(json.dumps(self.wordbook, ensure_ascii=False, sort_keys=True).encode())
         self.fingerprint = digest.hexdigest()
-        memory = {'schema': 1, 'source_fingerprint': self.fingerprint,
-                  'policy': '同工程源码映射及注释示例；命名类比仅转移机构类别，不能转移方向、位置或完成状态；LLM结果不作为源码事实回流',
-                  'mechanism_mappings': entries, 'annotated_commands': annotated,
-                  'wordbook': self.wordbook}
+        memory = {'schema': 2, 'source_fingerprint': self.fingerprint,
+                  'policy': '同工程源码命名及注释示例。名称类比仅作对象识别提示。动作、目标及完成状态须有独立本步证据。',
+                  'naming_examples': entries, 'annotated_commands': annotated}
         (self.run / MEMORY_FILE).write_text(json.dumps(memory, ensure_ascii=False, indent=1), encoding='utf-8')
 
     def packet(self, start, end, relation, direct, path, commands, notes):
@@ -221,7 +181,8 @@ class DescriptionContext:
                     caveat='实参代入后的源码条件写入，保留门控，不能证明现场输出或到位')
             for actual, mechanism, operation, target, writes in specs:
                 binding = self.index.call_evidence.binding(c['scope'], actual)
-                label, doc = _object_label(self.docs, binding, actual, mechanism)
+                doc = self.docs.get(actual.casefold(), ('', ''))[1]
+                label, operation, phrase = action_details(actual, mechanism, operation, target, doc, binding)
                 if not label:
                     continue
                 key = (c['scope'], actual.casefold(), operation, target)
@@ -229,12 +190,10 @@ class DescriptionContext:
                     continue
                 action_keys.add(key)
                 label_ref = add('object_binding', binding) if binding else ''
-                if operation == '原位侧请求' and label.endswith('气缸'):
-                    operation = '回原位请求'
-                phrase = f'向{label}发出{operation}' if operation.endswith('请求') else f'{label}{operation}{target}'
                 required.append(add('action_anchor', {
                     'call_ref': ref, 'actual': actual, 'object': label, 'operation': operation,
-                    'target': target, 'phrase': phrase, 'object_documentation': doc, 'label_ref': label_ref,
+                    'target': target, 'phrase': phrase, 'object_documentation': doc or (binding or {}).get('text', ''),
+                    'label_ref': label_ref,
                     'write_refs': [effect_refs[e['target'], e['callee_node']] for e in writes],
                 }, local=True))
         # A timer that drives an alarm coil is evidence of monitoring. Its
@@ -274,14 +233,14 @@ class DescriptionContext:
         related = {}
         for command in commands:
             for match in _SYMBOL.finditer(command.get('arguments', '')):
-                symbol = match[0]
-                for call in self.related.get(symbol.casefold(), []):
-                    if '.' not in symbol and call['source_unit'] not in local_scopes:
+                actual = normalize_symbol(match[0])
+                for call in self.related.get(actual.casefold(), []):
+                    if '.' not in actual and call['source_unit'] not in local_scopes:
                         continue
                     if call not in self.calls.get(start, []):
-                        related.setdefault(call['id'], (symbol, call))
-        for symbol, call in list(related.values())[:8]:
-            add('related_call', {'shared_symbol': symbol, **call},
+                        related.setdefault(call['id'], (actual, call))
+        for actual, call in list(related.values())[:8]:
+            add('related_call', {'shared_symbol': actual, **call},
                 caveat='调用实参或门控共用同一符号的一跳关联，需LLM结合作用域判断，不能直接当成本步动作')
 
         symbols = set()
@@ -294,9 +253,9 @@ class DescriptionContext:
             local_symbols.update(_symbols(command.get('arguments', '')))
             local_symbols.update(_symbols(command.get('guard', '')))
         def rank(symbol):
-            found = self.docs.get(re.sub(r'\[\d+\]', '', symbol).casefold())
-            mechanism = found and any(word in found[1] for word in _CLASSES)
-            return (0 if '[' in symbol or mechanism else 2 if symbol.startswith('_') else 1, symbol)
+            documented = (symbol.casefold() in self.docs
+                          or re.sub(r'\[\d+\]', '', symbol).casefold() in self.docs)
+            return (not documented, symbol)
         ordered = sorted(local_symbols, key=rank) + sorted(symbols - local_symbols, key=rank)
         for symbol in ordered:
             found = self.docs.get(symbol.casefold()) or self.docs.get(re.sub(r'\[\d+\]', '', symbol).casefold())
@@ -307,42 +266,24 @@ class DescriptionContext:
                     caveat='数组声明文档适用于类型，不证明某个数组项的独有方向或用途' if symbol.casefold() != name.casefold() else '')
             if (not found or not re.search(r'[\u4e00-\u9fff]', found[1])) and (family := _family(symbol)):
                 examples = self.families.get(family, [])
-                unscoped = False
-                if not examples and '.' in symbol:
-                    examples = self.families.get(_family(symbol.split('.')[-1]), [])
-                    unscoped = bool(examples)
                 examples = [item for item in examples if item.get('source') != 'annotated_call'
-                            or '.' in symbol or item.get('scope') in local_scopes]
+                            or item.get('scope') in local_scopes]
                 same_object = [item for item in examples if item['symbol'].casefold() == symbol.casefold()]
-                examples = same_object or examples
-                classes = set.intersection(*(set(item['mechanism_classes']) for item in examples)) if examples else set()
-                if len(classes) == 1:
-                    for example in examples[:2]:
-                        add('annotated_mapping' if same_object else 'naming_analogy',
-                            {'target': symbol, 'example_symbol': example['symbol'],
-                            'mechanism_classes': sorted(classes), 'source_ref': example['id']},
-                            caveat=('未限定声明作用域的同名族提示；' if unscoped else '') +
-                                   '同命名族类别推断；仅可推断机构类别，不能照搬示例的方向、目标位和用途')
-            chain = re.sub(r'\[\d+\]', '[N]', symbol)
-            for pattern, word in self.wordbook.get('member_patterns', {}).items():
-                if re.fullmatch(pattern, chain) or ('.' in chain and re.fullmatch(pattern, chain.split('.', 1)[1])):
-                    add('wordbook_mapping', {'symbol': symbol, 'text': word, 'pattern': pattern})
-                    break
-            member = symbol.split('.')[-1]
-            word = self.wordbook.get('members', {}).get(member)
-            if word:
-                add('wordbook_mapping', {'symbol': symbol, 'text': word})
+                for example in (same_object or examples)[:2]:
+                    add('annotated_mapping' if same_object else 'naming_analogy',
+                        {'target': symbol, 'example_symbol': example['symbol'],
+                         'example_text': example['text'], 'source_ref': example['id']},
+                        caveat='名称提示。动作、方向、目标及反馈须引用本步证据。')
             if len(evidence) >= 100:
                 break
         packet = {'schema': SCHEMA, 'relation': relation,
                   'memory_file': MEMORY_FILE,
                   'source_fingerprint': self.fingerprint, 'evidence': evidence,
                   'required_actions': required,
-                  'available_kinds': sorted(_KINDS),
                   'limitations': ['描述起始步；结束步注释和静态路径只作上下文',
                                  '调用实参、门控和映射可共同支持推断；机构同类命名只支持类别推断',
                                  '不得仅按步号大小、0值、工位名或相邻展示行猜动作']}
-        packet['basis'] = stable_id('TB3', [start, end, packet])
+        packet['basis'] = stable_id('TB4', [start, end, packet])
         return packet
 
 
@@ -352,39 +293,66 @@ def _clause_refs(refs, catalog):
     return [catalog[ref] for ref in dict.fromkeys(refs)]
 
 
-def _clause_evidence(selected, step):
-    """Separate names from evidence of an operation at the starting state."""
-    local = [e for e in selected if e['local'] and e['category'] in {
-        'current_command', 'guarded_call', 'bound_write', 'timer_alarm', 'start_comment', 'direct_control',
-    }]
-    facts, objects, asserted = [], [], set()
+def _target_supported(target, parameter, arguments, comment):
+    if not parameter:
+        return target in comment
+    value = named_arguments(arguments).get(parameter.casefold(), '')
+    if not value:
+        return False
+    literal = re.fullmatch(rf'(?:[A-Za-z]+#)?({_NUMBER})', value)
+    if literal:
+        try:
+            return {Decimal(n) for n in re.findall(_NUMBER, target)} == {Decimal(literal[1])}
+        except InvalidOperation:
+            return False
+    value = value.strip("'\"")
+    return bool(value and value in target)
+
+
+def _ground_clause(clause, subject, action, target, catalog, reserved, observed):
+    if not subject or not action or subject == action:
+        return '分句须分别填写具体对象和动作', []
+    ref = clause.get('source_ref')
+    fact = catalog.get(ref) if isinstance(ref, str) else None
+    if not fact or not fact['local']:
+        return '分句须引用本步指令效果、控制条件或适用注释作为source_ref', []
+    if ref in reserved:
+        return '该指令已由动作锚点覆盖，补充分句须引用另一项本步证据', []
+
+    category, data = fact['category'], fact['data']
+    comment = _comment_text(data.get('comment', ''), observed['from'])
+    if category == 'start_comment':
+        comment = data['text']
     symbols = set()
-    for item in local:
-        data = item['data']
-        for key in ('arguments', 'guard', 'feedback', 'target'):
-            symbols.update(s.casefold() for s in _symbols(data.get(key, '')))
-        if item['category'] == 'start_comment':
-            facts.append(data['text'])
-        elif item['category'] == 'timer_alarm':
-            facts.append(data['operation'])
-        elif item['category'] in {'current_command', 'guarded_call', 'direct_control'}:
-            facts.append(_comment_text(data.get('comment', ''), step))
-            if item['category'] == 'current_command' and data['command'].casefold() == 'coil_set':
-                asserted.add(data['arguments'].casefold())
-        elif data.get('write') == 'coil_set':
-            asserted.add(data['target'].casefold())
-    for item in selected:
-        data = item['data']
-        name = data.get('symbol', data.get('target', '')).casefold()
-        if name not in symbols:
-            continue
-        if item['category'] in {'exact_mapping', 'object_binding', 'wordbook_mapping'}:
-            objects.append(data.get('label', data.get('text', '')))
-        if item['category'] in {'naming_analogy', 'annotated_mapping'}:
-            objects.extend(data.get('mechanism_classes', ()))
-        if item['category'] == 'wordbook_mapping' and name in asserted:
-            facts.append(data['text'])
-    return bool(local), '\n'.join(facts), '\n'.join(objects)
+    arguments = ''
+    parent = None
+    if category in ('bound_write', 'timer_alarm'):
+        symbols.update((data.get('actual', ''), data['target']))
+        parent = catalog[data['call_ref']] if category == 'bound_write' else None
+    elif category == 'direct_control' and data.get('guard_complete'):
+        symbols.update(normalize_symbol(m[0]) for m in _SYMBOL.finditer(data['guard']))
+    elif category == 'current_command' and (comment or data.get('role') in {
+            'actuator_command', 'signal_write', 'connected_signal'}):
+        arguments = data['arguments']
+        for actual in named_arguments(arguments).values() or [arguments]:
+            symbols.update(normalize_symbol(m[0]) for m in _SYMBOL.finditer(actual))
+    elif category != 'start_comment':
+        return '此引用仅可作上下文，缺少本步动作效果或条件依据', []
+    if parent:
+        arguments = parent['data']['arguments']
+    bound = {s.casefold() for s in symbols} - _EXPRESSION_WORDS - {observed['variable'].casefold(), ''}
+    actual = clause.get('subject_symbol', '')
+    if not isinstance(actual, str):
+        return 'subject_symbol须为引用证据中的完整PLC对象或条件符号', []
+    if actual.strip():
+        if normalize_symbol(actual).casefold() not in bound:
+            return 'subject_symbol与所引用的本步对象或条件不匹配', []
+    elif not comment or subject not in comment or action not in comment:
+        return '分句须绑定本步对象或条件符号，或引用包含该对象和动作的本步注释', []
+    parameter = clause.get('target_parameter', '')
+    if not isinstance(parameter, str) or (target and not _target_supported(target, parameter.strip(), arguments, comment)):
+        return f'目标“{target}”缺少本步注释或调用实参支持', []
+    return '', [ref] + ([parent['id']] if parent else [])
 
 
 def _validate_action_clauses(result, context):
@@ -393,11 +361,23 @@ def _validate_action_clauses(result, context):
     actions = result.get('actions')
     if not isinstance(actions, list) or not actions:
         return None, 'B档须提交动作分句actions，逐项交代对象和动作'
-    reasoning = result.get('reasoning')
-    if result.get('kind') not in _KINDS or not isinstance(reasoning, str) or not reasoning.strip():
+    reasoning, kind = result.get('reasoning'), result.get('kind')
+    if not isinstance(kind, str) or not kind.strip() or not isinstance(reasoning, str) or not reasoning.strip():
         return None, '须回传行性质和基于引用的推断说明reasoning'
+    legacy = context.get('schema') == LEGACY_CLAUSE_SCHEMA
+    if legacy:
+        from trace_description_legacy import _KINDS, check_v3_phrase
+        if kind not in _KINDS:
+            return None, '须回传行性质和基于引用的推断说明reasoning'
 
-    step = next(item['data']['from'] for item in catalog.values() if item['category'] == 'observed_pair')
+    observed = next(item['data'] for item in catalog.values() if item['category'] == 'observed_pair')
+    # A free clause may describe another source effect, but may not rewrite
+    # the instruction already covered by a deterministic anchor.
+    anchored = {(catalog[ref]['data']['call_ref'], catalog[ref]['data']['actual'].casefold())
+                for ref in required}
+    reserved = {call for call, _ in anchored}
+    reserved.update(item['id'] for item in catalog.values() if item['category'] == 'bound_write'
+                    and (item['data']['call_ref'], item['data']['actual'].casefold()) in anchored)
     used, refs, phrases = set(), [], []
     for clause in actions:
         if not isinstance(clause, dict):
@@ -420,27 +400,14 @@ def _validate_action_clauses(result, context):
             if any(not isinstance(v, str) or len(v) > 80 or '\n' in v or '\r' in v for v in values):
                 return None, '对象、动作、目标字段须为单行短语'
             subject, action, target = (v.strip() for v in values)
-            if not re.search(r'[\u4e00-\u9fff]', subject) or subject in _GENERIC_SUBJECTS:
-                return None, '分句缺少执行机构、处理对象或具体条件'
-            if not _VERB.search(action):
-                return None, '分句缺少明确动作，机构名称或“动作、控制”不足以交付'
-            local, facts, objects = _clause_evidence(selected, step)
-            if not local:
-                return None, '分句缺少本步指令、注释或控制证据'
-            if any(token not in facts + objects for token in _CLASSES if token in subject):
-                return None, '分句中的机构类别缺少本步绑定或中文映射'
-            for detail in _SPECIFIC.findall(action + target):
-                if detail not in facts:
-                    return None, f'具体动作“{detail}”缺少同一步的指令效果或注释支持'
-            target_name = re.sub(r'^(?:至|到)\s*', '', target)
-            for detail in re.findall(r'\d+(?:\.\d+)?\s*(?:号位|毫秒|秒|分钟)|[\u4e00-\u9fff]{2,}(?:位置|工位|料位|安全位)', target_name):
-                if detail not in facts:
-                    return None, f'目标或时间“{detail}”缺少本步证据'
-            phrase = subject + action + target
-            for token in re.findall(r'[A-Za-z_][A-Za-z_0-9.\[\]]*', phrase):
-                if not token.isupper() or (len(token) > 1 and token not in facts + objects):
-                    return None, '分句含未映射的变量名或英文'
-            phrases.append(phrase)
+            if legacy:
+                issue = check_v3_phrase(subject, action, target, selected, observed['from'], _symbols)
+            else:
+                issue, grounding = _ground_clause(clause, subject, action, target, catalog, reserved, observed)
+                refs.extend(grounding)
+            if issue:
+                return None, issue
+            phrases.append(subject + action + target)
         refs.extend(item['id'] for item in selected)
     if missing := required - used:
         labels = [catalog[ref]['data']['object'] for ref in context['required_actions'] if ref in missing]
@@ -463,42 +430,7 @@ def validate_context_result(result, context):
         return None, 'B档证据版本不匹配'
     if result.get('ok') is not True:
         return None, str(result.get('reason') or 'B档证据不足')
-    if context.get('schema') == SCHEMA:
+    if context.get('schema') in {SCHEMA, LEGACY_CLAUSE_SCHEMA}:
         return _validate_action_clauses(result, context)
-    # Keep earlier saved v2 runs readable. A v3 packet has a different basis.
-    refs = result.get('evidence_refs')
-    catalog = {item['id']: item for item in context['evidence']}
-    if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or ref not in catalog for ref in refs):
-        return None, 'B档须引用当前行证据包中的有效证据ID'
-    selected = [catalog[ref] for ref in dict.fromkeys(refs)]
-    local = [e for e in selected if e['local'] and e['category'] != 'observed_pair']
-    if not local:
-        return None, '只有名称映射或步号，缺少本步动作、调用或控制证据'
-    desc, reason = result.get('desc'), result.get('reasoning')
-    if not isinstance(desc, str) or not desc.strip() or len(desc.strip()) > 40:
-        return None, '描述须为1至40字中文'
-    if not re.search(r'[\u4e00-\u9fff]', desc) or any(len(t) >= 2 for t in re.findall(r'[A-Za-z_][A-Za-z0-9_\[\].]*', desc)):
-        return None, '描述含英文或变量名，或缺少中文'
-    if result.get('kind') not in _KINDS or not isinstance(reason, str) or not reason.strip():
-        return None, '须回传行性质和基于引用的推断说明reasoning'
-    text, classes = '', ''
-    for item in selected:
-        if item['category'] == 'naming_analogy':
-            classes += ' '.join(item['data'].get('mechanism_classes', []))
-        if item['category'] in ('naming_analogy', 'neighbor_comment', 'observed_pair'):
-            continue
-        data = dict(item['data'])
-        if item.get('comment_matches_step') is False:
-            data.pop('comment', None)
-        text += json.dumps(data, ensure_ascii=False)
-        if data.get('command', '').casefold() in ('axismove', 'mc_moveabsolute', 'mc_moverelative', 'mc_movevelocity'):
-            classes += '轴 电机 伺服'
-    for mechanism in re.findall(r'气缸|机器人|真空|吸盘|伺服|电机', desc):
-        if mechanism not in text + classes:
-            return None, f'机构“{mechanism}”缺少引用的本步证据、中文映射或同类命名示例'
-    for detail in re.findall(r'焊接|点胶|贴胶|伸出|缩回|上升|下降|夹紧|松开|正转|反转|到位|完成', desc):
-        if detail not in text:
-            return None, f'具体动作“{detail}”缺少所引用的本步证据或精确映射支持'
-    level = '同类命名推断' if any(e['category'] == 'naming_analogy' for e in selected) else '上下文证据推断'
-    return {'desc': desc.strip(), 'kind': result['kind'], 'refs': list(dict.fromkeys(refs)),
-            'reasoning': reason.strip(), 'evidence_level': level}, ''
+    from trace_description_legacy import validate_v2_result
+    return validate_v2_result(result, context)

@@ -16,7 +16,9 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_workstation_xlsx import load_action_map, var_of, load_var_docs
 from trace_source_evidence import RELATION_TEXT, read_trace_evidence
-from trace_description_context import SCHEMA as TRACE_CONTEXT_SCHEMA, validate_context_result
+from trace_description_context import (
+    LEGACY_CLAUSE_SCHEMA, SCHEMA as TRACE_CONTEXT_SCHEMA, validate_context_result,
+)
 
 WORDBOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'action_wordbook.json')
 DASH_RE = re.compile(r'^[—…\-–\s]*$')
@@ -448,8 +450,11 @@ def _build_trace_batches(df, outdir, evidence, batch_size):
             'task': (
                 '为起始步写中文动作分句actions。每个分句说明具体机构或处理对象及动作，保留有证据的目标位和多个动作对象。'
                 '逐项核验context.required_actions，为每个锚点提交{action_ref: ID}。锚点包含对象、指令、目标及原始证据引用。'
-                '需补充的判断、等待、交接等提交{subject, action, target, evidence_refs}，target可为空。'
-                '结合调用实参、条件写入、控制关系与中文映射。仅借用同类命名的机构类别。'
+                '其他动作提交{subject, action, source_ref, subject_symbol, evidence_refs}。'
+                'source_ref指向本步指令效果、控制条件或注释，subject_symbol填写该证据中的完整PLC对象或条件变量。'
+                '如引用本步注释且其中明确包含对象和动作，可省略subject_symbol。'
+                '有目标时填写target，引用实参时用target_parameter写出同一调用中的形参名。'
+                '工艺词和kind按当前工程表达。命名类比只用于识别对象，不能当动作依据。'
                 '步号不匹配的注释仅作上下文。区分指令、反馈与完成，区分超时监控和正常等待。'
                 '保留basis、kind及reasoning。缺证据时提交ok=false和明确的reason。交付描述由通过的分句合成。'
             ),
@@ -554,7 +559,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
                     source, status = 'B档(上下文推断)', 'LLM推断待核验'
                     reason = 'B档引用通过，工艺语义待核验'
                     counts['b_candidates'] += 1
-                elif (info.get('description_context', {}).get('schema') == TRACE_CONTEXT_SCHEMA
+                elif (info.get('description_context', {}).get('schema') in (TRACE_CONTEXT_SCHEMA, LEGACY_CLAUSE_SCHEMA)
                       and not (isinstance(results[key], dict) and results[key].get('basis') == info['basis']
                                and results[key].get('ok') is False and isinstance(results[key].get('reason'), str)
                                and results[key]['reason'].strip())):
@@ -594,7 +599,12 @@ def _validate_trace(run, a, evidence, allowed, stats):
 
 
 def cmd_validate(run, *, stats=None):
-    """读 batches_desc/*.result.json -> 白名单校验 -> action_desc_final.csv(全行) + review。"""
+    """Validate the current batch protocol and produce descriptions and review."""
+    a = pd.read_csv(os.path.join(run, 'action_desc_a.csv'), dtype=str, encoding='utf-8-sig', keep_default_na=False)
+    evidence = read_trace_evidence(run)
+    if evidence is not None and all(info.get('description_context') or not info.get('b_evidence')
+                                    or info.get('description') for info in evidence.values()):
+        return _validate_trace(run, a, evidence, set(), stats)
     wb = load_wb()
     verbs = set(wb['verbs_whitelist'])
     word_allow = set()
@@ -622,8 +632,6 @@ def cmd_validate(run, *, stats=None):
         '步进过渡', '信号触发', '待人工补充',
     }
     allowed = verbs | word_allow | _GENERIC_MECH
-    a = pd.read_csv(os.path.join(run, 'action_desc_a.csv'), dtype=str, encoding='utf-8-sig', keep_default_na=False)
-    evidence = read_trace_evidence(run)
     if evidence is not None:
         return _validate_trace(run, a, evidence, allowed, stats)
     docs = load_full_docs(run)

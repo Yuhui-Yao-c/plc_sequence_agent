@@ -131,8 +131,8 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 **执行与续跑**
 
 1. 使用 `plc-trace-jump-analysis` 的输入格式、跳变和审计规则。入口四按观测跳变生成状态对和起始步停留时长的中位数。源码关系单列核验，区分直跳、多步路径及经步 0 的静态候选。候选路径只用于源码对照。
-2. A 档按完整变量、数组下标和起始步填源码注释。无适用注释的每一行进入 `trace-description-context-v3`。使用 `plc-action-description` 的 Trace 协议逐项核验本步指令、实参绑定、条件写入、控制关系及中文映射。B 档回传 `actions`、`basis`、`kind` 和 `reasoning`，或具体的证据不足原因。描述保留执行机构或处理对象、动作及已知目标位。一个调用涉及多个对象时逐项覆盖。
-3. 写完当前批次结果后，以相同源码、Trace、选项和输出目录执行同一条命令。续跑校验输入和准备产物指纹，合并结果并刷新工作簿。旧版 v1/v2 批次升级时使用新目录，或加 `--force` 重建一次并按新证据重新填写。入口一的预测批次由 `finish` 合并。
+2. A 档按完整变量、数组下标和起始步填源码注释。无适用注释的每一行进入 `trace-description-context-v4`。使用 `plc-action-description` 的 Trace 协议逐项核验本步指令、实参绑定、条件写入、控制关系及中文映射。B 档回传 `actions`、`basis`、`kind` 和 `reasoning`，或具体的证据不足原因。描述保留执行机构或处理对象、动作及已知目标位。一个调用涉及多个已绑定对象时逐项覆盖。通用分句以 `source_ref` 定位本步动作证据，以 `subject_symbol` 绑定具体对象或条件。新工艺术语按工程证据释义。
+3. 写完当前批次结果后，以相同源码、Trace、选项和输出目录执行同一条命令。续跑校验输入和准备产物指纹，合并结果并刷新工作簿。旧版 v1–v3 批次升级时使用新目录，或加 `--force` 重建一次并按新证据重新填写。入口一的预测批次由 `finish` 合并。
 
 ```powershell
 python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" --out "outputs/PLC_trace"

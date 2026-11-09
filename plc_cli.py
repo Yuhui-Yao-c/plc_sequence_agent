@@ -132,7 +132,7 @@ def _trace_inputs(src, trace, args):
  from trace_description_context import SCHEMA
  root = Path(__file__).resolve().parent
  code = sorted(root.glob('trace_*.py')) + [
-     root/name for name in ('VERSION', 'plc_cli.py', 'workflow.py', 'action_describe.py', 'action_wordbook.json')
+     root/name for name in ('VERSION', 'plc_cli.py', 'workflow.py', 'action_describe.py')
  ]
  return {
      'source': str(src), 'source_sha256': fingerprint(src),

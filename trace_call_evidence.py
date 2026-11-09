@@ -1,4 +1,4 @@
-"""Source call bindings used by Trace description evidence."""
+"""Generic source call binding and optional adapters for known instructions."""
 from __future__ import annotations
 
 import re
@@ -75,8 +75,7 @@ class CallEvidence:
                    if _DEVICE.fullmatch(formal) and re.fullmatch(IDENT, actual)]
         if len(devices) == 1:
             label = device_label(row['comment'])
-            if re.fullmatch(r'[\u4e00-\u9fffA-Z0-9（）()]+', label) and re.search(
-                    r'(气缸|电机|伺服轴|真空|吸盘|夹爪|机械手|机器人)$', label):
+            if label and '\n' not in row['comment'] and len(label) <= 80:
                 self.labels[owner(scope), devices[0].casefold()].append({
                     'symbol': devices[0], 'label': label, 'scope': scope,
                     'network': row['network'], 'source_line': row['source_line'],
@@ -137,3 +136,23 @@ def action_specs(command, actuals, effects):
         directions = {request for request, _ in requests}
         if len(directions) == 1:
             yield actual, '', requests[0][0], '', [effect for _, effect in requests]
+
+
+def action_details(actual, mechanism, operation, target, doc, binding):
+    """Render an optional known-interface anchor without gating other calls."""
+    if doc and re.search(r'[\u4e00-\u9fff]', doc):
+        label = device_label(doc)
+    elif binding:
+        label = binding['label']
+    else:
+        indexed = re.fullmatch(r'(Cylinder|Vacuum)\[(\d+)\]', actual, re.I)
+        if indexed:
+            mechanism = {'cylinder': '气缸', 'vacuum': '真空通道'}[indexed[1].casefold()]
+            label = f'{indexed[2]}号{mechanism}'
+        else:
+            number = re.search(r'\d+', actual.rsplit('.', 1)[-1])
+            label = f'{int(number[0])}号{mechanism}' if number and mechanism else mechanism
+    if operation == '原位侧请求' and label.endswith('气缸'):
+        operation = '回原位请求'
+    phrase = f'向{label}发出{operation}' if operation.endswith('请求') else f'{label}{operation}{target}'
+    return label, operation, phrase
