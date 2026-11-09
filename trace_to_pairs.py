@@ -850,6 +850,8 @@ def generate(trace_path, run, source=None, proc_name=None,
     sc_map = {} if source_index.control is not None else _load_step_comments(str(run))
     si_map = load_station_identity(str(run))
     var_docs = _load_var_docs(str(run))
+    indexed_stations = {name: source_index.station(name) for name in variables
+                        if source_index.control is not None and '[' in name and '.' not in name}
 
     # ---- 7. Assemble pair rows ----
     rows = []
@@ -882,7 +884,7 @@ def generate(trace_path, run, source=None, proc_name=None,
         action_vars = list(dict.fromkeys(c['arguments'] for c in commands))
 
         # Station name for grouping
-        ws_name = _station_name(var_name, si_map, var_docs)
+        ws_name = indexed_stations.get(var_name) or _station_name(var_name, si_map, var_docs)
 
         median_dur = int(round(statistics.median(durs)))
         min_dur = int(min(durs))
@@ -950,7 +952,10 @@ def generate(trace_path, run, source=None, proc_name=None,
     _write_csv(run / 'trace_pairs_review.csv', review_rows, rev_fields)
     control = source_index.control
     source_audit = ({'policy': control.policy, 'edges': len(control.edges),
-                     'fb_state_variables': len(control.bindings_found), 'issues': dict(control.issues)}
+                     'fb_state_variables': len(control.bindings_found), 'issues': dict(control.issues),
+                     'indexed_stations': indexed_stations,
+                     'pairs_without_local_control': sum('no_local_control' in row['source_issues']
+                                                        for row in pair_evidence.values())}
                     if control is not None else {'policy': 'source_ledger'})
     (run / EVIDENCE_FILE).write_text(
         json.dumps({'schema': 1, 'source_audit': source_audit, 'pairs': pair_evidence}, ensure_ascii=False, indent=2),

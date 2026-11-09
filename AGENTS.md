@@ -143,9 +143,10 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 ### PLCopen Trace 描述取证
 
 - 使用本轮 PLC XML。通过 LD/FBD 接线、功能块具名引用实参和 ST 分支定位本步。读取 `EXECUTE` 内嵌 ST 时保留外层使能和内部写入条件。
-- A 档采用绑定到本步控制写入的原注释。多个适用原文冲突时交复核。读取 `trace_source_evidence.json` 查看 XML 位置、实例绑定、命令及待核原因。
+- 步注释、本步写入及条件、后继迁移分别保存。对有确定门控和类型的算术回写，从源码求步值。功能块实例的已绑定输入可以定位门控，输出运行时状态单列待核。
+- A 档采用绑定到本步控制写入的原注释。跨多步的注释只选能归属本步的原文片段。多个适用原文冲突时交复核。读取 `trace_source_evidence.json` 查看 XML 位置、实例绑定、写步表达式及待核原因。全局数组按完整通道和实际写入 POU 分组。
 - 测量触发、工程计时、统计和显示文本属于后加证据。PLCopen Trace 描述使用控制证据包和本工程相关变量文档。避免从旧 `step_comments.json`、候选 CSV 或工程监控补写描述。
-- B 档引用 `step_condition` 时用 `condition_use=wait/check` 区分等待和判断。写入分句核对实际对象、写值及条件。所有推断保留引用和复核状态。
+- B 档从证据项的 `subjects` 选择对应对象，结合同一条分支核对门控。引用 `step_condition` 时用 `condition_use=wait/check` 区分等待和判断。对象带 `numeric_predicate` 时省略 `action`、`target`，数值判据由源码生成。写入分句核对实际对象、写值及条件。所有推断保留引用和复核状态。
 
 ### 隔离与数据规则
 - 新任务仅使用本次指定的输入、本轮输出及当前工程规则。历史会话中的批次、证据索引和语义结论只属于原运行。

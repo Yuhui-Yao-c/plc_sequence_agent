@@ -22,7 +22,7 @@
 
 1. 逐个核对 `context.required_actions`，提交每个锚点的 `action_ref`。锚点保留已绑定对象、指令和已知目标。并行对象分别覆盖。有相反方向时查看实参和门控，区分条件请求与现场执行。
 2. 通用分句填写 `subject`、`action`、`source_ref` 和 `subject_symbol`。`source_ref` 指向本步写入、已定位的指令、已解析的控制条件或适用注释。`subject_symbol` 填该证据中的完整 PLC 对象或条件符号。注释已明确包含对象和动作时可省略该字段。名称示例和相邻步可以写入 `evidence_refs` 作为辅助引用。
-   引用 `step_condition` 时填写 `condition_use` 为 `wait` 或 `check`。`subject` 写对象或条件，`action` 写具体判据，程序添加「等待」或「判断」。对于 `source_write`，检查 `write_value`、原始门控和实例实参。
+   证据提供 `subjects` 时，从符合当前分支的同一证据项选择 `symbol`。引用 `step_condition` 时填写 `condition_use` 为 `wait` 或 `check`。`subject` 写对象，`action` 写具体判据。若所选对象带 `numeric_predicate`，省略 `action` 和 `target`，程序按源码渲染比较方向及数值。对于 `source_write`，检查 `write_value`、原始门控和实例实参。
 3. 目标可省略。目标取自本步注释或同一调用的实参。引用实参时填 `target_parameter`。已由锚点覆盖的指令直接使用 `action_ref`。补充分句须有独立本步证据。核对指令、条件和反馈的区别，结合源逻辑解释工程术语。
 4. 批次原样回传 `run_id` 和 `batch_id`。各行保留当前 `basis`、`kind` 和 `reasoning`。使用中文工艺术语，保留已证实的细节。工作流从通过的分句合成交付描述。
 5. 若证据不足，回传 `ok=false` 及具体原因。避免以“夹子气缸”“设备动作”“步进过渡”充当完整描述。

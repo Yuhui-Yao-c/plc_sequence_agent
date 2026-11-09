@@ -159,11 +159,13 @@ def substitute(x: Expr, variable: str, value: int) -> Expr:
     if x.kind=='not':return negate(substitute(x.args[0],variable,value))
     return x
 
-def compatible(x: Expr, variable: str, value: int) -> bool:
+def compatible(x: Expr, variable: str, value: int, *, check_remaining=False) -> bool:
     """Conservative satisfiability for the supported Boolean/equality grammar.
 
     Never flatten equalities from different OR branches into one conjunction.
     A bounded search returns possible on budget exhaustion (not a proof).
+    With check_remaining, opaque atoms permit either value while the rest
+    of the same branch still has to be compatible.
     """
     y=substitute(x,variable,value);budget=[4096]
     def possible(todo,eq,neq,signals):
@@ -189,6 +191,6 @@ def compatible(x: Expr, variable: str, value: int) -> bool:
                 yes=e.kind=='signal'
                 if v in signals and signals[v]!=yes:return False
                 signals[v]=yes
-            else:return True
+            elif not check_remaining:return True
         return True
     return possible([y],{},{},{})

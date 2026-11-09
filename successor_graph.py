@@ -59,6 +59,9 @@ def binding(variable,scope,pou):
 
 class WireError(ValueError): pass
 class WireBody:
+    combine_guard = staticmethod(combine)
+    parse_guard = staticmethod(parse)
+
     def __init__(self,body):
         self.body=body;self.nodes={n.get('localId'):n for n in body if n.get('localId')}
         self.seen=set();self.stack=set();self.memo={}
@@ -91,10 +94,10 @@ class WireBody:
         refs=connections(p)
         if not refs:
             direct=own_expr(p)
-            if direct:return parse(direct)
+            if direct:return self.parse_guard(direct)
             if default is not None:return default
             raise WireError('missing_control_input')
-        x=combine('or',*(self.resolve(ref,port) for ref,port in refs))
+        x=self.combine_guard('or',*(self.resolve(ref,port) for ref,port in refs))
         if p is not None and p.get('negated','').lower()=='true':x=negate(x)
         return x
     def resolve(self,ref,port=''):
@@ -108,15 +111,15 @@ class WireBody:
         try:
             kind=tag(n)
             if kind=='leftPowerRail':x=TRUE
-            elif kind in ('inVariable','inOutVariable'):x=parse(own_expr(n))
+            elif kind in ('inVariable','inOutVariable'):x=self.parse_guard(own_expr(n))
             elif kind=='contact':
                 if n.get('edge','none').lower() not in ('','none'):raise WireError('edge_contact:'+ref)
                 v=own_expr(n)
                 if not v:raise WireError('contact_variable_missing:'+ref)
-                x=parse(v)
+                x=self.parse_guard(v)
                 if n.get('negated','').lower()=='true':x=negate(x)
                 cp=next((c for c in n if tag(c)=='connectionPointIn'),None)
-                x=combine('and',self.cp(cp),x)
+                x=self.combine_guard('and',self.cp(cp),x)
             elif kind in ('connector','continuation'):
                 if kind=='continuation':
                     matches=[m for m in self.nodes.values() if tag(m)=='connector' and m.get('name')==n.get('name')]
@@ -132,12 +135,12 @@ class WireBody:
                     if len(data)!=2:raise WireError('nonbinary_comparison:'+ref)
                     a,b=self.value(data[0]),self.value(data[1])
                     pred=parse(a+(' = ' if typ in ('EQ','=','==') else ' <> ')+b)
-                    x=combine('and',gate,pred)
+                    x=self.combine_guard('and',gate,pred)
                 elif typ in ('AND','OR','NOT'):
                     if not data or (typ=='NOT' and len(data)!=1):raise WireError('boolean_arity:'+ref)
                     args=[self.cp(v) for v in data]
-                    pred=negate(args[0]) if typ=='NOT' else combine(typ.lower(),*args)
-                    x=combine('and',gate,pred)
+                    pred=negate(args[0]) if typ=='NOT' else self.combine_guard(typ.lower(),*args)
+                    x=self.combine_guard('and',gate,pred)
                 else:raise WireError('unsupported_control_block:'+typ+':'+ref+':'+port)
                 output=next((v for v in pins(n,'outputVariables') if v.get('formalParameter','').upper()==port.upper()),None)
                 if output is not None and output.get('negated','').lower()=='true':x=negate(x)

@@ -112,17 +112,36 @@ class TraceSourceIndex:
             for variable, edge in self.control.edges:
                 self._add_edge(variable, edge)
             self.commands.update(self.control.commands)
-            from plcopen_trace_control import comment_text
+            from plcopen_trace_control import comment_text, step_comment_text
+            network_states = defaultdict(set)
+            for state, writes in self.control.state_writes.items():
+                for write in writes:
+                    network_states[write['body'], write['network']].add(state)
             for state, notes in self.control.notes.items():
                 for note in notes:
-                    desc = comment_text(note['raw'])
-                    prefix = _STEP_PREFIX.match(desc)
-                    if desc and (not prefix or int(prefix[1]) == state[1]):
-                        record = {**note, 'text': desc, 'source_file': 'PLC XML'}
-                        record['id'] = stable_id('TC', [state, record])
-                        self.notes[state].append(record)
+                    single = len(network_states[note['body'], note['network']]) == 1
+                    desc = step_comment_text(note['raw'], state[1], single_step=single)
+                    record = {**note, 'text': desc or comment_text(note['raw']),
+                              'applies_to_step': bool(desc), 'source_file': 'PLC XML'}
+                    record['id'] = stable_id('TC', [state, record])
+                    self.notes[state].append(record)
+            self.program_names = defaultdict(set)
+            for scopes in self.control.programs.values():
+                for scope in scopes:
+                    self.program_names[scope.split('::')[-1]].add(scope)
         from trace_description_context import DescriptionContext
         self.context = DescriptionContext(run, self, wanted)
+
+    def station(self, variable):
+        """Resolve a channel's display group from actual executable writers."""
+        if self.control is None:
+            return ''
+        scopes = self.control.programs.get(variable.casefold(), set())
+        if len(scopes) != 1:
+            return variable
+        scope, = scopes
+        name = scope.split('::')[-1]
+        return (name if len(self.program_names[name]) == 1 else scope) or variable
 
     @staticmethod
     def _source_control(run, source, variables):
@@ -243,35 +262,45 @@ class TraceSourceIndex:
         notes = self.notes.get(start, [])
         if relation == 'ambiguous_scope':
             return '', [], [], notes, ['ambiguous_scope']
-        proved_ids = {e['source_id'] for e in direct if e['guard_complete']}
+        direct_ids = {e['source_id'] for e in direct}
         locations = {(e['scope'], e['network']) for e in direct}
-        exact = [n for n in notes if n['source_id'] in proved_ids]
-        applicable = exact or notes
+        applicable = [note for note in notes if note['applies_to_step']]
+        if direct:
+            # Directly bound notes are specific to this branch. A note on
+            # another outgoing branch remains visible only as context.
+            applicable = [note for note in applicable if note['source_id'] in direct_ids]
         descriptions = {n['text'] for n in applicable}
         linked = [c for c in commands if (not locations or (c['scope'], c['network']) in locations)
                   and self.control.compatible_write(start, c, direct)]
         reasons = set(self.control.affected.get(start[0], ())) if relation == 'unresolved' else set()
         if start in self.control.partial:
             reasons.add('unresolved_guard')
+        if any(write['to'] is None for write in self.control.state_writes.get(start, ())):
+            reasons.add('dynamic_state_write')
         if len(descriptions) == 1:
             return applicable[0]['text'], [n['id'] for n in applicable], linked, notes, sorted(reasons)
         if len(descriptions) > 1:
             reasons.add('conflicting_comments')
-        if not notes and not linked and not any(graph.get(start[1]) for graph in self.graphs[start[0]].values()):
+        if not notes and not linked and not self.control.state_writes.get(start):
             reasons.add('no_local_control')
-        return '', [], linked, notes, sorted(reasons)
+        applicable_ids = {note['id'] for note in applicable}
+        context_notes = [{**note, 'applies_to_step': note['id'] in applicable_ids} for note in notes]
+        return '', [], linked, context_notes, sorted(reasons)
 
     def lookup(self, start_label, end_label, step_comment=''):
         start, end = _state(start_label), _state(end_label)
         direct, path, commands, linked, eligible, refs, notes = [], [], [], [], [], [], []
         relation, description, description_source = 'unresolved', '', ''
-        issues = []
+        issues, writes, blockers = [], [], []
         if start and end and start[0] == end[0]:
             variable, value = start
             direct = self.transitions.get((variable, value, end[1]), [])
             proved = [e for e in direct if e['guard_complete']]
             scopes = {e['scope'] for e in direct}
-            if len(self.bindings[variable]) > 1 or len(scopes) > 1:
+            if self.control is not None:
+                writes = self.control.state_writes.get(start, [])
+            local_programs = {write['program'] for write in writes}
+            if len(self.bindings[variable]) > 1 or len(scopes) > 1 or len(local_programs) > 1:
                 relation = 'ambiguous_scope'
             elif proved:
                 relation = 'direct'
@@ -294,6 +323,8 @@ class TraceSourceIndex:
                 description, refs, linked, notes, issues = self._control_description(start, relation, direct, commands)
                 if description:
                     description_source = 'A档(源码控制注释)'
+                if 'no_local_control' in issues:
+                    blockers = self.control.blockers.get(variable, [])
             elif relation == 'direct':
                 locations = {(e['scope'], e['network']) for e in proved}
                 linked = [
@@ -334,7 +365,8 @@ class TraceSourceIndex:
                         description, description_source = best[0]['text'], 'A档(起始步源码注释)'
                         refs = list(dict.fromkeys(n['id'] for n in best))
             context = (self.context.packet(start, end, relation, direct, path,
-                                           linked if self.control is not None else commands, notes, issues)
+                                           linked if self.control is not None else commands, notes, issues,
+                                           writes=writes, blockers=blockers)
                        if not description else {})
         else:
             context = {}
@@ -345,6 +377,7 @@ class TraceSourceIndex:
             'description': description, 'description_source': description_source,
             'description_refs': refs, 'b_evidence': eligible,
             'source_issues': issues,
+            'start_state_writes': writes, 'source_blockers': blockers,
             'description_context': context,
             'basis': context.get('basis', ''),
         }

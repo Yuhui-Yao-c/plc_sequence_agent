@@ -358,11 +358,14 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     Raises ValueError on missing columns (caller decides how to report)."""
     run = run or os.path.dirname(prediction)
     is_trace = sheet == 'trace步序采集表' or os.path.basename(prediction) == 'trace_collection_pairs.csv'
-    if is_trace and not proc_name:
+    indexed_stations = {}
+    if is_trace:
         summary_path = os.path.join(run, 'trace_pairs_summary.json')
         if os.path.isfile(summary_path):
             with open(summary_path, encoding='utf-8-sig') as stream:
-                proc_name = json.load(stream).get('proc_name')
+                summary = json.load(stream)
+            proc_name = proc_name or summary.get('proc_name')
+            indexed_stations = summary.get('source_evidence_audit', {}).get('indexed_stations', {})
     proc_name = infer_proc_name(None, run, proc_name)
     if not out:
         suffix = 'trace步序采集表' if is_trace else '步序采集表'
@@ -407,7 +410,9 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         var_docs = load_var_docs(run)
         si_map = load_station_identity(run)
         df['_变量根'] = df['_变量'].map(lambda v: (str(v).split('.')[0] if pd.notna(v) and v else ''))
-        df['_工位'] = df.apply(lambda r: workstation(r['构成要素'], r['_变量根'], var_docs, si_map), axis=1)
+        df['_工位'] = df.apply(
+            lambda r: indexed_stations.get(r['_变量']) or workstation(r['构成要素'], r['_变量根'], var_docs, si_map),
+            axis=1)
     elif group_by == '证据POU':
         df['_工位'] = df['证据POU'].map(pou_station)
     else:
@@ -416,6 +421,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     # then variable, then step number.  Numeric so EM01<EM02<…<EM10.
     si_map = load_station_identity(run)
     def _row_sort(row):
+        if group_by == '构成要素' and row['_变量'] in indexed_stations:
+            return _em_sort_key(row['_工位'])
         vr = row.get('_变量根', '')
         if pd.notna(vr) and vr:
             if vr in si_map:

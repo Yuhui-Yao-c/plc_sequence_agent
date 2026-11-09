@@ -60,6 +60,30 @@ class TraceDescriptionTests(unittest.TestCase):
         _, info = self.prepare()
         self.assertEqual((info['relation'], info['description']), ('unresolved', '气缸夹紧'))
 
+    def test_workbook_groups_global_array_by_writing_program(self):
+        names = ('Phase[1]', 'Phase[2]')
+        self.write_part(self.FIRST + '_00001.csv', self.EPOCH, [(0, 10, 10), (1, 20, 20)], channels=names)
+        source = self.root / 'source.xml'
+        source.write_text(
+            '<project><types><pous>'
+            '<pou name="Load" pouType="program"><body><ST>'
+            'IF Phase[1]=10 THEN //载具上料\n Phase[1]:=20; END_IF;'
+            '</ST></body></pou>'
+            '<pou name="Unload" pouType="program"><body><ST>'
+            'IF Phase[2]=10 THEN //载具卸料\n Phase[2]:=20; END_IF;'
+            '</ST></body></pou>'
+            '</pous></types></project>', encoding='utf-8')
+        (self.run / 'variable_documentation.json').write_text(
+            json.dumps({'all': {'Phase': '全线自动步状态'}}), encoding='utf-8')
+        (self.run / 'station_identity.json').write_text(json.dumps({'Phase': {
+            'code': 'Phase', 'display': '全线自动步状态', 'doc': '全线自动步状态', 'sort_key': [0, 0]
+        }}), encoding='utf-8')
+        stats = generate(self.trace, self.run, source=source)
+        pairs = stats['outputs']['pairs_csv']
+        self.assertEqual({r['构成要素'] for r in self.read_csv(pairs)}, {'Load', 'Unload'})
+        result = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
+        self.assertEqual(result['workstation_groups'], 2)
+
     def test_end_comment_is_context_and_never_start_description(self):
         self.record()
         self.source_edges(self.run, [(10, 30)])

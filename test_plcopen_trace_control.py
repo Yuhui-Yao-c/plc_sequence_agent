@@ -22,11 +22,22 @@ def compare(node, first, second):
             f'{port("EN", 0)}{port("", first)}{port("", second)}</inputVariables></block>')
 
 
-def move(node, enable, value, target):
-    return (f'<block localId="{node}" typeName="MOVE"><inputVariables>'
-            f'{port("EN", enable)}{port("", value)}</inputVariables><outputVariables>'
+def write_block(node, enable, operands, target, operation='MOVE'):
+    data = ''.join(port('', value) for value in operands)
+    return (f'<block localId="{node}" typeName="{operation}"><inputVariables>'
+            f'{port("EN", enable)}{data}</inputVariables><outputVariables>'
             f'<variable formalParameter=""><connectionPointOut><expression>{target}</expression>'
             f'</connectionPointOut></variable></outputVariables></block>')
+
+
+def move(node, enable, value, target):
+    return write_block(node, enable, (value,), target)
+
+
+def contact(node, enable, variable):
+    return (f'<contact localId="{node}"><connectionPointIn>'
+            + ''.join(f'<connection refLocalId="{source}"/>' for source in enable)
+            + f'</connectionPointIn><variable>{variable}</variable></contact>')
 
 
 def network(node, title):
@@ -50,8 +61,9 @@ class PlcopenTraceControlTests(unittest.TestCase):
         self.run = Path(tmp.name)
         self.source = self.run / 'source.xml'
 
-    def index(self, pous, variables):
-        self.source.write_text(f'<project><types><pous>{pous}</pous></types></project>', encoding='utf-8')
+    def index(self, pous, variables, declarations=''):
+        self.source.write_text(f'<project>{declarations}<types><pous>{pous}</pous></types></project>',
+                               encoding='utf-8')
         return TraceSourceIndex(self.run, variables, source=self.source)
 
     def test_inout_template_is_rebound_per_instance_and_monitor_is_excluded(self):
@@ -154,6 +166,11 @@ class PlcopenTraceControlTests(unittest.TestCase):
         self.assertIn('只支持等待或判断', validate_context_result(result, context)[1])
         clause.update(condition_use='check', subject_symbol='Sensor.Other')
         self.assertIn('不匹配', validate_context_result(result, context)[1])
+        clause.update(subject='检测偏差', subject_symbol='Tuning.Delta', action='小于0.1')
+        self.assertIn('数值判据', validate_context_result(result, context)[1])
+        del clause['action']
+        self.assertEqual(validate_context_result(result, context)[0]['desc'],
+                         '判断检测偏差是否满足 ≥0.1')
 
     def test_st_original_branch_comment_and_unanchored_bypass(self):
         body = ('<body><ST><![CDATA[CASE Drive.Phase[2] OF\n'
@@ -171,6 +188,94 @@ class PlcopenTraceControlTests(unittest.TestCase):
         info = index.lookup('Drive.Phase[2]=99', 'Drive.Phase[2]=0')
         self.assertEqual(info['relation'], 'unresolved')
         self.assertEqual(info['description'], '')
+
+    def test_typed_arithmetic_and_unresolved_destination_keep_own_source_evidence(self):
+        name = 'PhaseTable[2]'
+        decl = ('<variable name="PhaseTable"><type><array><dimension lower="0" upper="3"/>'
+                '<baseType><USINT/></baseType></array></type></variable>')
+        declarations = f'<globalVars>{decl}<addData><data><globalVars>{decl}</globalVars></data></addData></globalVars>'
+        body = ladder(
+            network(100, '切换分支\n37 对接载具\n200 放行载具')
+            + operand(1, name) + operand(2, '37') + compare(3, 1, 2)
+            + operand(4, 'USINT#10') + write_block(5, 3, (1, 4), name, '+')
+            + network(101, '置位移载许可') + operand(6, '250') + compare(7, 1, 6)
+            + '<coil localId="8" storage="set"><connectionPointIn><connection refLocalId="7"/>'
+              '</connectionPointIn><variable>Transfer.Permit</variable></coil>'
+            + write_block(9, 7, (1, 4), name, 'ADD')
+        )
+        index = self.index(program('TransferUnit', body), (name,), declarations)
+        info = index.lookup(f'{name}=37', f'{name}=47')
+        self.assertEqual((info['relation'], info['description']), ('direct', '37 对接载具'))
+        self.assertIn('200 放行载具', info['start_notes'][0]['raw'])
+        self.assertEqual(index.station(name), 'TransferUnit')
+        overflow = index.lookup(f'{name}=250', f'{name}=4')
+        self.assertEqual((overflow['relation'], overflow['description']), ('unresolved', '置位移载许可'))
+        self.assertIsNone(overflow['start_state_writes'][0]['to'])
+        self.assertEqual(overflow['linked_commands'][0]['arguments'], 'Transfer.Permit')
+
+    def test_parallel_guard_retains_shared_start_constraint(self):
+        name = 'Procedure.Sequence'
+        nodes = network(100, '对侧工位联锁完成') + operand(1, name) + operand(2, '21') + compare(3, 1, 2)
+        left, right = 3, 3
+        for layer in range(12):
+            next_left, next_right = 10 + layer * 2, 11 + layer * 2
+            nodes += contact(next_left, (left, right), f'PermitA[{layer}]')
+            nodes += contact(next_right, (left, right), f'PermitB[{layer}]')
+            left, right = next_left, next_right
+        nodes += contact(40, (left, right), 'Control.Run') + operand(41, '93') + move(42, 40, 41, name)
+        info = self.index(program('Transfer', ladder(nodes)), (name,)).lookup(f'{name}=21', f'{name}=93')
+        self.assertEqual((info['relation'], info['description']), ('direct', '对侧工位联锁完成'))
+        self.assertIn('(PermitA[11] OR PermitB[11])', info['direct'][0]['guard'])
+
+    def test_wired_command_can_precede_exit_feedback_in_same_step(self):
+        name = 'Sequence'
+        ready = contact(4, (3,), 'Drive.InPosition')
+        pending = ready.replace('localId="4"', 'localId="5" negated="true"')
+        nodes = (network(100, '升降轴定位') + operand(1, name) + operand(2, '30') + compare(3, 1, 2)
+                 + ready + pending + operand(6, '45') + move(7, 4, 6, name)
+                 + '<coil localId="8" storage="set"><connectionPointIn><connection refLocalId="5"/>'
+                   '</connectionPointIn><variable>Drive.PositionRequest</variable></coil>')
+        info = self.index(program('Transfer', ladder(nodes)), (name,)).lookup(f'{name}=30', f'{name}=45')
+        self.assertEqual(info['relation'], 'direct')
+        self.assertEqual(info['linked_commands'][0]['arguments'], 'Drive.PositionRequest')
+
+    def test_custom_bool_output_follows_declared_input_through_implicit_port(self):
+        name = 'Sequence[0]'
+        template = (
+            '<pou name="AccumulatedWindow" pouType="functionBlock"><interface>'
+            '<inputVars><variable name="Gate"><type><BOOL/></type></variable></inputVars>'
+            '<outputVars><variable name="Elapsed"><type><BOOL/></type></variable></outputVars>'
+            '</interface><body><ST><![CDATA[Elapsed := Gate AND (_Clock >= (Began + Duration));]]></ST></body>'
+            '</pou>'
+        )
+        call = (f'<block localId="4" typeName="AccumulatedWindow" instanceName="Window[1]">'
+                f'<inputVariables>{port("Gate", 3)}</inputVariables>'
+                '<outputVariables><variable formalParameter="Elapsed"><addData><data>'
+                '<IsMainOutput>true</IsMainOutput></data></addData></variable></outputVariables></block>')
+        body = ladder(network(100, '延时放行') + operand(1, name) + operand(2, '25') + compare(3, 1, 2)
+                      + call + operand(5, '56') + move(6, 4, 5, name))
+        info = self.index(template + program('Transfer', body), (name,)).lookup(f'{name}=25', f'{name}=56')
+        self.assertEqual((info['relation'], info['description']), ('direct_unverified', '延时放行'))
+        dependency, = info['direct'][0]['output_dependencies']
+        self.assertEqual(dependency['instance'], 'Window[1]')
+        self.assertEqual(dependency['required_inputs'][0]['guard'], f'{name}=25')
+        bypass = template.replace('Gate AND', 'Gate OR')
+        info = self.index(bypass + program('Transfer', body), (name,)).lookup(f'{name}=25', f'{name}=56')
+        self.assertEqual((info['relation'], info['description']), ('unresolved', ''))
+
+    def test_st_self_relative_assignment_uses_declared_type_and_exact_branch(self):
+        body = (
+            '<interface><localVars><variable name="Mode"><type><DINT/></type></variable></localVars></interface>'
+            '<body><ST><![CDATA[CASE Mode OF\n'
+            '21: //进入下一组\n Mode:=Mode + DINT#7;\n'
+            '40: //重排步值\n Mode:=42; Mode:=Mode - 1;\n'
+            'END_CASE;]]></ST></body>'
+        )
+        index = self.index(program('Exchange', body), ('Mode',))
+        self.assertEqual(index.lookup('Mode=21', 'Mode=28')['relation'], 'direct')
+        info = index.lookup('Mode=40', 'Mode=39')
+        self.assertEqual(info['relation'], 'unresolved')
+        self.assertEqual([write['to'] for write in info['start_state_writes']], [42, None])
 
 
 if __name__ == '__main__':

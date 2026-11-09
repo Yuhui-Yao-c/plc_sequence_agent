@@ -66,7 +66,27 @@ def _compact_command(command):
     fields = ('id', 'scope', 'network', 'source_line', 'node', 'command', 'arguments',
               'guard', 'guard_complete', 'comment', 'issue', 'role', 'kind', 'operation')
     return {**{key: command.get(key, '') for key in fields},
-            **{key: command[key] for key in ('write_value', 'st_line', 'instance_path') if key in command}}
+            **{key: command[key] for key in
+               ('write_value', 'st_line', 'instance_path', 'output_dependencies') if key in command}}
+
+
+def _subject_symbols(category, data):
+    if category == 'step_condition':
+        return data['condition_symbols']
+    if category in ('bound_write', 'timer_alarm'):
+        return [name for name in (data.get('actual'), data['target']) if name]
+    if category == 'current_command':
+        arguments = data['arguments']
+        return sorted({normalize_symbol(match[0]) for value in named_arguments(arguments).values() or [arguments]
+                       for match in _SYMBOL.finditer(value)})
+    if category == 'direct_control' and data.get('guard_complete'):
+        return sorted({normalize_symbol(m[0]) for m in _SYMBOL.finditer(data['guard'])})
+    return []
+
+
+def _numeric_predicate(data, symbol):
+    return next((terms for name, terms in data.get('numeric_conditions', {}).items()
+                 if name.casefold() == normalize_symbol(symbol).casefold()), [])
 
 
 class DescriptionContext:
@@ -160,12 +180,25 @@ class DescriptionContext:
                   'naming_examples': entries, 'annotated_commands': annotated}
         (self.run / MEMORY_FILE).write_text(json.dumps(memory, ensure_ascii=False, indent=1), encoding='utf-8')
 
-    def packet(self, start, end, relation, direct, path, commands, notes, issues=()):
+    def packet(self, start, end, relation, direct, path, commands, notes, issues=(), *, writes=(), blockers=()):
         variable, number = start
         evidence, seen = [], set()
 
         def add(kind, data, *, local=False, **extra):
             item = {'category': kind, 'local': local, 'data': data, **extra}
+            if self.control and local:
+                subjects = []
+                for name in _subject_symbols(kind, data):
+                    if name.casefold() in _EXPRESSION_WORDS or name.casefold() == variable:
+                        continue
+                    choice = {'symbol': name}
+                    if found := self.docs.get(name.casefold()):
+                        choice['label'] = found[1]
+                    if terms := _numeric_predicate(data, name):
+                        choice['numeric_predicate'] = terms
+                    subjects.append(choice)
+                if subjects:
+                    item['subjects'] = subjects
             item['id'] = stable_id('TX', item)
             truncated = [key for key, value in data.items() if isinstance(value, str) and len(value) > 1600]
             if truncated:
@@ -188,9 +221,11 @@ class DescriptionContext:
                 continue
             prefix = re.match(r'^\s*(?:步\s*)?(\d+)\s*[-—:：>]', c['comment'])
             usable_comment = not prefix or int(prefix[1]) == number
-            if self.control and (not usable_comment or 'conflicting_comments' in issues):
-                c['comment'] = ''
-                usable_comment = False
+            if self.control:
+                from plcopen_trace_control import step_comment_text
+                c['comment'] = (step_comment_text(c['comment'], number)
+                                if 'conflicting_comments' not in issues else '')
+                usable_comment = bool(c['comment'])
             ref = add('current_command', c, local=True, comment_matches_step=usable_comment)
             command_refs[command['id']] = ref
             effect_refs = {}
@@ -230,7 +265,8 @@ class DescriptionContext:
                                         'target': coil['arguments'], 'operation': '超时监控'}, local=True)
         local = not (self.control and relation == 'ambiguous_scope')
         for note in notes[:12]:
-            add('start_comment', note, local=local and not (self.control and 'conflicting_comments' in issues))
+            applicable = not self.control or (note['applies_to_step'] and 'conflicting_comments' not in issues)
+            add('start_comment', note, local=local and applicable)
         for edge in direct[:12]:
             add('direct_control', edge, local=local and not self.control)
         for edge in path[:16]:
@@ -244,11 +280,13 @@ class DescriptionContext:
             # A real outgoing source guard belongs to this step even when the
             # next sample spans multiple source transitions. Later path edges
             # cannot authorize a clause about the observed starting step.
-            conditions = direct or [edge for edge in neighbors if edge['from'] == number]
+            conditions = direct or writes
             for edge in conditions[:12]:
                 if edge['condition_symbols']:
                     add('step_condition', edge, local=True,
                         caveat='本步写步条件。用于描述等待、判断或联锁，保留条件极性和门控待核项。')
+        for blocker in blockers:
+            add('source_blocker', blocker, caveat='XML 取证受阻位置，需检查原始接线。')
         for edge in neighbors[:16]:
             add('control_context', edge, local=edge['from'] == number)
             neighbor = edge['to'] if edge['from'] == number else edge['from']
@@ -346,8 +384,6 @@ def _target_supported(target, parameter, arguments, comment):
 
 
 def _ground_clause(clause, subject, action, target, catalog, reserved, observed):
-    if not subject or not action or subject == action:
-        return '分句须分别填写具体对象和动作', []
     ref = clause.get('source_ref')
     fact = catalog.get(ref) if isinstance(ref, str) else None
     if not fact or not fact['local']:
@@ -359,24 +395,20 @@ def _ground_clause(clause, subject, action, target, catalog, reserved, observed)
     comment = _comment_text(data.get('comment', ''), observed['from'])
     if category == 'start_comment':
         comment = data['text']
-    symbols = set()
+    symbols = _subject_symbols(category, data)
     arguments = ''
     parent = None
     if category in ('bound_write', 'timer_alarm'):
-        symbols.update((data.get('actual', ''), data['target']))
         parent = catalog[data['call_ref']] if category == 'bound_write' else None
     elif category == 'direct_control' and data.get('guard_complete'):
-        symbols.update(normalize_symbol(m[0]) for m in _SYMBOL.finditer(data['guard']))
+        pass
     elif category == 'step_condition':
         use = clause.get('condition_use')
         if not isinstance(use, str) or use not in _CONDITION_USES:
             return '本步条件只支持等待或判断，须填写condition_use为wait或check', []
-        symbols.update(data['condition_symbols'])
     elif category == 'current_command' and (comment or data.get('role') in {
             'actuator_command', 'signal_write', 'connected_signal', 'source_write'}):
         arguments = data['arguments']
-        for actual in named_arguments(arguments).values() or [arguments]:
-            symbols.update(normalize_symbol(m[0]) for m in _SYMBOL.finditer(actual))
     elif category != 'start_comment':
         return '此引用仅可作上下文，缺少本步动作效果或条件依据', []
     if parent:
@@ -385,6 +417,14 @@ def _ground_clause(clause, subject, action, target, catalog, reserved, observed)
     actual = clause.get('subject_symbol', '')
     if not isinstance(actual, str):
         return 'subject_symbol须为引用证据中的完整PLC对象或条件符号', []
+    numeric = category == 'step_condition' and _numeric_predicate(data, actual)
+    if numeric:
+        if action or target:
+            return '该条件的数值判据由源码渲染，请省略action和target', []
+    elif not action or subject == action:
+        return '分句须分别填写具体对象和动作', []
+    if not subject:
+        return '分句须填写具体对象', []
     if actual.strip():
         if normalize_symbol(actual).casefold() not in bound:
             return 'subject_symbol与所引用的本步对象或条件不匹配', []
@@ -449,6 +489,13 @@ def _validate_action_clauses(result, context):
             if issue:
                 return None, issue
             if not legacy and catalog[clause['source_ref']]['category'] == 'step_condition':
+                fact = catalog[clause['source_ref']]
+                if terms := _numeric_predicate(fact['data'], clause.get('subject_symbol', '')):
+                    choice = next((item for item in fact.get('subjects', [])
+                                   if item['symbol'].casefold() == normalize_symbol(clause['subject_symbol']).casefold()), {})
+                    subject = choice.get('label') or subject
+                    predicate = ' 且 '.join(term['operator'] + term['value'] for term in terms)
+                    action = ('是否满足 ' if clause['condition_use'] == 'check' else '满足 ') + predicate
                 subject = _CONDITION_USES[clause['condition_use']] + subject
             phrases.append(subject + action + target)
         refs.extend(item['id'] for item in selected)
