@@ -68,6 +68,7 @@ def _compact_command(command):
 class DescriptionContext:
     def __init__(self, run, index, wanted):
         self.run, self.index = Path(run), index
+        self.run_id = _json(self.run / 'workflow_manifest.json', {}).get('run_id')
         docs = _json(self.run / 'variable_documentation.json', {})
         self.docs = {key.casefold(): (key, _clean(value))
                      for key, value in (docs.get('all') or {}).items() if _clean(value)}
@@ -283,6 +284,8 @@ class DescriptionContext:
                   'limitations': ['描述起始步；结束步注释和静态路径只作上下文',
                                  '调用实参、门控和映射可共同支持推断；机构同类命名只支持类别推断',
                                  '不得仅按步号大小、0值、工位名或相邻展示行猜动作']}
+        if self.run_id:
+            packet['run_id'] = self.run_id
         packet['basis'] = stable_id('TB4', [start, end, packet])
         return packet
 

@@ -351,7 +351,7 @@ def step_text(row, amap) -> str:
     return txt
 
 
-def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sheet='步序采集表'):
+def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sheet='步序采集表', *, b_tier_pending=None):
     """Build the workstation delivery xlsx. Inputs are read-only; returns stats dict.
     group_by='auto' picks 构成要素 for SC04 naming, else 证据POU when available.
     out/proc_name default like the CLI: <proc_name>_步序采集表.xlsx beside the prediction.
@@ -511,10 +511,10 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     trace_rt = load_trace_runtime(run)
     # v9.29: detect B-tier not processed (input.json exists but no result.json).
     # When True, rows with empty descriptions get 【B档未处理】 in the remark column.
-    b_tier_pending = False
     if is_trace:
         b_tier_pending = any(row[4] in ('B档待处理', 'B档待修订') for row in desc_map.values())
-    elif run:
+    elif b_tier_pending is None:
+        b_tier_pending = False
         bd = os.path.join(run, 'batches_desc')
         if os.path.isdir(bd):
             _bd_files = os.listdir(bd)

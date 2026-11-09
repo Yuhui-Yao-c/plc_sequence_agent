@@ -22,11 +22,12 @@
 1. 逐个核对 `context.required_actions`，提交每个锚点的 `action_ref`。锚点保留已绑定对象、指令和已知目标。并行对象分别覆盖。有相反方向时查看实参和门控，区分条件请求与现场执行。
 2. 通用分句填写 `subject`、`action`、`source_ref` 和 `subject_symbol`。`source_ref` 指向本步写入、已定位的指令、已解析的控制条件或适用注释。`subject_symbol` 填该证据中的完整 PLC 对象或条件符号。注释已明确包含对象和动作时可省略该字段。名称示例和相邻步可以写入 `evidence_refs` 作为辅助引用。
 3. 目标可省略。目标取自本步注释或同一调用的实参。引用实参时填 `target_parameter`。已由锚点覆盖的指令直接使用 `action_ref`。补充分句须有独立本步证据。核对指令、条件和反馈的区别，结合源逻辑解释工程术语。
-4. 保留当前 `basis`、`kind` 和 `reasoning`。使用中文工艺术语，保留已证实的细节。工作流从通过的分句合成交付描述。
+4. 批次原样回传 `run_id` 和 `batch_id`。各行保留当前 `basis`、`kind` 和 `reasoning`。使用中文工艺术语，保留已证实的细节。工作流从通过的分句合成交付描述。
 5. 若证据不足，回传 `ok=false` 及具体原因。避免以“夹子气缸”“设备动作”“步进过渡”充当完整描述。
 
 ```json
 {
+  "run_id": "复制本批输入的run_id",
   "batch_id": 1,
   "descs": {
     "开始标签|||结束标签": {
@@ -48,7 +49,7 @@
 
 - 检查每个当前输入行的 `basis`、引用、动作对象及已知目标。通过项写入 `action_desc_final.csv`，保留依据和引用，并标为 LLM 推断待核。
 - 旧 v1–v3 批次仍可复核。使用新协议时按 v4 批次填写当前结果。缺失、过期及无效分句保持待处理。有效的证据不足结果归入描述复核。
-- 写完结果后重复同一条 `plc_cli.py trace` 命令。准备产物通过指纹核验后，续跑直接合并并刷新 `<工序名称>_trace步序采集表.xlsx`。
+- 写完结果后用相同参数加 `--resume`。准备产物通过指纹核验后，续跑直接合并并刷新 `<工序名称>_trace步序采集表.xlsx`。
 
 ## 预测业务目标
 为有支持证据的状态对（开始标签→结束标签）生成一句纯中文工艺动作描述。
@@ -74,7 +75,7 @@ A档由代码确定性生成（源码步注释），B档由 LLM 补充无步注�
 4. 有 `step_comment` 时优先使用步注释；参考 prev/next 的 sc 获取上下文
 5. 写 `batches_desc/*.result.json`，格式：
    ```json
-   {"batch_id": 1, "descs": {"开始标签|||结束标签": {"ok": true, "desc": "纯中文描述", "refs": ["token1"], "kind": "机械动作"}}}
+   {"run_id": "复制本批输入的run_id", "batch_id": 1, "descs": {"开始标签|||结束标签": {"ok": true, "desc": "纯中文描述", "refs": ["token1"], "kind": "机械动作"}}}
    ```
    - **键 = `开始标签|||结束标签`**（标签键，v9.29起稳定标识，重跑后行号可能变但标签键不变）
    - 旧格式按行号索引仍兼容（cmd_validate 回退匹配）
@@ -90,9 +91,9 @@ A档由代码确定性生成（源码步注释），B档由 LLM 补充无步注�
 |---|---|---|---|---|---|
 | predict | predict末尾 cmd_a | predict末尾 cmd_build | predict停→agent写result.json | finish cmd_validate | finish渲染 |
 | trace | 起始步源码注释优先 | 全部无注释行建上下文批次 | Agent 逐行综合映射、调用和控制证据 | 核验批次、证据版本和多条引用 | 渲染工作簿并保留推断依据和待核项 |
-| 重跑 | cmd_a（确定性不变）| cmd_build（不删result.json，v9.22）| agent成果保留 | cmd_validate | 渲染 |
+| 同轮续跑 | 使用本轮 A 档 | 使用本轮输入批次 | 使用匹配本轮的结果 | cmd_validate | 刷新 |
 
-**幂等保证**：`cmd_build` 不删除已有 `result.json`（v9.22），agent 处理成果在重跑时保留。
+同轮结果按 `run_id` 匹配。`--force` 将旧产物整体归档，再生成新批次。
 
 ## 产物链
 ```
@@ -131,7 +132,8 @@ python plc_cli.py finish --run "outputs/X"
 ```bash
 python plc_cli.py trace --source "..." --trace "..." --out "outputs/X" [--pattern "..."]
 # 首跑生成观测表、源码证据和适用的 B 档批次
-# Agent 完成 B 档后用相同参数加 --force，核验 workflow_status.json
+python plc_cli.py trace --source "..." --trace "..." --out "outputs/X" --resume
+# Agent 完成 B 档后保持首跑的全部选项，核验 workflow_status.json
 ```
 
 ## 边界情况
@@ -140,4 +142,4 @@ python plc_cli.py trace --source "..." --trace "..." --out "outputs/X" [--patter
 | 全部行有步注释 | cmd_build 输出"0行需LLM补充"，无B档批次 |
 | 源码无步注释且agent不介入 | A档全空，B档未处理，交付表标【B档未处理】 |
 | agent写的result.json不符白名单 | cmd_validate拒进review，行描述空 |
-| --force重跑 | cmd_build不删result.json，agent成果保留 |
+| --force 重建 | 归档旧目录，生成新 run_id 和本轮批次 |

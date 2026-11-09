@@ -10,58 +10,10 @@ Prediction and trace never open ground truth.  All four share the same
 column-compatible state-pair CSV format so downstream action_describe /
 gen_workstation_xlsx can be reused across modes.
 """
-import argparse, json, sys, hashlib
+import argparse, json, sys
 from pathlib import Path
-from workflow import create, validate
+from workflow import create, fingerprint, lock_run_dir, pipeline_fingerprint, validate
 from pair_evaluation import run as evaluate_candidates
-
-def fingerprint(p):
- h=hashlib.sha256()
- with Path(p).open('rb') as f:
-  for data in iter(lambda:f.read(1024*1024),b''):h.update(data)
- return h.hexdigest()
-
-# Stale-product markers shared by -t and trace short-circuit modes.
-_STALE_MARKERS=['workflow_manifest.json','workflow_status.json','batches',
-                'batches_desc','final_prediction_pairs.csv']
-# Stale file patterns to clear on --force (union of both modes' outputs).
-_STALE_PATTERNS=('step_variables.json','step_variables.csv',
-                 'trace_collection_pairs.csv','trace_*.csv','trace_*.json',
-                 '*_步序变量表.xlsx','*_步序采集表.xlsx','*_trace步序采集表.xlsx',
-                 'action_desc_*.csv','indexed_candidates.csv','indexed_events.csv',
-                 'source_transition_graph.json','source_transition_edges.csv','source_stage_candidates.csv',
-                 'native_command_evidence.csv','plcopen_action_trace.csv',
-                 'prediction_*.csv','sequence_*.csv','final_*.csv',
-                 'step_comments.json','network_comments.json',
-                 'variable_documentation.json','station_identity.json')
-
-def _check_isolation(out,args,mode_name):
-  """Refuse to write into a dir with predict/finish products unless --force.
-  Returns True if stale was cleared (caller should use force=True on create)."""
-  markers = _STALE_MARKERS
-  if mode_name == 'trace':
-   markers = markers + ['trace_pairs_summary.json','source_transition_edges.csv',
-                        'native_command_evidence.csv','plcopen_action_trace.csv']
-  has_stale=any((out/m).exists() for m in markers)
-  if has_stale and not args.force:
-   raise SystemExit(
-    f'{mode_name} 模式拒绝写入已有 predict/finish 产物的目录：{out}\n'
-    f'  检测到残留：{[m for m in markers if (out/m).exists()]}\n'
-    f'  请指定空目录，或加 --force 强制清理残留后重跑。')
-  if has_stale and args.force:
-   import shutil
-   for m in markers:
-    if m == 'batches_desc' and mode_name == 'trace':
-     continue  # Rebuild inputs and validate retained results against the new source basis.
-    p=out/m
-    if p.is_dir(): shutil.rmtree(p,ignore_errors=True)
-    elif p.exists(): p.unlink()
-   for pat in _STALE_PATTERNS:
-    for fp in out.glob(pat):
-     try: fp.unlink()
-     except Exception: pass
-   return True
-  return False
 
 def _extract_source_evidence(src,out,include_comments=True,include_station_identity=True):
   """Extract variable_docs + station_identity (+ step_comments + network_comments
@@ -100,14 +52,12 @@ def _run_tagvars(src,out,args):
  machinery that finds start/end labels, then extracts symbols from it.
  Skips batch/action-desc/delivery-table/trace/coverage.  Reads only source
  XML, never GT.  Outputs <proc_name>_步序变量表.xlsx + step_variables.json/csv."""
- out.mkdir(parents=True,exist_ok=True)
  stats={'mode':'tagvars','source':str(src),'out':str(out),'status':'running'}
- _check_isolation(out,args,'-t')
  # 1) Run the normal candidate pipeline (parse → filter → freeze candidates).
- #    force=True so workflow.create does not refuse on a freshly-cleaned dir.
  manifest=create(str(src),str(out),batch_size=args.batch_size,
-                 pattern=args.pattern,force=True,manual=None,trace=None)
- stats['candidate_count']=manifest.get('candidate_count',0)
+                 pattern=args.pattern,force=args.force,manual=args.manual,trace=args.trace,mode='tagvars')
+ stats.update(run_id=manifest['run_id'],previous_output=manifest['previous_output'],
+              candidate_count=manifest.get('candidate_count',0))
  # 2) Extract variable docs + station identity (for workstation naming).
  #    -t mode does not need step_comments/network_comments (no descriptions).
  _extract_source_evidence(src,out,include_comments=False)
@@ -130,14 +80,10 @@ _TRACE_STATS = ('variables_total', 'variables_active', 'total_jumps', 'cycles_de
 def _trace_inputs(src, trace, args):
  from trace_to_pairs import trace_input_digest
  from trace_description_context import SCHEMA
- root = Path(__file__).resolve().parent
- code = sorted(root.glob('trace_*.py')) + [
-     root/name for name in ('VERSION', 'plc_cli.py', 'workflow.py', 'action_describe.py')
- ]
  return {
      'source': str(src), 'source_sha256': fingerprint(src),
      'trace': str(trace), 'trace_sha256': trace_input_digest(trace),
-     'description_schema': SCHEMA, 'code': {p.name: fingerprint(p) for p in code},
+     'description_schema': SCHEMA, 'pipeline_sha256': pipeline_fingerprint(),
      'options': {name: getattr(args, name) for name in ('batch_size', 'pattern', 'proc_name', 'sample_interval_ms')},
  }
 
@@ -162,23 +108,22 @@ def _run_trace_mode(src,out,args):
   raise FileNotFoundError(f'PLC源码不存在：{src}')
  if not trace.exists():
   raise FileNotFoundError(f'Trace输入不存在：{trace}')
- if src.is_relative_to(out) or trace.is_relative_to(out):
+ if any(p.is_relative_to(out) for p in (src,trace,Path(args.source).absolute(),Path(args.trace).absolute())):
   raise ValueError('输出目录须与PLC源码和Trace输入分开')
- out.mkdir(parents=True,exist_ok=True)
  cache_path = out/_TRACE_PREPARED
  inputs = _trace_inputs(src, trace, args)
  cached = None
- if cache_path.is_file() and not args.force:
+ if args.resume:
   try:
    cached = json.loads(cache_path.read_text(encoding='utf-8'))
-   if (cached['inputs'] != inputs or cached['files'] != _trace_prepared_files(out)
+   manifest = json.loads((out/'workflow_manifest.json').read_text(encoding='utf-8'))
+   if (manifest.get('mode') != 'trace' or not cached['run_id'] or cached['run_id'] != manifest.get('run_id')
+       or cached['inputs'] != inputs or cached['files'] != _trace_prepared_files(out)
        or not set((*_TRACE_STATS, 'candidate_count')) <= cached['stats'].keys()
        or (out/'final_prediction_pairs.csv').exists()):
     raise ValueError('输入或准备产物已变化')
   except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-   raise SystemExit(f'Trace准备结果无法复用（{exc}）。请用新目录或显式 --force 重建。') from exc
- else:
-  _check_isolation(out,args,'trace')
+   raise SystemExit(f'Trace准备结果无法续跑（{exc}）。请用新目录或显式 --force 重建。') from exc
  stats = {'mode':'trace','source':str(src),'trace':str(trace),'out':str(out),
           'preparation_reused': cached is not None}
  stage = 'source'
@@ -186,8 +131,9 @@ def _run_trace_mode(src,out,args):
   if cached is None:
    print('Trace [1/4] 解析 PLC 源码并准备候选批次', file=sys.stderr, flush=True)
    manifest = create(str(src),str(out),batch_size=args.batch_size,
-                     pattern=args.pattern,force=True,manual=None,trace=None)
-   stats['candidate_count'] = manifest.get('candidate_count',0)
+                     pattern=args.pattern,force=args.force,trace=trace,mode='trace')
+   stats.update(run_id=manifest['run_id'],previous_output=manifest['previous_output'],
+                candidate_count=manifest.get('candidate_count',0))
 
    stage = 'source_evidence'
    print('Trace [2/4] 提取变量文档、步注释和工位身份', file=sys.stderr, flush=True)
@@ -207,14 +153,14 @@ def _run_trace_mode(src,out,args):
    cmd_build(str(out))
    if _trace_inputs(src, trace, args) != inputs:
     raise ValueError('准备过程中源码、Trace或程序发生变化，请重建')
-   prepared = {'inputs': inputs, 'files': _trace_prepared_files(out),
+   prepared = {'run_id': stats['run_id'], 'inputs': inputs, 'files': _trace_prepared_files(out),
                'stats': {k: stats[k] for k in (*_TRACE_STATS, 'candidate_count')}}
    tmp_path = cache_path.with_suffix('.tmp')
    tmp_path.write_text(json.dumps(prepared, ensure_ascii=False, indent=2), encoding='utf-8')
    tmp_path.replace(cache_path)
   else:
    print('Trace 续跑：准备产物已核验，合并 B 档结果并刷新交付表', file=sys.stderr, flush=True)
-   stats.update(cached['stats'])
+   stats.update(cached['stats'],run_id=cached['run_id'])
 
   stage = 'description'
   from action_describe import cmd_validate
@@ -236,10 +182,11 @@ def _run_trace_mode(src,out,args):
   stats.update(status='xlsx_failed' if stage == 'workbook' else 'failed',
                failed_stage=stage, error=str(exc))
  status = json.dumps(stats,ensure_ascii=False,indent=2)
- status_path = out/'workflow_status.json'
- tmp_path = status_path.with_suffix('.tmp')
- tmp_path.write_text(status,encoding='utf-8')
- tmp_path.replace(status_path)
+ if stats.get('run_id'):
+  status_path = out/'workflow_status.json'
+  tmp_path = status_path.with_suffix('.tmp')
+  tmp_path.write_text(status,encoding='utf-8')
+  tmp_path.replace(status_path)
  print(status)
  if 'error' in stats:
   sys.exit(2)
@@ -283,7 +230,7 @@ def predict(args):
   (out/'candidate_audit.json').write_text(json.dumps(ap_,ensure_ascii=False,indent=1),encoding='utf-8')
  except Exception:
   pass
- prov={'version':'9.28.0','source_format':json.loads((out/'candidate_audit.json').read_text(encoding='utf-8'))['format'],'pipeline_order':['source_parse_all','source_cross_fb_protocols','name_filter','boundary_normalization','action_signal_tail_composition','optional_process_review'],'mode':'prediction','source_sha256':fingerprint(src),'source_name':src.name,'pattern':args.pattern,'candidate_sha256':fingerprint(out/'sequence_candidates.csv'),'prediction_has_gt_access':False,'status':'prepared_needs_opencode_batches','workflow_manifest':'workflow_manifest.json','trace':trace_path}
+ prov={'version':'9.28.0','source_format':json.loads((out/'candidate_audit.json').read_text(encoding='utf-8'))['format'],'pipeline_order':['source_parse_all','source_cross_fb_protocols','name_filter','boundary_normalization','action_signal_tail_composition','optional_process_review'],'mode':'prediction','source_sha256':manifest['source_sha256'],'source_name':src.name,'pattern':args.pattern,'candidate_sha256':fingerprint(out/'sequence_candidates.csv'),'prediction_has_gt_access':False,'status':'prepared_needs_opencode_batches','workflow_manifest':'workflow_manifest.json','trace':trace_path}
  prov['atomic_output_sha256']=fingerprint(out/'prediction_collection_pairs.csv')
  prov['atomic_archive_sha256']=fingerprint(out/'prediction_atomic_pairs.csv')
  prov['full_pair_archive_sha256']=fingerprint(out/'prediction_candidate_pairs.csv')
@@ -302,7 +249,7 @@ def predict(args):
  with (out/'prediction_candidate_pairs.csv').open(encoding='utf-8-sig',newline='') as f:
   import csv
   complete_pairs=sum(1 for _ in csv.DictReader(f))
- print(json.dumps({'mode':'predict','source_format':audit['format'],'output':str(out),'complete_candidate_pairs':complete_pairs,'main_prediction':str(out/'prediction_collection_pairs.csv'),'full_recall_archive':str(out/'prediction_candidate_pairs.csv'),'atomic_projection':json.loads((out/'prediction_atomic_summary.json').read_text(encoding='utf-8')),'batch_count':len(manifest['batches']),'next':'OpenCode逐批写result.json后运行 python plc_cli.py finish --run "目录"'},ensure_ascii=False,indent=2))
+ print(json.dumps({'mode':'predict','run_id':manifest['run_id'],'previous_output':manifest['previous_output'],'source_format':audit['format'],'output':str(out),'complete_candidate_pairs':complete_pairs,'main_prediction':str(out/'prediction_collection_pairs.csv'),'full_recall_archive':str(out/'prediction_candidate_pairs.csv'),'atomic_projection':json.loads((out/'prediction_atomic_summary.json').read_text(encoding='utf-8')),'batch_count':len(manifest['batches']),'next':'OpenCode逐批写result.json后运行 python plc_cli.py finish --run "目录"'},ensure_ascii=False,indent=2))
 
 def finish(args):
  r=validate(args.run,write=True)
@@ -389,7 +336,7 @@ def main():
  p=argparse.ArgumentParser(description='PLC Agent v9.28，候选保全、逻辑后继统一、动作描述纯中文化(A档步注释自动+B档LLM补充/变量文档注入/简短动作重点)、predict生成A档+B档(finish一次完成)、预测评价隔离、trace跳变分析与时长回填(--trace)、覆盖评价(--manual自动触发)、步序变量清单提取(--tagvars/-t短路模式)、STCode状态比较补充轨道、trace步序采集模式(trace子命令)')
  sub=p.add_subparsers(dest='mode',required=True)
  x=sub.add_parser('predict',help='源码+变量模式；不接受GT')
- x.add_argument('--source',required=True);x.add_argument('--pattern');x.add_argument('--out',required=True);x.add_argument('--batch-size',type=int,default=120);x.add_argument('--force',action='store_true'); x.add_argument('--manual',default=None,help='可选：人工采集表路径，传入后finish自动运行覆盖评价');x.add_argument('--trace',default=None,help='可选：运行时trace文件路径(.trace)，传入后finish自动分析跳变并回填交付表时长列');x.add_argument('--tagvars','-t',action='store_true',help='步序变量提取模式：跳过候选/批次/交付表，只输出<工序名>_步序变量表.xlsx');x.set_defaults(func=predict)
+ x.add_argument('--source',required=True);x.add_argument('--pattern');x.add_argument('--out',required=True);x.add_argument('--batch-size',type=int,default=120);x.add_argument('--force',action='store_true',help='归档旧输出目录并从空目录开始'); x.add_argument('--manual',default=None,help='可选：人工采集表路径，传入后finish自动运行覆盖评价');x.add_argument('--trace',default=None,help='可选：运行时trace文件路径(.trace)，传入后finish自动分析跳变并回填交付表时长列');x.add_argument('--tagvars','-t',action='store_true',help='步序变量提取模式：跳过候选/批次/交付表，只输出<工序名>_步序变量表.xlsx');x.set_defaults(func=predict)
  x=sub.add_parser('evaluate',help='已有预测+GT；可读取XML独立核验，不修改预测')
  x.add_argument('--prediction',required=True);x.add_argument('--gt',required=True);x.add_argument('--out',required=True);x.add_argument('--relations');x.add_argument('--transition-graph',help='预测阶段生成的source_transition_graph.json，不接受GT作为证据');x.add_argument('--xml',help='仅评价读取PLCopen/SMC2/欧姆龙原生IEC61131-10 XML文本，生成独立控制流证据，绝不回写预测');x.add_argument('--top-k',type=int,default=5);x.add_argument('--no-excel',action='store_true');x.set_defaults(func=evaluate)
  x=sub.add_parser('finish',help='组装所有OpenCode批次+自动A档动作描述+交付表');x.add_argument('--run',required=True);x.set_defaults(func=finish)
@@ -403,7 +350,14 @@ def main():
  x.add_argument('--out',required=True,help='输出目录')
  x.add_argument('--pattern',default=None,help='可选：变量名称过滤模式（glob或re:前缀正则）')
  x.add_argument('--batch-size',type=int,default=120)
- x.add_argument('--force',action='store_true',help='强制重建准备产物；同一运行合并B档时可直接续跑')
+ execution=x.add_mutually_exclusive_group()
+ execution.add_argument('--force',action='store_true',help='归档旧输出目录并从空目录开始')
+ execution.add_argument('--resume',action='store_true',help='校验并合并同一轮的B档批次')
  x.set_defaults(func=lambda a:_run_trace_mode(Path(a.source).resolve(),Path(a.out).resolve(),a))
- a=p.parse_args();a.func(a)
+ a=p.parse_args()
+ if a.mode in ('predict','trace','finish'):
+  with lock_run_dir(a.run if a.mode=='finish' else a.out):
+   a.func(a)
+ else:
+  a.func(a)
 if __name__=='__main__':main()

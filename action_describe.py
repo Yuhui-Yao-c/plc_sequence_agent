@@ -342,6 +342,13 @@ def cmd_a(run):
     return p
 
 
+def _description_run_id(run):
+    manifest = Path(run) / 'workflow_manifest.json'
+    if manifest.is_file():
+        return json.loads(manifest.read_text(encoding='utf-8')).get('run_id')
+    return None
+
+
 def cmd_build(run, batch_size=40):
     p = os.path.join(run, 'action_desc_a.csv')
     df = pd.read_csv(p, dtype=str, encoding='utf-8-sig', keep_default_na=False)
@@ -351,8 +358,9 @@ def cmd_build(run, batch_size=40):
     outdir = Path(run) / 'batches_desc'
     outdir.mkdir(exist_ok=True)
     trace_evidence = read_trace_evidence(run)
+    run_id = _description_run_id(run)
     if trace_evidence is not None:
-        return _build_trace_batches(df, outdir, trace_evidence, batch_size)
+        return _build_trace_batches(df, outdir, trace_evidence, batch_size, run_id)
     # Rebuild only the inputs. Results are matched to the current batch and source basis.
     for f in outdir.glob('*.input.json'):
         f.unlink()
@@ -412,13 +420,16 @@ def cmd_build(run, batch_size=40):
                             '描述不含变量名/英文/ASCII标识符，长度≤20字符。'
                             '允许使用Z轴/X轴/Y轴/R轴/气缸/电夹爪/吸盘/机器人等通用机构词。'
                             'refs字段填写该行所有token的原始变量名。'}
+        if run_id:
+            payload['run_id'] = run_id
+            payload['task'] += '结果原样回传本批次 run_id 和 batch_id。'
         with open(os.path.join(outdir, f'batch_{nb:03d}.input.json'), 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=1)
     print(f'B档批次: {nb}批 / {len(df)}行（待LLM补充） -> {outdir}')
     return nb
 
 
-def _build_trace_batches(df, outdir, evidence, batch_size):
+def _build_trace_batches(df, outdir, evidence, batch_size, run_id):
     if batch_size < 1:
         raise ValueError('B档batch_size须大于0')
     rows = []
@@ -459,6 +470,9 @@ def _build_trace_batches(df, outdir, evidence, batch_size):
                 '保留basis、kind及reasoning。缺证据时提交ok=false和明确的reason。交付描述由通过的分句合成。'
             ),
         }
+        if run_id:
+            payload['run_id'] = run_id
+            payload['task'] += '结果原样回传本批次 run_id 和 batch_id。'
         path = outdir / f'batch_{count:03d}.input.json'
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
     print(f'Trace B档: 全部{len(rows)}行缺注释状态对进入上下文描述，{count}批')
@@ -479,7 +493,7 @@ def _description_issue(desc, vocabulary):
     return f'词汇待核: {unknown[:3]}' if unknown else ''
 
 
-def _trace_results(run):
+def _description_results(run, run_id):
     results, missing, invalid = {}, [], []
     inputs = sorted((run / 'batches_desc').glob('*.input.json'))
     for path in inputs:
@@ -490,14 +504,16 @@ def _trace_results(run):
             continue
         try:
             result = json.loads(result_path.read_text(encoding='utf-8-sig'))
-            if result['batch_id'] != batch['batch_id'] or not isinstance(result['descs'], dict):
-                raise ValueError('batch mismatch')
+            if (result['batch_id'] != batch['batch_id'] or not isinstance(result['descs'], dict)
+                    or (run_id and (batch.get('run_id') != run_id or result.get('run_id') != run_id))):
+                raise ValueError('batch or run mismatch')
         except (OSError, ValueError, KeyError, TypeError):
             invalid.append(result_path.name)
             continue
         for row in batch['rows']:
-            if row['id'] in result['descs']:
-                results[row['id']] = result['descs'][row['id']]
+            key = row['id'] if row['id'] in result['descs'] else row.get('row_id')
+            if key in result['descs']:
+                results[row['id']] = result['descs'][key]
     return results, {
         'b_tier_input_count': len(inputs),
         'b_tier_result_count': len(inputs) - len(missing) - len(invalid),
@@ -534,7 +550,7 @@ def _validate_trace_result(result, evidence, allowed):
 
 def _validate_trace(run, a, evidence, allowed, stats):
     run = Path(run)
-    results, counts = _trace_results(run)
+    results, counts = _description_results(run, _description_run_id(run))
     counts.update(a_sourced=0, b_candidates=0, unresolved_rows=0, b_tier_pending_rows=0,
                   b_tier_invalid_rows=0)
     rows, review = [], []
@@ -657,37 +673,46 @@ def cmd_validate(run, *, stats=None):
         label_to_rid[label_key] = rid
     bmap = {}
     issues = []
-    for fp in sorted(glob.glob(os.path.join(run, 'batches_desc', '*.result.json'))):
-        with open(fp, encoding='utf-8') as f:
-            res = json.load(f)
-        for rid, d in res.get('descs', {}).items():
-            if not d.get('ok'):
-                issues.append((rid, f"B档标记不可用: {d.get('reason', '')}"))
-                continue
-            desc = str(d.get('desc', '')).strip()
-            refs = [str(x).strip() for x in d.get('refs', [])]
-            # v9.29: match by label_key first, fall back to 行号 (legacy result.json)
-            if rid in row_lex:
-                toks, words, actions = row_lex[rid]
-                match_rid = label_to_rid.get(rid, rid)
-            elif rid in row_lex_by_rid:
-                toks, words, actions = row_lex_by_rid[rid]
-                match_rid = rid
-            else:
-                issues.append((rid, '行号/标签键不存在'))
-                continue
-            bad = [x for x in refs if x not in toks]
-            if bad:
-                issues.append((rid, f'引用超出该行动作变量: {bad[:2]}'))
-                continue
-            row_words = set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(words)))
-            row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(actions)))
-            row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', str(a[a['行号'] == match_rid]['A档描述'].iloc[0])))
-            issue = _description_issue(desc, allowed | row_words)
-            if issue:
-                issues.append((rid, issue))
-                continue
-            bmap[match_rid] = {'desc': desc, 'refs': refs, 'kind': d.get('kind') or a[a['行号'] == match_rid]['行性质'].iloc[0]}
+    run_id = _description_run_id(run)
+    if run_id:
+        scoped, counts = _description_results(Path(run), run_id)
+        entries = scoped.items()
+        issues.extend(('', f'批次不属于本轮或结果格式不符：{name}') for name in counts['invalid_b_tier_batches'])
+        if stats is not None:
+            stats.update(counts)
+    else:
+        entries = []
+        for fp in sorted(glob.glob(os.path.join(run, 'batches_desc', '*.result.json'))):
+            with open(fp, encoding='utf-8') as stream:
+                entries.extend(json.load(stream).get('descs', {}).items())
+    for rid, d in entries:
+        if not d.get('ok'):
+            issues.append((rid, f"B档标记不可用: {d.get('reason', '')}"))
+            continue
+        desc = str(d.get('desc', '')).strip()
+        refs = [str(x).strip() for x in d.get('refs', [])]
+        # v9.29: match by label_key first, fall back to 行号 (legacy result.json)
+        if rid in row_lex:
+            toks, words, actions = row_lex[rid]
+            match_rid = label_to_rid.get(rid, rid)
+        elif rid in row_lex_by_rid:
+            toks, words, actions = row_lex_by_rid[rid]
+            match_rid = rid
+        else:
+            issues.append((rid, '行号/标签键不存在'))
+            continue
+        bad = [x for x in refs if x not in toks]
+        if bad:
+            issues.append((rid, f'引用超出该行动作变量: {bad[:2]}'))
+            continue
+        row_words = set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(words)))
+        row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', ' '.join(actions)))
+        row_words |= set(re.findall(r'[\u4e00-\u9fff]{2,}', str(a[a['行号'] == match_rid]['A档描述'].iloc[0])))
+        issue = _description_issue(desc, allowed | row_words)
+        if issue:
+            issues.append((rid, issue))
+            continue
+        bmap[match_rid] = {'desc': desc, 'refs': refs, 'kind': d.get('kind') or a[a['行号'] == match_rid]['行性质'].iloc[0]}
     rows = []
     n_b = 0
     n_a = 0

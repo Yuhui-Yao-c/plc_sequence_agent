@@ -2,9 +2,11 @@
 """Deterministic orchestration/checkpointing for an OpenCode-driven PLC analysis.
 No gold labels, project names or specific PLC step constants are used.
 """
-import argparse,csv,glob,hashlib,json,re,sys
+import argparse,csv,glob,hashlib,json,os,re,sys
 from collections import defaultdict,Counter
+from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 from agent import run as extract
 from candidate_filter import filter_rows,filter_csv
 from boundary_normalizer import META,normalize_rows,load_graph,empty_graph
@@ -50,10 +52,91 @@ def pack_controller_batches(crows,evrows,batch_size):
  for i in range(0,len(unmatched),batch_size):result.append({'c':[],'e':unmatched[i:i+batch_size]})
  return result
 
-def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=None):
- out=Path(out).resolve();out.mkdir(parents=True,exist_ok=True)
+def fingerprint(path):
+ h=hashlib.sha256()
+ with Path(path).open('rb') as stream:
+  for block in iter(lambda:stream.read(1024*1024),b''):
+   h.update(block)
+ return h.hexdigest()
+
+
+def pipeline_fingerprint():
+ root=Path(__file__).resolve().parent
+ paths=[p for p in root.glob('*.py') if not p.name.startswith('test_')]
+ paths += list((root/'评价器').glob('*.py'))
+ paths += list((root/'.opencode').glob('agents/*.md'))
+ paths += list((root/'.opencode').glob('skills/*/SKILL.md'))
+ paths += [root/name for name in ('VERSION','AGENTS.md','opencode.json','requirements.txt','action_wordbook.json')]
+ hashes={p.relative_to(root).as_posix():fingerprint(p) for p in paths if p.is_file()}
+ return hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()
+
+
+def _check_output_location(out):
+ if Path.cwd().resolve().is_relative_to(out) or Path(__file__).resolve().is_relative_to(out):
+  raise ValueError('输出目录须独立于工作目录和程序文件')
+
+
+@contextmanager
+def lock_run_dir(out):
+ """Serialize commands targeting the same output directory, including rebuilds."""
+ out=Path(out).resolve()
+ out.parent.mkdir(parents=True,exist_ok=True)
+ # A sibling lock stays in place when --force archives the old directory.
+ with (out.parent/f'.{out.name}.plc.lock').open('a+b') as lock:
+  try:
+   if os.name=='nt':
+    import msvcrt
+    lock.seek(0)
+    msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
+   else:
+    import fcntl
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except OSError as exc:
+   raise SystemExit(f'输出目录正在由其他工作流命令使用：{out}') from exc
+  yield
+
+
+def _fresh_output(out, force):
+ if out.exists() and not out.is_dir():
+  raise ValueError(f'输出路径须为目录：{out}')
+ if not out.exists() or not any(out.iterdir()):
+  out.mkdir(parents=True,exist_ok=True)
+  return None
+ if not force:
+  raise SystemExit(f'新一轮执行须使用空目录：{out}。如需在原路径重建，可用 --force 归档旧产物。')
+ markers=('workflow_manifest.json','workflow_status.json','sequence_candidates.csv',
+          'recall_candidates.csv','trace_collection_pairs.csv','action_desc_a.csv')
+ if not any((out/name).is_file() for name in markers):
+  raise SystemExit(f'目录非空且未识别到工作流产物：{out}。请指定空目录。')
+ previous=out.with_name(f'{out.name}.previous-{uuid4().hex[:12]}')
+ out.rename(previous)
+ try:
+  out.mkdir()
+ except OSError:
+  if not out.exists():
+   previous.rename(out)
+  raise
+ print(f'旧工作流产物已归档到 {previous}',file=sys.stderr)
+ return str(previous)
+
+
+def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=None,*,mode='predict'):
+ out=Path(out).resolve()
+ _check_output_location(out)
+ if not Path(source).is_file():
+  raise FileNotFoundError(f'PLC源码不存在：{source}')
+ for path in (source,manual,trace):
+  if path and any(p.is_relative_to(out) for p in (Path(path).absolute(),Path(path).resolve())):
+   raise ValueError(f'输出目录须与输入分开：{path}')
+ if batch_size<1:
+  raise ValueError('batch_size must be positive')
+ previous=_fresh_output(out,force)
+ run_id=uuid4().hex
  manifest=out/'workflow_manifest.json'
- if manifest.exists() and not force:raise SystemExit('已存在 workflow_manifest.json；为保护人工整理进度，请指定新输出目录，或显式 --force。')
+ run_meta={'run_id':run_id,'mode':mode,'previous_output':previous,
+           'pipeline_sha256':pipeline_fingerprint(),'source_sha256':fingerprint(source)}
+ with manifest.open('x',encoding='utf-8') as stream:
+  json.dump({**run_meta,'status':'PREPARING'},stream)
  report=extract(str(source),str(out))
  rows=csv_read(out/'sequence_candidates.csv');events=csv_read(out/'event_graph.csv')
  if pattern:
@@ -116,8 +199,9 @@ def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=
   for pack in pack_controller_batches(crows,evrows,batch_size):
    bid+=1;batch_id=f'B{bid:05d}'
    cp=pack['c'];ep=pack['e']
-   payload={'batch_id':batch_id,'controller':controller,'candidate_count':len(cp),'event_count':len(ep),
+   payload={'run_id':run_id,'batch_id':batch_id,'controller':controller,'candidate_count':len(cp),'event_count':len(ep),
     'candidates':cp,'events':ep,'task':'SMC2 state_wait代表源网络中的等待阶段，无机械线圈不等于无工艺意义。首先保留source_stage_candidates.csv中的有条件等待与交接，并解释其起止，不将注释中的数字当成新步号。为真实动作/加工保持/检测/工艺等待/关键交接填写过程类型、统计对象、起点含义、终点含义、工艺依据、边界依据。状态退出按源码后继规范化；不得按数字邻接猜测。动作紧接信号/数据收尾时按signal_merge_lineage.json合并；原始分段留档，内部延时计入；不得吞掉下一独立动作或等待。不能确定时记录待核验，不删除主候选。每个事件须入表或unresolved_events。'}
+   payload['task']+='结果原样回传本批次 run_id 和 batch_id。'
    (bdir/f'{batch_id}.input.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
    batches.append({'batch_id':batch_id,'controller':controller,'input':f'batches/{batch_id}.input.json','output':f'batches/{batch_id}.result.json','candidate_ids':[r['候选ID'] for r in cp],'event_ids':[r['事件ID'] for r in ep]})
  # A deterministic lossless candidate-pair export BEFORE the optional OpenCode semantic stage.
@@ -138,13 +222,24 @@ def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=
  (out/'candidate_audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
 
 
- meta={'version':'9.28','collection_projection':collection_stats,'atomic_projection':atomic_stats,'boundary_normalization':boundary_stats,'source':str(Path(source).resolve()),'manual':str(Path(manual).resolve()) if manual else None,'trace':str(Path(trace).resolve()) if trace else None,'extraction':report,'batches':batches,'batch_size':batch_size,'candidate_count':len(rows),'candidate_pairs_count':len(pair_rows),'event_count':len(events),'status':'PREPARED','filter':filter_summary,'process_triage':process_triage,'plcopen_action_trace':report.get('plcopen_action_trace'),'timing_relation_hypotheses':len(time_rows)}
- manifest.write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
- (out/'RESULT_SCHEMA.md').write_text('''# 每批结果JSON协议\n```json\n{"batch_id":"B00001","steps":[{"构成要素":"...","动作":"...","动作描述":"...","开始标签":"...","结束标签":"...","核验状态":"confirmed_or_candidate","证据候选ID":["C0000001"],"证据事件ID":["E0000001"],"说明":"..."}],"unresolved_events":[{"event_id":"E0000002","reason":"无法确定使能或反馈"}],"notes":"..."}\n```\n\n要求：开始标签必须来自候选开始标签（或明确写出证据候选ID）；结束标签必须来自候选结束标签；特殊的新条件只能标记 `source_review_required` 并注明源码位置，不能无证据认定已验证。每个事件ID必须出现在某个steps.证据事件ID或unresolved_events中；不可只凭同网络共现证明因果。每条step还要填写：过程类型（机械动作/加工保持/检测测量/工艺等待/交接数据/周期汇总/内部辅助/未分类）、统计对象、起点含义、终点含义、工艺依据、边界依据。缺字段仅进入复核队列，不能删主候选。\n''',encoding='utf-8')
+ meta={**run_meta,'version':'9.28','collection_projection':collection_stats,'atomic_projection':atomic_stats,'boundary_normalization':boundary_stats,'source':str(Path(source).resolve()),'manual':str(Path(manual).resolve()) if manual else None,'trace':str(Path(trace).resolve()) if trace else None,'extraction':report,'batches':batches,'batch_size':batch_size,'candidate_count':len(rows),'candidate_pairs_count':len(pair_rows),'event_count':len(events),'status':'PREPARED','filter':filter_summary,'process_triage':process_triage,'plcopen_action_trace':report.get('plcopen_action_trace'),'timing_relation_hypotheses':len(time_rows)}
+ (out/'RESULT_SCHEMA.md').write_text('''# 每批结果JSON协议\n```json\n{"run_id":"复制本批输入的run_id","batch_id":"B00001","steps":[{"构成要素":"...","动作":"...","动作描述":"...","开始标签":"...","结束标签":"...","核验状态":"confirmed_or_candidate","证据候选ID":["C0000001"],"证据事件ID":["E0000001"],"说明":"..."}],"unresolved_events":[{"event_id":"E0000002","reason":"无法确定使能或反馈"}],"notes":"..."}\n```\n\n要求：开始标签必须来自候选开始标签（或明确写出证据候选ID）；结束标签必须来自候选结束标签；特殊的新条件只能标记 `source_review_required` 并注明源码位置，不能无证据认定已验证。每个事件ID必须出现在某个steps.证据事件ID或unresolved_events中；不可只凭同网络共现证明因果。每条step还要填写：过程类型（机械动作/加工保持/检测测量/工艺等待/交接数据/周期汇总/内部辅助/未分类）、统计对象、起点含义、终点含义、工艺依据、边界依据。缺字段仅进入复核队列，不能删主候选。\n''',encoding='utf-8')
+ tmp=manifest.with_suffix('.tmp')
+ tmp.write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+ tmp.replace(manifest)
  return meta
 
 def validate(out,write=False):
  out=Path(out);manifest=json.loads((out/'workflow_manifest.json').read_text(encoding='utf-8'))
+ if manifest.get('mode','predict')!='predict' or (out/'trace_collection_pairs.csv').is_file():
+  raise SystemExit('finish/assemble 只合并预测批次。Trace 请用 trace --resume。')
+ if 'batches' not in manifest:
+  raise SystemExit('预测批次尚未准备完成，请新建输出目录或使用 --force 重建。')
+ run_id=manifest.get('run_id')
+ if run_id and (manifest.get('pipeline_sha256')!=pipeline_fingerprint()
+                or not Path(manifest['source']).is_file()
+                or manifest['source_sha256']!=fingerprint(manifest['source'])):
+  raise SystemExit('源码或工作流版本已变化，请重新准备预测批次。')
  # v9.22: fallback — if step_comments.json is missing (e.g. predict ran on
  # an older version without step-comment extraction), extract it now from
  # the source XML so A-tier descriptions work on re-runs.
@@ -165,7 +260,10 @@ def validate(out,write=False):
   if not p.exists():missing.append(b['batch_id']);continue
   try:result=json.loads(p.read_text(encoding='utf-8'))
   except Exception as ex:issues.append(f"{b['batch_id']} JSON格式错误: {ex}");continue
-  if result.get('batch_id')!=b['batch_id']:issues.append(f"{b['batch_id']} ID错误");continue
+  if not isinstance(result,dict) or result.get('batch_id')!=b['batch_id']:
+   issues.append(f"{b['batch_id']} ID错误");continue
+  if run_id and result.get('run_id')!=run_id:
+   issues.append(f"{b['batch_id']} run_id 与本轮不符");continue
   local_used=set()
   for step in result.get('steps',[]):
    ids=step.get('证据候选ID',[]);eids=step.get('证据事件ID',[])
@@ -257,8 +355,9 @@ def validate(out,write=False):
    try:
     from action_describe import cmd_validate
     desc_files = glob.glob(str(out/'batches_desc'/'*.result.json'))
+    desc_stats = {}
     if desc_files:
-     cmd_validate(str(out))
+     cmd_validate(str(out),stats=desc_stats)
     else:
      import shutil as _sh
      a_path = out/'action_desc_a.csv'
@@ -269,17 +368,20 @@ def validate(out,write=False):
     # 未处理时 b_tier=False，交付表会有大面积空描述，需 agent 处理后重跑。
     # v9.29: b_tier_incomplete 强制标记——result.json 缺失时交付表标【B档未处理】。
     b_inputs = glob.glob(str(out/'batches_desc'/'*.input.json'))
+    result_count = desc_stats.get('b_tier_result_count',len(desc_files))
+    pending = max(0,len(b_inputs)-result_count)
     status['action_desc'] = {
      'a_tier': True,
-     'b_tier': bool(desc_files),
+     'b_tier': bool(result_count),
      'b_tier_batches_built': bool(b_inputs),
      'b_tier_input_count': len(b_inputs),
-     'b_tier_result_count': len(desc_files),
-     'b_tier_pending': len(b_inputs) - len(desc_files),
-     'b_tier_incomplete': bool(b_inputs) and not desc_files,
+     'b_tier_result_count': result_count,
+     'b_tier_pending': pending,
+     'b_tier_incomplete': bool(pending),
+     **{key:desc_stats[key] for key in ('missing_b_tier_batches','invalid_b_tier_batches') if key in desc_stats},
     }
-    if not desc_files and b_inputs:
-     print(f'B档未处理: {len(b_inputs)}批 input.json 待 agent 逐批处理写 result.json 后重跑 finish；当前交付表动作描述为空（仅 A 档步注释），备注列标【B档未处理】', file=sys.stderr)
+    if pending:
+     print(f'B档未处理: {pending}批 input.json 待 agent 逐批处理写 result.json 后重跑 finish；当前交付表动作描述为空（仅 A 档步注释），备注列标【B档未处理】', file=sys.stderr)
    except Exception as exc:
     status['action_desc'] = {'error': str(exc)}
     print(f'warning: action description not generated ({exc}); CSV deliverables intact', file=sys.stderr)
@@ -301,7 +403,8 @@ def validate(out,write=False):
    # Delivery table: workstation-format xlsx ships with every finished run.
    try:
     from gen_workstation_xlsx import generate as gen_ws
-    status['workstation_xlsx'] = gen_ws(str(out/'final_prediction_pairs.csv'),run=str(out))
+    status['workstation_xlsx'] = gen_ws(str(out/'final_prediction_pairs.csv'),run=str(out),
+        b_tier_pending=status.get('action_desc',{}).get('b_tier_incomplete'))
    except Exception as exc:
     status['workstation_xlsx'] = {'error': str(exc)}
     print(f'warning: workstation xlsx not generated ({exc}); CSV deliverables intact', file=sys.stderr)
@@ -332,7 +435,8 @@ def main():
  for op in ('status','assemble'):
   s=sub.add_parser(op);s.add_argument('out')
  args=p.parse_args()
- if args.cmd=='prepare':r=create(args.source,args.out,args.batch_size,args.force,args.pattern);print(json.dumps({k:v for k,v in r.items() if k!='batches'}|{'batch_count':len(r['batches'])},ensure_ascii=False))
- else:
-  r=validate(args.out,args.cmd=='assemble');print(json.dumps(r,ensure_ascii=False,indent=2));sys.exit(0 if r['success'] else 2)
+ with lock_run_dir(args.out):
+  if args.cmd=='prepare':r=create(args.source,args.out,args.batch_size,args.force,args.pattern);print(json.dumps({k:v for k,v in r.items() if k!='batches'}|{'batch_count':len(r['batches'])},ensure_ascii=False))
+  else:
+   r=validate(args.out,args.cmd=='assemble');print(json.dumps(r,ensure_ascii=False,indent=2));sys.exit(0 if r['success'] else 2)
 if __name__=='__main__':main()

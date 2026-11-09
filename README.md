@@ -12,13 +12,13 @@ PLC 步序采集 Agent：从 PLC 源码（PLCopen / 欧姆龙 IEC61131-10 / SMC2
 | 预测 | `XML地址 匹配格式 [trace地址] [人工表地址]` | `python plc_cli.py predict --source ... --pattern ... --out ... [--trace ...] [--manual ...]` |
 | GT评价 | `预测CSV路径 GT路径 [源码XML]` | `python plc_cli.py evaluate --prediction ... --gt ... --out ... [--xml ...]` |
 | 覆盖评价 | `预测CSV路径 人工表路径` | `python plc_cli.py coverage --prediction ... --manual ... --out ...` |
-| trace步序采集 | `XML地址 trace地址 -t` | `python plc_cli.py trace --source ... --trace ... --out ... [--pattern ...] [--force]` |
+| trace步序采集 | `XML地址 trace地址 -t` | `python plc_cli.py trace --source ... --trace ... --out ... [--pattern ...] [--force \| --resume]` |
 
 详见 `AGENTS.md`（权威规则源）。
 
 当前修订为 2026-11-09 Trace 动作描述。A 档填写起始步源码注释。B 档按 v4 证据包组织动作分句，保留已绑定的执行机构、动作及目标位，分别核验多个对象。新工艺术语按当前工程释义。通用分句验证本步事实、对象绑定和目标实参，命名族仅提供辅助线索。默认输出 `<工序名称>_trace步序采集表.xlsx`，也可用 `--proc-name` 指定。源码修订以 Git 提交和 `CHANGELOG.md` 为准。
 
-升级时使用新输出目录，或以 `--force` 重建一次。根据 v4 输入重写旧 B 档结果。首跑后以相同命令续跑，通过输入与准备产物指纹核验后合并并刷新工作簿。对话简写仍为 `源码路径 Trace路径 -t`。
+每个新任务使用空目录。`--force` 将旧输出目录整体归档，再创建新一轮。Agent 按当前批次填写结果，并回传输入的 `run_id` 和 `batch_id`。Trace 同轮用原参数加 `--resume`，预测同轮用 `finish`。对话简写仍为 `源码路径 Trace路径 -t`。
 
 `prepared_b_tier_pending` 表示有缺失、过期或待修订的 B 档结果。`done_with_review` 表示工作簿已生成，源码迁移和动作语义复核分别记录。描述覆盖率和语义准确率分别核验。
 
