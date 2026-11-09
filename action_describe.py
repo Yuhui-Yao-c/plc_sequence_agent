@@ -463,6 +463,8 @@ def _build_trace_batches(df, outdir, evidence, batch_size, run_id):
                 '逐项核验context.required_actions，为每个锚点提交{action_ref: ID}。锚点包含对象、指令、目标及原始证据引用。'
                 '其他动作提交{subject, action, source_ref, subject_symbol, evidence_refs}。'
                 'source_ref指向本步指令效果、控制条件或注释，subject_symbol填写该证据中的完整PLC对象或条件变量。'
+                '引用step_condition时填写condition_use为wait或check，action填写具体条件，程序会加上等待或判断。'
+                'source_write写入保留对象、值和门控。定位命令、结果写入和反馈判断分别描述，避免把条件说成执行动作。'
                 '如引用本步注释且其中明确包含对象和动作，可省略subject_symbol。'
                 '有目标时填写target，引用实参时用target_parameter写出同一调用中的形参名。'
                 '工艺词和kind按当前工程表达。命名类比只用于识别对象，不能当动作依据。'

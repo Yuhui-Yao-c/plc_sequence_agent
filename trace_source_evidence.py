@@ -96,7 +96,7 @@ def _path(adjacency, source, target, *, proved_only, allow_zero=False):
 
 
 class TraceSourceIndex:
-    def __init__(self, run, variables):
+    def __init__(self, run, variables, *, source=None):
         self.transitions = defaultdict(list)
         self.graphs = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.bindings = defaultdict(set)
@@ -105,6 +105,45 @@ class TraceSourceIndex:
         self.call_evidence = CallEvidence()
         wanted = {name.casefold() for name in variables}
         run = Path(run)
+        self.control = self._source_control(run, source, variables)
+        if self.control is None:
+            self._load_ledger(run, wanted)
+        else:
+            for variable, edge in self.control.edges:
+                self._add_edge(variable, edge)
+            self.commands.update(self.control.commands)
+            from plcopen_trace_control import comment_text
+            for state, notes in self.control.notes.items():
+                for note in notes:
+                    desc = comment_text(note['raw'])
+                    prefix = _STEP_PREFIX.match(desc)
+                    if desc and (not prefix or int(prefix[1]) == state[1]):
+                        record = {**note, 'text': desc, 'source_file': 'PLC XML'}
+                        record['id'] = stable_id('TC', [state, record])
+                        self.notes[state].append(record)
+        from trace_description_context import DescriptionContext
+        self.context = DescriptionContext(run, self, wanted)
+
+    @staticmethod
+    def _source_control(run, source, variables):
+        from source_format import detect_source_format
+        manifest_path = run / 'workflow_manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
+        path = Path(source or manifest.get('source') or '')
+        if path.is_file():
+            if detect_source_format(path) == 'plcopen':
+                if manifest.get('source_sha256'):
+                    from successor_graph import sha256
+                    if sha256(path) != manifest['source_sha256']:
+                        raise ValueError('PLCopen 源码与本轮准备产物不一致，请重建输出目录')
+                from plcopen_trace_control import collect
+                return collect(path, variables)
+        elif (manifest.get('extraction', {}).get('format') == 'plcopen'
+              or (run / 'plcopen_action_trace.csv').is_file()):
+            raise ValueError('PLCopen Trace 描述需要原始源码，请指定 --source 并重建证据')
+        return None
+
+    def _load_ledger(self, run, wanted):
         edges_by_id = {}
         for row in _read_csv(run / 'source_transition_edges.csv'):
             variable = row['variable'].casefold()
@@ -183,8 +222,6 @@ class TraceSourceIndex:
             if start and start[0] in wanted and row.get('状态') != 'reset_hypothesis':
                 self._note(start, row.get('动作描述', ''), row.get('证据POU', ''), '',
                            row.get('证据节点', ''), 'indexed_candidates.csv', 1)
-        from trace_description_context import DescriptionContext
-        self.context = DescriptionContext(run, self, wanted)
 
     def _note(self, state, comment, scope, network, source_id, source_file, rank):
         text = _comment_text(comment, state[1])
@@ -202,10 +239,33 @@ class TraceSourceIndex:
         self.graphs[variable][edge['scope'], edge['binding']][edge['from']].append(edge)
         self.bindings[variable].add(edge['binding'])
 
-    def lookup(self, start_label, end_label, step_comment):
+    def _control_description(self, start, relation, direct, commands):
+        notes = self.notes.get(start, [])
+        if relation == 'ambiguous_scope':
+            return '', [], [], notes, ['ambiguous_scope']
+        proved_ids = {e['source_id'] for e in direct if e['guard_complete']}
+        locations = {(e['scope'], e['network']) for e in direct}
+        exact = [n for n in notes if n['source_id'] in proved_ids]
+        applicable = exact or notes
+        descriptions = {n['text'] for n in applicable}
+        linked = [c for c in commands if (not locations or (c['scope'], c['network']) in locations)
+                  and self.control.compatible_write(start, c, direct)]
+        reasons = set(self.control.affected.get(start[0], ())) if relation == 'unresolved' else set()
+        if start in self.control.partial:
+            reasons.add('unresolved_guard')
+        if len(descriptions) == 1:
+            return applicable[0]['text'], [n['id'] for n in applicable], linked, notes, sorted(reasons)
+        if len(descriptions) > 1:
+            reasons.add('conflicting_comments')
+        if not notes and not linked and not any(graph.get(start[1]) for graph in self.graphs[start[0]].values()):
+            reasons.add('no_local_control')
+        return '', [], linked, notes, sorted(reasons)
+
+    def lookup(self, start_label, end_label, step_comment=''):
         start, end = _state(start_label), _state(end_label)
         direct, path, commands, linked, eligible, refs, notes = [], [], [], [], [], [], []
         relation, description, description_source = 'unresolved', '', ''
+        issues = []
         if start and end and start[0] == end[0]:
             variable, value = start
             direct = self.transitions.get((variable, value, end[1]), [])
@@ -229,7 +289,12 @@ class TraceSourceIndex:
                         break
 
             commands = self.commands.get(start, [])
-            if relation == 'direct':
+            if self.control is not None:
+                step_comment = ''
+                description, refs, linked, notes, issues = self._control_description(start, relation, direct, commands)
+                if description:
+                    description_source = 'A档(源码控制注释)'
+            elif relation == 'direct':
                 locations = {(e['scope'], e['network']) for e in proved}
                 linked = [
                     c for c in commands
@@ -255,19 +320,21 @@ class TraceSourceIndex:
                         refs = [f'step_comments.json:{start_label}']
             # A description identifies the start state; proving a direct edge
             # is a separate question and must not suppress an available note.
-            exact_note = _comment_text(step_comment, value)
-            notes = self.notes.get(start, [])
-            if exact_note:
-                description, description_source = exact_note, 'A档(源码步注释)'
-                refs = [f'step_comments.json:{start_label}']
-            elif not description and notes:
-                scoped = [n for n in notes if not scopes or n['scope'] in scopes] or notes
-                priority = max(n['priority'] for n in scoped)
-                best = [n for n in scoped if n['priority'] == priority]
-                if len({n['text'] for n in best}) == 1:
-                    description, description_source = best[0]['text'], 'A档(起始步源码注释)'
-                    refs = list(dict.fromkeys(n['id'] for n in best))
-            context = (self.context.packet(start, end, relation, direct, path, commands, notes)
+            if self.control is None:
+                exact_note = _comment_text(step_comment, value)
+                notes = self.notes.get(start, [])
+                if exact_note:
+                    description, description_source = exact_note, 'A档(源码步注释)'
+                    refs = [f'step_comments.json:{start_label}']
+                elif not description and notes:
+                    scoped = [n for n in notes if not scopes or n['scope'] in scopes] or notes
+                    priority = max(n['priority'] for n in scoped)
+                    best = [n for n in scoped if n['priority'] == priority]
+                    if len({n['text'] for n in best}) == 1:
+                        description, description_source = best[0]['text'], 'A档(起始步源码注释)'
+                        refs = list(dict.fromkeys(n['id'] for n in best))
+            context = (self.context.packet(start, end, relation, direct, path,
+                                           linked if self.control is not None else commands, notes, issues)
                        if not description else {})
         else:
             context = {}
@@ -277,6 +344,7 @@ class TraceSourceIndex:
             'start_notes': notes,
             'description': description, 'description_source': description_source,
             'description_refs': refs, 'b_evidence': eligible,
+            'source_issues': issues,
             'description_context': context,
             'basis': context.get('basis', ''),
         }

@@ -168,26 +168,46 @@ class WireBody:
 # '/' is excluded from bare symbols so a line comment glued to code
 # (e.g. `AND//comment`) terminates the symbol and the `//...` rule wins.
 # Division was never supported; dropping the '/' token changes nothing there.
-ST_TOKEN=re.compile(r"\s+|//[^\n]*|\(\*.*?\*\)|'(?:''|[^'])*'|:=|\.\.|<>|>=|<=|[();,:=<>]|[^\s();,:=<>\\/]+",re.S)
+ST_TOKEN=re.compile(r"\s+|//[^\n]*|\(\*.*?\*\)|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|:=|\.\.|<>|>=|<=|[();,:=<>]|[^\s();,:=<>\\/]+",re.S)
+
+
+def _st_tokens_with_spans(code):
+    for match in ST_TOKEN.finditer(code):
+        token = match.group()
+        if token.isspace() or token.startswith(('//', '(*')):
+            continue
+        yield ('__STRING_UNSUPPORTED__' if token.startswith(('"', "'")) else token), match.span()
+
+
 def st_tokens(s):
-    ts=[]
-    for m in ST_TOKEN.finditer(s):
-        t=m.group()
-        if t.isspace() or t.startswith('//') or t.startswith('(*'):continue
-        if t.startswith("'"):t='__STRING_UNSUPPORTED__'
-        ts.append(t)
-    return ts
+    return [token for token, _ in _st_tokens_with_spans(s)]
 
 class STParser:
-    def __init__(self,s,condition_parser=None,strict=True):
+    def __init__(self,s,condition_parser=None,strict=True,*,retain_source=False):
         # strict=True (default): any call/opaque/string/expression statement
         # blocks the body — required for InlineST tail slices whose merge
         # premise is a zero-side-effect proof (v9.11, locked by tests).
         # strict=False: those statements degrade to recorded skips so a large
         # section body keeps its provable writes. Skips are always surfaced.
         self.strict=strict
-        self.ts=st_tokens(s);self.i=0;self.writes=[];self.actions=[];self.skipped=[]
+        self.source = s if retain_source else None
+        self.statements = []
+        tokens = list(_st_tokens_with_spans(s)) if retain_source else []
+        self.spans = [span for _, span in tokens]
+        self.ts = [token for token, _ in tokens] if retain_source else st_tokens(s)
+        self.i=0;self.writes=[];self.actions=[];self.skipped=[]
         self.condition_parser=condition_parser or parse
+
+    def branch_note(self, inherited):
+        if self.source is None or self.i == len(self.ts):
+            return inherited
+        begin = self.spans[self.i - 1][1]
+        end = self.spans[self.i][0]
+        for match in ST_TOKEN.finditer(self.source, begin, end):
+            raw = match.group()
+            if raw.startswith(('//', '(*')):
+                return (raw[2:-2] if raw.startswith('(*') else raw[2:], match.start())
+        return inherited
     def is_(self,*words):return self.i<len(self.ts) and self.ts[self.i].upper() in words
     def pop(self,word=None):
         if self.i>=len(self.ts) or (word and not self.is_(word)):raise WireError('ST expected '+str(word))
@@ -214,7 +234,7 @@ class STParser:
                 if n is None:return None
                 vals.append(n)
         return j+1,vals
-    def seq(self,guard=TRUE,stops=(),case_context=False):
+    def seq(self,guard=TRUE,stops=(),case_context=False,note=None):
         while self.i<len(self.ts) and not self.is_(*stops):
             if case_context and self.case_label():return
             if self.is_(';'):self.pop();continue
@@ -223,12 +243,12 @@ class STParser:
                 # case_context must survive nested IF/ELSIF/ELSE bodies: a CASE
                 # branch label after an (unclosed) inner IF is a branch boundary,
                 # never a statement.
-                self.seq(combine('and',guard,cond),('ELSIF','ELSE','END_IF'),case_context)
+                self.seq(combine('and',guard,cond),('ELSIF','ELSE','END_IF'),case_context,self.branch_note(note))
                 while self.is_('ELSIF'):
                     self.pop();cond=self.condition_parser(self.until('THEN'))
-                    self.seq(combine('and',guard,negate(seen),cond),('ELSIF','ELSE','END_IF'),case_context)
+                    self.seq(combine('and',guard,negate(seen),cond),('ELSIF','ELSE','END_IF'),case_context,self.branch_note(note))
                     seen=combine('or',seen,cond)
-                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_IF',),case_context)
+                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_IF',),case_context,self.branch_note(note))
                 self.pop('END_IF')
             elif self.is_('CASE'):
                 self.pop();var=symbol(self.until('OF'))
@@ -238,8 +258,8 @@ class STParser:
                     lab=self.case_label()
                     if not lab:raise WireError('ST invalid CASE label')
                     self.i,vals=lab;cond=combine('or',*(Expr('eq',(var,v)) for v in vals));seen=combine('or',seen,cond)
-                    self.seq(combine('and',guard,cond),('ELSE','END_CASE'),True)
-                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_CASE',),True)
+                    self.seq(combine('and',guard,cond),('ELSE','END_CASE'),True,self.branch_note(note))
+                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_CASE',),True,self.branch_note(note))
                 self.pop('END_CASE')
             elif self.is_('FOR','WHILE','REPEAT','JMP','RETURN','EXIT','CONTINUE','GOTO'):
                 # RETURN blocks: statements after it are unreachable this scan;
@@ -262,6 +282,10 @@ class STParser:
                     self.skipped.append({'token':begin,'reason':reason,'stmt':stmt[:200]})
                     continue
                 lhs=symbol(stmt.split(':=',1)[0]);rhs=stmt.split(':=',1)[1].strip()
+                if self.source is not None:
+                    offset = self.spans[begin][0]
+                    statement = self.source[offset:self.spans[self.i - 1][0]]
+                    self.statements.append((lhs, statement.split(':=', 1)[1].strip(), guard, offset, note))
                 if rhs.upper() in ('TRUE','FALSE'):
                     self.actions.append({'variable':lhs,'value':rhs.upper(),'guard':guard.text(),'token':begin})
                 elif self.strict:

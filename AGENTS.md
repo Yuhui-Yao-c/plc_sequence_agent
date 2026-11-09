@@ -140,6 +140,13 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 
 核验 `workflow_status.json`、状态对、动作描述和工作簿。`prepared_b_tier_pending` 表示有缺失、过期或需修订的 B 档结果。`done_with_review` 表示工作簿已出且有源码或描述待核。源码迁移项见 `trace_pairs_review.csv`，动作描述项见 `action_desc_review.csv`。工作簿按状态对合计待核行。
 
+### PLCopen Trace 描述取证
+
+- 使用本轮 PLC XML。通过 LD/FBD 接线、功能块具名引用实参和 ST 分支定位本步。读取 `EXECUTE` 内嵌 ST 时保留外层使能和内部写入条件。
+- A 档采用绑定到本步控制写入的原注释。多个适用原文冲突时交复核。读取 `trace_source_evidence.json` 查看 XML 位置、实例绑定、命令及待核原因。
+- 测量触发、工程计时、统计和显示文本属于后加证据。PLCopen Trace 描述使用控制证据包和本工程相关变量文档。避免从旧 `step_comments.json`、候选 CSV 或工程监控补写描述。
+- B 档引用 `step_condition` 时用 `condition_use=wait/check` 区分等待和判断。写入分句核对实际对象、写值及条件。所有推断保留引用和复核状态。
+
 ### 隔离与数据规则
 - 新任务仅使用本次指定的输入、本轮输出及当前工程规则。历史会话中的批次、证据索引和语义结论只属于原运行。
 - `predict`、`--tagvars`、`trace` 首跑使用空目录。`--force` 将已识别的旧运行目录整体归档到旁边的 `.previous-...` 目录，再开始新一轮。

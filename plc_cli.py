@@ -74,7 +74,8 @@ def _run_tagvars(src,out,args):
 _TRACE_PREPARED = 'trace_prepared.json'
 _TRACE_STATS = ('variables_total', 'variables_active', 'total_jumps', 'cycles_detected',
                 'unique_pairs', 'pairs_with_action_vars', 'pairs_with_step_comment',
-                'pairs_reset_exit', 'review_count', 'source_relations', 'proc_name', 'trace_input')
+                'pairs_reset_exit', 'review_count', 'source_relations', 'source_evidence_audit',
+                'proc_name', 'trace_input')
 
 
 def _trace_inputs(src, trace, args):
@@ -136,8 +137,8 @@ def _run_trace_mode(src,out,args):
                 candidate_count=manifest.get('candidate_count',0))
 
    stage = 'source_evidence'
-   print('Trace [2/4] 提取变量文档、步注释和工位身份', file=sys.stderr, flush=True)
-   _extract_source_evidence(src,out,include_comments=True)
+   print('Trace [2/4] 提取源码变量文档和工位身份', file=sys.stderr, flush=True)
+   _extract_source_evidence(src,out,include_comments=manifest['extraction']['format'] != 'plcopen')
 
    stage = 'trace'
    print('Trace [3/4] 解析采集数据并汇总状态对', file=sys.stderr, flush=True)

@@ -677,7 +677,8 @@ def generate(trace_path, run, source=None, proc_name=None,
         files from a prior workflow.create() call: plcopen_action_trace.csv,
         step_comments.json, station_identity.json, variable_documentation.json).
     source : str, optional
-        Source XML path (for process-name inference only).
+        Source XML path for PLCopen control evidence and process naming.
+        With a prepared run, defaults to its recorded source for evidence.
     proc_name : str, optional
         Override process name.
     idle_threshold_ms : int
@@ -845,8 +846,8 @@ def generate(trace_path, run, source=None, proc_name=None,
             pair_cycles[key].add(bisect_right(boundaries, ts))
 
     # ---- 6. Index source evidence for the exact observed variable names ----
-    source_index = TraceSourceIndex(run, variables)
-    sc_map = _load_step_comments(str(run))
+    source_index = TraceSourceIndex(run, variables, source=source)
+    sc_map = {} if source_index.control is not None else _load_step_comments(str(run))
     si_map = load_station_identity(str(run))
     var_docs = _load_var_docs(str(run))
 
@@ -865,6 +866,11 @@ def generate(trace_path, run, source=None, proc_name=None,
         relation = evidence['relation']
         linked = evidence['direct'] or evidence['candidate_path']
         scopes = list(dict.fromkeys(e['scope'] for e in linked))
+        refs = [e['source_id'] for e in linked]
+        if source_index.control is not None and not linked and evidence['description_refs']:
+            chosen = [n for n in evidence['start_notes'] if n['id'] in evidence['description_refs']]
+            scopes = list(dict.fromkeys(n['scope'] for n in chosen))
+            refs = evidence['description_refs']
         guards = {e['guard'] for e in linked if e['guard_complete']}
         commands = list(evidence['linked_commands'])
         # A PLCopen EQ-to-coil path is a useful reference, with incomplete gating.
@@ -911,7 +917,7 @@ def generate(trace_path, run, source=None, proc_name=None,
             '结束标签': end_label,
             '状态': 'trace_state_jump',
             '证据POU': '; '.join(scopes),
-            '证据节点': '; '.join(dict.fromkeys(e['source_id'] for e in linked)),
+            '证据节点': '; '.join(dict.fromkeys(refs)),
             '原始条件': next(iter(guards)) if relation == 'direct' and len(guards) == 1 else '',
             '控制器': var_name,
             '分支数': len(guards) if relation == 'direct' else 0,
@@ -942,8 +948,12 @@ def generate(trace_path, run, source=None, proc_name=None,
 
     rev_fields = ['类型', '变量', '开始标签', '结束标签', '说明']
     _write_csv(run / 'trace_pairs_review.csv', review_rows, rev_fields)
+    control = source_index.control
+    source_audit = ({'policy': control.policy, 'edges': len(control.edges),
+                     'fb_state_variables': len(control.bindings_found), 'issues': dict(control.issues)}
+                    if control is not None else {'policy': 'source_ledger'})
     (run / EVIDENCE_FILE).write_text(
-        json.dumps({'schema': 1, 'pairs': pair_evidence}, ensure_ascii=False, indent=2),
+        json.dumps({'schema': 1, 'source_audit': source_audit, 'pairs': pair_evidence}, ensure_ascii=False, indent=2),
         encoding='utf-8')
 
     proc = infer_proc_name(source, str(run), proc_name)
@@ -966,6 +976,7 @@ def generate(trace_path, run, source=None, proc_name=None,
         'pairs_reset_exit': sum(1 for r in rows if '返回步0' in r['备注']),
         'review_count': len(review_rows),
         'source_relations': dict(Counter(r['源码关系'] for r in rows)),
+        'source_evidence_audit': source_audit,
         'outputs': {
             'pairs_csv': str(csv_path),
             'variables': str(run / 'trace_variables.json'),
@@ -1029,7 +1040,7 @@ def main():
     ap = argparse.ArgumentParser(description='trace → step pairs extraction')
     ap.add_argument('--trace', required=True, help='.trace 文件、Sysmac CSV/TSV/TXT，或同次采集的分卷目录')
     ap.add_argument('--run', required=True, help='run目录（含源码证据文件）')
-    ap.add_argument('--source', default=None, help='源码XML（推断工序名用）')
+    ap.add_argument('--source', default=None, help='源码XML（控制证据与工序命名，默认取run清单）')
     ap.add_argument('--proc-name', default=None, help='工序名')
     ap.add_argument('--idle-threshold', type=int, default=5000,
                     help='周期检测空闲阈值(ms)，默认5000')

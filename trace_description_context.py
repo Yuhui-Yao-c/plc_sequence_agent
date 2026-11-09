@@ -20,6 +20,7 @@ LEGACY_CLAUSE_SCHEMA = 'trace-description-context-v3'
 _SYMBOL = re.compile(IDENT)
 _NUMBER = r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
 _EXPRESSION_WORDS = {'and', 'or', 'xor', 'not', 'true', 'false', 'mod'}
+_CONDITION_USES = {'wait': '等待', 'check': '判断'}
 
 
 def _read(path):
@@ -53,6 +54,8 @@ def _family(symbol):
 def _symbols(text):
     out = set()
     text = re.sub(r'\b(?:T|TIME|LTIME)#[\w.]+', '', text or '', flags=re.I)
+    text = re.sub(r'@wired_output\([^)]*\)|@condition\(', '', text)
+    text = re.sub(r'''"(?:""|[^"])*"|'(?:''|[^'])*' ''', '', text, flags=re.X)
     for match in _SYMBOL.finditer(text or ''):
         parts = normalize_symbol(match[0]).split('.')
         out.update('.'.join(parts[:i]) for i in range(1, len(parts) + 1))
@@ -62,7 +65,8 @@ def _symbols(text):
 def _compact_command(command):
     fields = ('id', 'scope', 'network', 'source_line', 'node', 'command', 'arguments',
               'guard', 'guard_complete', 'comment', 'issue', 'role', 'kind', 'operation')
-    return {key: command.get(key, '') for key in fields}
+    return {**{key: command.get(key, '') for key in fields},
+            **{key: command[key] for key in ('write_value', 'st_line', 'instance_path') if key in command}}
 
 
 class DescriptionContext:
@@ -72,11 +76,22 @@ class DescriptionContext:
         docs = _json(self.run / 'variable_documentation.json', {})
         self.docs = {key.casefold(): (key, _clean(value))
                      for key, value in (docs.get('all') or {}).items() if _clean(value)}
+        self.control = index.control is not None
+        used_symbols = set()
+        for commands in index.commands.values():
+            for command in commands:
+                used_symbols.update(_symbols(command.get('arguments', '')))
+        families = set()
+        if self.control:
+            for _, edge in index.control.edges:
+                for name in edge['condition_symbols']:
+                    used_symbols.update(_symbols(name))
+            families = {_family(name) for name in used_symbols} - {''}
         self.families = defaultdict(list)
         entries = []
         for symbol, text in self.docs.values():
             family = _family(symbol)
-            if not family:
+            if not family or (self.control and family not in families):
                 continue
             item = {'symbol': symbol, 'text': text, 'source': 'variable_documentation.json'}
             item['id'] = stable_id('TM', item)
@@ -103,15 +118,12 @@ class DescriptionContext:
                     self.families[family].append(item)
         self.calls = defaultdict(list)
         self.related = defaultdict(list)
-        used_symbols = set()
-        for commands in index.commands.values():
-            for command in commands:
-                used_symbols.update(_symbols(command.get('arguments', '')))
         used_symbols = {s.casefold() for s in used_symbols
                         if ('.' in s or '[' in s or len(s) >= 6) and s.casefold() not in wanted}
         pattern = re.compile(r'(?<![\w.\[\]])(' + '|'.join(
-            re.escape(name) for name in sorted(wanted, key=len, reverse=True)) + r')\s*=\s*([+-]?\d+)', re.I)
-        for event in _read(self.run / 'indexed_events.csv'):
+            re.escape(name) for name in sorted(wanted, key=lambda name: (-len(name), name))) + r')\s*=\s*([+-]?\d+)', re.I)
+        events = () if self.control else _read(self.run / 'indexed_events.csv')
+        for event in events:
             guard = event.get('guard', '')
             starts = {(m[1].casefold(), int(m[2])) for m in pattern.finditer(guard)}
             item = {key: event.get(key, '') for key in
@@ -133,8 +145,11 @@ class DescriptionContext:
                     annotated.append({'state': [state[0], state[1]], **_compact_command(command)})
         # Hash source evidence, not run paths, timestamps or previous LLM results.
         digest = hashlib.sha256()
-        for name in ('variable_documentation.json', 'native_command_evidence.csv',
-                     'source_stage_candidates.csv', 'indexed_candidates.csv', 'indexed_events.csv', 'step_comments.json'):
+        names = ('variable_documentation.json',)
+        if not self.control:
+            names += ('native_command_evidence.csv', 'source_stage_candidates.csv',
+                      'indexed_candidates.csv', 'indexed_events.csv', 'step_comments.json')
+        for name in names:
             path = self.run / name
             digest.update(name.encode())
             if path.is_file():
@@ -145,7 +160,7 @@ class DescriptionContext:
                   'naming_examples': entries, 'annotated_commands': annotated}
         (self.run / MEMORY_FILE).write_text(json.dumps(memory, ensure_ascii=False, indent=1), encoding='utf-8')
 
-    def packet(self, start, end, relation, direct, path, commands, notes):
+    def packet(self, start, end, relation, direct, path, commands, notes, issues=()):
         variable, number = start
         evidence, seen = [], set()
 
@@ -173,6 +188,9 @@ class DescriptionContext:
                 continue
             prefix = re.match(r'^\s*(?:步\s*)?(\d+)\s*[-—:：>]', c['comment'])
             usable_comment = not prefix or int(prefix[1]) == number
+            if self.control and (not usable_comment or 'conflicting_comments' in issues):
+                c['comment'] = ''
+                usable_comment = False
             ref = add('current_command', c, local=True, comment_matches_step=usable_comment)
             command_refs[command['id']] = ref
             effect_refs = {}
@@ -210,10 +228,11 @@ class DescriptionContext:
                         and (';' + timer['node'] + ';') in (';' + coil['path'] + ';')):
                     add('timer_alarm', {'timer_ref': command_refs[timer['id']], 'alarm_ref': command_refs[coil['id']],
                                         'target': coil['arguments'], 'operation': '超时监控'}, local=True)
+        local = not (self.control and relation == 'ambiguous_scope')
         for note in notes[:12]:
-            add('start_comment', note, local=True)
+            add('start_comment', note, local=local and not (self.control and 'conflicting_comments' in issues))
         for edge in direct[:12]:
-            add('direct_control', edge, local=True)
+            add('direct_control', edge, local=local and not self.control)
         for edge in path[:16]:
             add('candidate_path', edge, local=edge['from'] == number,
                 caveat='静态候选路径，不证明本次采样间实际逐条执行')
@@ -221,6 +240,15 @@ class DescriptionContext:
         for (scope, binding), graph in self.index.graphs.get(variable, {}).items():
             neighbors.extend(graph.get(number, []))
             neighbors.extend(edge for edges in graph.values() for edge in edges if edge['to'] == number)
+        if self.control and local:
+            # A real outgoing source guard belongs to this step even when the
+            # next sample spans multiple source transitions. Later path edges
+            # cannot authorize a clause about the observed starting step.
+            conditions = direct or [edge for edge in neighbors if edge['from'] == number]
+            for edge in conditions[:12]:
+                if edge['condition_symbols']:
+                    add('step_condition', edge, local=True,
+                        caveat='本步写步条件。用于描述等待、判断或联锁，保留条件极性和门控待核项。')
         for edge in neighbors[:16]:
             add('control_context', edge, local=edge['from'] == number)
             neighbor = edge['to'] if edge['from'] == number else edge['from']
@@ -247,6 +275,8 @@ class DescriptionContext:
         symbols = set()
         for item in evidence:
             data = item['data']
+            for name in data.get('condition_symbols', ()):
+                symbols.update(_symbols(name))
             for key in ('arguments', 'guard', 'feedback', 'next_state', 'target'):
                 symbols.update(_symbols(data.get(key, '')))
         local_symbols = set()
@@ -284,6 +314,9 @@ class DescriptionContext:
                   'limitations': ['描述起始步；结束步注释和静态路径只作上下文',
                                  '调用实参、门控和映射可共同支持推断；机构同类命名只支持类别推断',
                                  '不得仅按步号大小、0值、工位名或相邻展示行猜动作']}
+        if self.control:
+            packet['source_policy'] = self.index.control.policy
+            packet['source_issues'] = list(issues)
         if self.run_id:
             packet['run_id'] = self.run_id
         packet['basis'] = stable_id('TB4', [start, end, packet])
@@ -334,8 +367,13 @@ def _ground_clause(clause, subject, action, target, catalog, reserved, observed)
         parent = catalog[data['call_ref']] if category == 'bound_write' else None
     elif category == 'direct_control' and data.get('guard_complete'):
         symbols.update(normalize_symbol(m[0]) for m in _SYMBOL.finditer(data['guard']))
+    elif category == 'step_condition':
+        use = clause.get('condition_use')
+        if not isinstance(use, str) or use not in _CONDITION_USES:
+            return '本步条件只支持等待或判断，须填写condition_use为wait或check', []
+        symbols.update(data['condition_symbols'])
     elif category == 'current_command' and (comment or data.get('role') in {
-            'actuator_command', 'signal_write', 'connected_signal'}):
+            'actuator_command', 'signal_write', 'connected_signal', 'source_write'}):
         arguments = data['arguments']
         for actual in named_arguments(arguments).values() or [arguments]:
             symbols.update(normalize_symbol(m[0]) for m in _SYMBOL.finditer(actual))
@@ -410,6 +448,8 @@ def _validate_action_clauses(result, context):
                 refs.extend(grounding)
             if issue:
                 return None, issue
+            if not legacy and catalog[clause['source_ref']]['category'] == 'step_condition':
+                subject = _CONDITION_USES[clause['condition_use']] + subject
             phrases.append(subject + action + target)
         refs.extend(item['id'] for item in selected)
     if missing := required - used:
