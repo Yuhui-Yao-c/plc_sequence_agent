@@ -46,6 +46,7 @@ Usage (CLI):
   python station_identity.py --run outputs/<run> --candidates prediction_candidate_pairs.csv
 """
 import argparse, json, os, re, csv
+from collections import Counter, defaultdict
 
 
 # IEC61131-3 standard type prefixes that can be safely stripped for DISPLAY only.
@@ -151,6 +152,42 @@ def _pou_area_to_station(area: str):
         name = re.sub(r'_L\d+.*$', '', name)
         return code, name
     return None, None
+
+
+def source_station_displays(groups, identity):
+    """Use the documented name when one qualified source scope confirms it.
+
+    Each input is (display, controller, source_scopes). Keep the existing
+    label if sources disagree, are missing, or a rename would merge groups.
+    """
+    if not identity:
+        return {}
+    displays, blocked = set(), set()
+    docs, owners = defaultdict(set), defaultdict(set)
+    for display, controller, scopes in groups:
+        displays.add(display)
+        root = controller.split('.', 1)[0]
+        entry = identity.get(controller) or identity.get(root, {})
+        doc, code = entry.get('doc'), entry.get('code')
+        if not doc or not code or display != f'{code}_{doc}':
+            blocked.add(display)
+            continue
+        docs[display].add(doc)
+        for scope in scopes.split(';'):
+            if not scope.strip():
+                continue
+            parts = tuple(part.strip() for part in scope.split('::'))
+            matches = [index for index, part in enumerate(parts) if _clean_doc(part) == doc]
+            if len(matches) != 1:
+                blocked.add(display)
+                continue
+            owners[display].add(parts[:matches[0] + 1])
+
+    names = {display: next(iter(labels)) for display, labels in docs.items()
+             if display not in blocked and len(labels) == len(owners[display]) == 1}
+    counts = Counter(names.values())
+    return {display: name for display, name in names.items()
+            if name not in displays and counts[name] == 1}
 
 
 def build_identity(run_dir: str, candidates_csv: str = None) -> dict:

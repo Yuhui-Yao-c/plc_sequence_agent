@@ -7,6 +7,7 @@ from unittest.mock import patch
 import test_trace_to_pairs as fixtures
 from action_describe import cmd_a, cmd_build, cmd_validate
 from gen_workstation_xlsx import generate as workbook
+from station_identity import source_station_displays
 from trace_description_context import validate_context_result
 from trace_to_pairs import generate
 from utils import infer_proc_name
@@ -104,6 +105,44 @@ class TraceDescriptionTests(unittest.TestCase):
         self.addCleanup(book.close)
         self.assertEqual(book.active['C4'].value, comment)
         self.assertEqual(book.active['D4'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
+
+    def test_source_station_name_is_used_for_csv_and_existing_workbook_export(self):
+        from openpyxl import load_workbook
+
+        name = 'Dock4_进料单元'
+        controller = 'LoaderView.Status[1]'
+        alias = f'LoaderView_{name}'
+        self.write_part(self.FIRST + '_00001.csv', self.EPOCH, [(0, 0), (1, 20)], channels=(controller,))
+        source = self.root / 'source.xml'
+        source.write_text(
+            f'<project><types><pous><pou name="{name}" pouType="program"><body><ST>'
+            f'IF {controller}=0 THEN //载具进料\n {controller}:=20; END_IF;'
+            '</ST></body></pou></pous></types></project>', encoding='utf-8')
+        (self.run / 'station_identity.json').write_text(json.dumps({'LoaderView': {
+            'code': 'LoaderView', 'doc': name, 'display': alias, 'sort_key': [4, 0],
+        }}), encoding='utf-8')
+
+        path = generate(self.trace, self.run, source=source)['outputs']['pairs_csv']
+        row, = self.read_csv(path)
+        self.assertEqual(row['构成要素'], name)
+        self.assertEqual(row['控制器'], controller)
+
+        legacy = self.run / 'legacy-pairs.csv'
+        self.write_csv(legacy, [{**row, '构成要素': alias}])
+        result = workbook(str(legacy), run=str(self.run), sheet='trace步序采集表')
+        book = load_workbook(result['out'], read_only=True, data_only=True)
+        self.addCleanup(book.close)
+        self.assertEqual(book.active['B4'].value, name)
+        self.assertEqual(book.active['F4'].value, f'{controller}=0')
+
+    def test_same_documented_name_does_not_merge_station_groups(self):
+        doc = 'Dock_进料单元'
+        identities = {code: {'code': code, 'doc': doc, 'display': f'{code}_{doc}'}
+                      for code in ('FeederA', 'FeederB')}
+        groups = [(identities['FeederA']['display'], 'FeederA.Status', f'LineA::{doc}::Run'),
+                  (identities['FeederB']['display'], 'FeederB.Status', f'LineB::{doc}::Run')]
+        self.assertEqual(source_station_displays(groups, identities), {})
+        self.assertEqual(source_station_displays([(*groups[0][:2], 'LineA::Other::Run')], identities), {})
 
     def test_end_comment_is_context_and_never_start_description(self):
         self.record()

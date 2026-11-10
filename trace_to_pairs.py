@@ -52,6 +52,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from station_identity import source_station_displays
+
 
 # ---- Sysmac trace tables and recording directories ----
 
@@ -940,6 +942,10 @@ def generate(trace_path, run, source=None, proc_name=None,
     rows.sort(key=lambda r: (em_sort_key_prefixed(r['构成要素']),
                               em_sort_key_prefixed(r['控制器']),
                               r['开始标签']))
+    display_names = source_station_displays(
+        ((row['构成要素'], row['控制器'], row['证据POU']) for row in rows), si_map)
+    for row in rows:
+        row['构成要素'] = display_names.get(row['构成要素'], row['构成要素'])
 
     # ---- 8. Write outputs ----
     csv_path = run / 'trace_collection_pairs.csv'

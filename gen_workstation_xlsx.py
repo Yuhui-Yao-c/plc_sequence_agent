@@ -29,6 +29,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+from station_identity import source_station_displays
 from utils import load_station_identity, infer_proc_name
 
 
@@ -421,6 +422,10 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         df['_工位'] = df.apply(
             lambda r: indexed_stations.get(r['_变量']) or workstation(r['构成要素'], r['_变量根'], var_docs, si_map),
             axis=1)
+        if is_trace and '证据POU' in df:
+            display_names = source_station_displays(
+                zip(df['_工位'], df['_变量'], df['证据POU'].fillna('')), si_map)
+            df['_工位'] = df['_工位'].replace(display_names)
     elif group_by == '证据POU':
         df['_工位'] = df['证据POU'].map(pou_station)
     else:
