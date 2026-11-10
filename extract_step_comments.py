@@ -24,7 +24,7 @@ Two generic extraction rules based on XML format (not project-specific):
 
 Output: step_comments.json
   {"ST10.AutoStep[1]=50": "Cu焊接1_焊接开始", ...}
-  Key format matches prediction start labels (状态变量=步值).
+  Key format matches Trace start labels (状态变量=步值).
 
 Usage:
   python extract_step_comments.py --source "source.xml" --out "outputs/run/step_comments.json"
@@ -230,7 +230,7 @@ def _extract_omron_case(source: str) -> dict:
 def extract(source: str, out: str) -> dict:
     """Extract step-level comments from PLC source XML.
     Writes step_comments.json and returns the dict.
-    Safe to import from plc_cli.predict."""
+    Safe to import from the Trace workflow."""
     fmt = _detect_format(source)
     if fmt == 'plcopen':
         result = _extract_plcopen(source)

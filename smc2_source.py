@@ -6,7 +6,6 @@ line; they are never silently treated as a complete source. No GT input.
 """
 from __future__ import annotations
 import json,re
-from pathlib import Path
 from lxml import etree
 
 

@@ -1,7 +1,6 @@
 """Trace description evidence and checks independent of process vocabulary."""
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import re
@@ -21,12 +20,6 @@ _SYMBOL = re.compile(IDENT)
 _NUMBER = r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
 _EXPRESSION_WORDS = {'and', 'or', 'xor', 'not', 'true', 'false', 'mod'}
 _CONDITION_USES = {'wait': '等待', 'check': '判断'}
-
-
-def _read(path):
-    if path.is_file():
-        with path.open(encoding='utf-8-sig', newline='') as stream:
-            yield from csv.DictReader(stream)
 
 
 def _json(path, default):
@@ -142,8 +135,7 @@ class DescriptionContext:
                         if ('.' in s or '[' in s or len(s) >= 6) and s.casefold() not in wanted}
         pattern = re.compile(r'(?<![\w.\[\]])(' + '|'.join(
             re.escape(name) for name in sorted(wanted, key=lambda name: (-len(name), name))) + r')\s*=\s*([+-]?\d+)', re.I)
-        events = () if self.control else _read(self.run / 'indexed_events.csv')
-        for event in events:
+        for event in index.events:
             guard = event.get('guard', '')
             starts = {(m[1].casefold(), int(m[2])) for m in pattern.finditer(guard)}
             item = {key: event.get(key, '') for key in
@@ -166,7 +158,11 @@ class DescriptionContext:
         # Hash source evidence, not run paths, timestamps or previous LLM results.
         digest = hashlib.sha256()
         names = ('variable_documentation.json',)
-        if not self.control:
+        if index.source_fingerprint:
+            digest.update(index.source_fingerprint.encode())
+            if not self.control:
+                names += ('step_comments.json',)
+        elif not self.control:
             names += ('native_command_evidence.csv', 'source_stage_candidates.csv',
                       'indexed_candidates.csv', 'indexed_events.csv', 'step_comments.json')
         for name in names:

@@ -1,23 +1,10 @@
-"""Source-only state transition graph for first-exit boundary normalization.
-
-Supported: explicit PLCopen LD/FBD EQ/NE, contacts, AND/OR/NOT, MOVE EN,
-output-variable connections, and a strict ST IF/ELSIF/ELSE/CASE subset.
-Unknown paths/writers are blockers, not guessed transitions. No GT import.
-A complete local path is NOT a proof of scan visibility, liveness or physical completion.
-"""
+"""PLCopen LD wiring and Structured Text readers shared by Trace adapters."""
 from __future__ import annotations
-import argparse, csv, hashlib, json, re
-from pathlib import Path
+import re
 from lxml import etree
-from boundary_logic import (Expr,TRUE,FALSE,parse,combine,negate,integer,symbol,
-                            comparisons,compatible,BoundarySyntaxError,IDENT)
+from boundary_logic import (Expr,TRUE,FALSE,parse,combine,negate,integer,symbol,IDENT)
 
 def tag(e): return etree.QName(e).localname if isinstance(e.tag,str) else ''
-def sha256(p):
-    h=hashlib.sha256()
-    with Path(p).open('rb') as f:
-        for chunk in iter(lambda:f.read(1048576),b''):h.update(chunk)
-    return h.hexdigest()
 def text(e): return ''.join(e.itertext()).strip() if e is not None else ''
 def own_expr(e):
     if e is None:return ''
@@ -45,17 +32,6 @@ def owner(e):
         if tag(p)=='pou':pou=p
         p=p.getparent()
     return '::'.join(reversed(names)) or '<anonymous>',pou
-
-def binding(variable,scope,pou):
-    root=re.split(r'[.\[]',variable)[0].casefold()
-    local_names=set()
-    if pou is not None:
-        for section in pou:
-            if tag(section)!='interface':continue
-            for group in section:
-                if tag(group) in ('localVars','inputVars','outputVars','inOutVars','tempVars'):
-                    local_names.update(v.get('name','').casefold() for v in group if tag(v)=='variable')
-    return scope.split('::')[0] if root in local_names or '.' not in variable else ''
 
 class WireError(ValueError): pass
 class WireBody:
@@ -307,116 +283,3 @@ class STParser:
                         # no single-integer state write is representable; skip
                         # with an audit record instead of losing the body.
                         self.skipped.append({'token':begin,'reason':'st_expression_assignment_unmodeled_effects','stmt':stmt[:200]})
-
-
-def collect(source):
-    source=Path(source);transitions=[];blockers=[];observations=[];warnings=[];bodies=0
-    from source_format import detect_source_format
-    fmt=detect_source_format(source)
-    if fmt=='omron_iec61131_10':
-        from omron_native import collect_native
-        return collect_native(source)
-    def block(scope,var,reason,states=None,bscope=''):
-        for s in states or [None]:blockers.append({'scope':scope,'binding_scope':bscope,'variable':var,'from':s,'reason':reason})
-    def emit(scope,pou,body_id,var,dest,guard,evidence,path):
-        bscope=binding(var,scope,pou)
-        if dest is None:
-            block(scope,var,'dynamic_state_assignment',None,bscope);return
-        atoms=[a for a in comparisons(guard) if a.kind=='eq' and a.args[0].casefold()==var.casefold()]
-        states=sorted({a.args[1] for a in atoms if compatible(guard,var,a.args[1])})
-        all_values={a.args[1] for a in comparisons(guard) if a.args[0].casefold()==var.casefold()}
-        other=(max(all_values)+1) if all_values else 0
-        if states and compatible(guard,var,other):
-            block(scope,var,'guard_has_unconstrained_source_branch',None,bscope)
-        # Without a positive source state, a reset/default/unconditional writer may apply anywhere.
-        if not states:
-            if guard!=FALSE:block(scope,var,'writer_without_positive_source_state',None,bscope)
-            return
-        for src in states:
-            transitions.append({'id':f'T{len(transitions)+1:07d}','scope':scope,'binding_scope':bscope,
-                'body':body_id,'variable':var,'from':src,'to':dest,'guard':guard.text(),
-                'guard_complete':True,'evidence':evidence,'path':path,
-                'timing_proof':'local_control_only; scan visibility and writer ordering not proved'})
-    if fmt=='smc2':
-        from smc2_controlflow import collect_smc2
-        model=collect_smc2(source)
-        return {'schema':'plc.state_transitions.v1','adapter':'smc2','source_sha256':sha256(source),
-                'source_name':source.name,'source_size':source.stat().st_size,**model,
-                'limits':['SMC2 CLs/VLs exported-grid local control model; not vendor runtime certification.',
-                          'Unknown function outputs, edge contacts, dynamic writes and malformed networks block normalization.',
-                          'External library side effects, task/scan ordering and physical completion are unresolved.',
-                          'Comment state numbers are diagnostic only and NEVER executable state evidence.']}
-    else:
-        for _,body in etree.iterparse(str(source),events=('end',),tag=('{*}LD','{*}FBD','{*}ST'),huge_tree=True,resolve_entities=False,no_network=True):
-            bodies+=1;scope,pou=owner(body);body_id=f'{scope}/{tag(body)}/{bodies}'
-            if tag(body)=='ST':
-                code=text(body);parser=STParser(code)
-                try:
-                    parser.seq()
-                    for var,dest,guard,pos,rhs in parser.writes:emit(scope,pou,body_id,var,dest,guard,'st_structured_guard',[f'token:{pos}'])
-                    observations.extend({**a,'scope':scope,'source':'ST_bool_assignment'} for a in parser.actions)
-                    for s in parser.skipped:
-                        warnings.append(f"{body_id}: skipped ST statement token {s['token']} {s['reason']}: {s['stmt'][:80]}")
-                except (WireError,BoundarySyntaxError) as e:
-                    vars_=set(re.findall(rf'({IDENT})\s*:=',code))
-                    for v in vars_:block(scope,symbol(v),'unsupported_ST_body:'+str(e),None,binding(symbol(v),scope,pou))
-                    warnings.append(body_id+': '+str(e))
-            else:
-                wire=WireBody(body)
-                for n in body:
-                    if tag(n)!='block' or n.get('typeName','').upper()!='MOVE':continue
-                    try:targets=wire.targets(n)
-                    except WireError as e:
-                        warnings.append(body_id+': '+str(e));continue
-                    for var in targets:
-                        dest=None;guard=None;wire.seen=set();wire.memo.clear()
-                        try:
-                            inp=pin(n,'inputVariables','IN')
-                            if inp is None:
-                                data=[v for v in pins(n,'inputVariables') if v.get('formalParameter','').upper()!='EN']
-                                if len(data)==1:inp=data[0]
-                            dest=integer(wire.value(inp))
-                            if dest is None:raise WireError('non_literal_MOVE_target')
-                            en=pin(n,'inputVariables','EN')
-                            if en is None:raise WireError('MOVE_EN_missing')
-                            guard=wire.cp(en)
-                            emit(scope,pou,body_id,var,dest,guard,'plcopen_wired_guard',sorted(wire.seen))
-                        except (WireError,BoundarySyntaxError) as e:
-                            block(scope,var,str(e),None,binding(var,scope,pou))
-                # Other explicit state writes via outVariable/coil are blockers unless fed by MOVE.
-                for n in body:
-                    if tag(n) not in ('outVariable','inOutVariable'):continue
-                    v=own_expr(n)
-                    if not re.fullmatch(IDENT,v or ''):continue
-                    refs=connections(n)
-                    if refs and all(r in wire.nodes and wire.nodes[r].get('typeName','').upper()=='MOVE' for r,p in refs):continue
-                    if refs:block(scope,symbol(v),'non_MOVE_writer',None,binding(symbol(v),scope,pou))
-            body.clear()
-            while body.getprevious() is not None:del body.getparent()[0]
-    return {'schema':'plc.state_transitions.v1','adapter':fmt,'source_sha256':sha256(source),
-            'source_name':source.name,'source_size':source.stat().st_size,'transitions':transitions,
-            'blockers':blockers,'observations':observations,'warnings':warnings,
-            'summary':{'bodies':bodies,'transitions':len(transitions),'blockers':len(blockers)},
-            'limits':['Supported local source transitions only; not a whole-program temporal proof.',
-                      'External libraries/indirect writes/tasks/scan acquisition are not resolved.',
-                      'No numeric-adjacency or co-location edge is treated as proved.']}
-
-def write_graph(source,out,model=None):
-    out=Path(out);out.mkdir(parents=True,exist_ok=True);graph=model if model is not None else collect(source)
-    (out/'source_transition_graph.json').write_text(json.dumps(graph,ensure_ascii=False,indent=2),encoding='utf-8')
-    rows=[{**r,'path':';'.join(r['path'])} for r in graph['transitions']]
-    fields=['id','scope','binding_scope','body','variable','from','to','guard','guard_complete','evidence','path','timing_proof']
-    with (out/'source_transition_edges.csv').open('w',encoding='utf-8-sig',newline='') as f:
-        w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
-    if graph.get('adapter') in ('smc2','omron_iec61131_10'):
-        from boundary_normalizer import write_csv
-        write_csv(out/'source_state_inventory.csv',graph.get('state_observations',[]))
-        write_csv(out/'source_comment_state_audit.csv',graph.get('comment_state_diagnostics',[]))
-        write_csv(out/'source_stage_candidates.csv',graph.get('stage_records',[]))
-        audit_name='native_parse_audit.json' if graph.get('adapter')=='omron_iec61131_10' else 'smc2_parse_audit.json'
-        audit=graph.get('native_parse_audit',{}) if graph.get('adapter')=='omron_iec61131_10' else graph.get('smc2_audit',{})
-        (out/audit_name).write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf-8')
-    return graph
-if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('source');p.add_argument('-o','--out',required=True)
-    a=p.parse_args();print(json.dumps(write_graph(a.source,a.out)['summary'],ensure_ascii=False))

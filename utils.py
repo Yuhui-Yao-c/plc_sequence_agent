@@ -1,39 +1,18 @@
-# -*- coding: utf-8 -*-
-"""Shared utilities for PLC agent modules.
-
-Extracted in v9.28 to eliminate duplication across gen_stepvars_xlsx.py,
-gen_workstation_xlsx.py, and trace_to_pairs.py.
-
-Contents:
-  - load_station_identity(run)  — load station_identity.json (3 callers)
-  - infer_proc_name(source, run, proc_name)  — infer process name (2 callers)
-  - em_sort_key_prefixed(name)  — sort key with prefix preserved (2 callers)
-
-Note: gen_workstation_xlsx._em_sort_key (B version, EM/ST-only numeric) and
-gen_workstation_xlsx.load_var_docs (clean_doc version) are intentionally NOT
-merged here — they have different semantics from their namesakes.
-"""
+"""Shared station, naming and sort helpers for Trace."""
 import json
-import os
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 
-def load_station_identity(run: str) -> dict:
-    """Load station_identity.json (var_root -> {display, code, sort_key, ...}).
-
-    Returns {} when file is absent or run is None.  Shared by
-    gen_stepvars_xlsx, gen_workstation_xlsx, and trace_to_pairs.
-    """
+def load_station_identity(run):
+    """Load the source-backed station names when available."""
     if not run:
         return {}
-    p = os.path.join(run, 'station_identity.json')
-    if os.path.exists(p):
-        try:
-            return json.load(open(p, encoding='utf-8'))
-        except Exception:
-            return {}
-    return {}
+    path = Path(run) / 'station_identity.json'
+    try:
+        return json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def infer_proc_name(source: str, run: str = None, proc_name: str = None) -> str:
@@ -80,7 +59,7 @@ def em_sort_key_prefixed(name: str):
     Preserves the alphabetic prefix in the sort key (unlike the EM/ST-only
     version in gen_workstation_xlsx).  Returns (prefix_str, [main_num, sub_num])
     so names with different prefixes sort by prefix first, then by number.
-    Used by gen_stepvars_xlsx and trace_to_pairs.
+    Used for Trace state pairs.
     """
     m = re.match(r'^([A-Za-z]*)(\d+)(?:_(\d+))?', str(name))
     if not m:

@@ -6,9 +6,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from action_describe import cmd_validate
 from plc_cli import main
-from workflow import create, lock_run_dir, validate
+from workflow import create, lock_run_dir
 
 
 class WorkflowRunTests(unittest.TestCase):
@@ -85,36 +84,30 @@ class WorkflowRunTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, '无法续跑'):
                 self.cli('trace', '--resume')
 
-    def test_predict_rebuild_cannot_read_prior_trace_or_prior_batches(self):
-        self.out.mkdir()
-        (self.out / 'trace_collection_pairs.csv').write_text('stale', encoding='utf-8')
-        self.cli('predict', '--force')
-        first = self.read('workflow_manifest.json')
-        self.assertEqual(first['mode'], 'predict')
-        self.assertFalse((self.out / 'trace_collection_pairs.csv').exists())
-        self.assertTrue((Path(first['previous_output']) / 'trace_collection_pairs.csv').exists())
-        self.cli('predict', '--force')
-        current = self.read('workflow_manifest.json')
-        batch = current['batches'][0]
-        (self.out / batch['output']).write_text(
-            json.dumps({'batch_id': batch['batch_id'], 'run_id': first['run_id'], 'steps': []}),
-            encoding='utf-8')
-        self.assertTrue(any('run_id' in issue for issue in validate(self.out)['invalid_issues']))
-        batch_path = next((self.out / 'batches_desc').glob('*.input.json'))
-        desc_batch = json.loads(batch_path.read_text(encoding='utf-8'))
-        desc_path = self.result_path(batch_path)
-        desc = {'run_id': first['run_id'], 'batch_id': desc_batch['batch_id'],
-                'descs': {desc_batch['rows'][0]['id']: {'ok': True, 'desc': '等待', 'refs': []}}}
-        desc_path.write_text(json.dumps(desc), encoding='utf-8')
-        stats = {}
-        with redirect_stdout(io.StringIO()):
-            cmd_validate(self.out, stats=stats)
-            self.assertEqual(stats['invalid_b_tier_batches'], [desc_path.name])
-            desc['run_id'] = current['run_id']
-            desc_path.write_text(json.dumps(desc), encoding='utf-8')
-            cmd_validate(self.out, stats=stats)
-        self.assertEqual(stats['b_tier_result_count'], 1)
-        self.assertIn('B档(LLM工艺语义)', (self.out / 'action_desc_final.csv').read_text(encoding='utf-8-sig'))
+    def test_trace_has_one_entrypoint_and_only_trace_outputs(self):
+        self.cli('trace')
+        self.assertEqual(self.read('workflow_manifest.json')['extraction']['format'], 'plcopen')
+        self.assertFalse((self.out / 'batches').exists())
+        self.assertFalse((self.out / 'sequence_candidates.csv').exists())
+        self.assertFalse((self.out / 'source_transition_graph.json').exists())
+        for mode in ('predict', 'finish', 'coverage', 'evaluate'):
+            with self.subTest(mode=mode), self.assertRaises(SystemExit) as error:
+                self.cli(mode)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_trace_reads_smc2_source_without_candidate_preparation(self):
+        self.source = self.root / 'PLC.smc2'
+        network = {'CMT': '10：等待进料', 'CLs': [{'__type': 'IST', 'Ix': 1, 'X': 0, 'Y': 0,
+                    'TXT': 'IF Cell.Phase[4]=10 AND Ready THEN Cell.Phase[4]:=20; END_IF;'}]}
+        self.source.write_text(f'<smc2><entry type="json" name="Feed"><![CDATA[{json.dumps(network, ensure_ascii=False)}]]>'
+                               '</entry></smc2>', encoding='utf-8')
+        self.cli('trace')
+        status = self.read('workflow_status.json')
+        self.assertEqual((status['source_format'], status['unique_pairs'], status['a_sourced']), ('smc2', 1, 1))
+        evidence = self.read('trace_source_evidence.json')['pairs']['Cell.Phase[4]=10|||Cell.Phase[4]=20']
+        self.assertEqual((evidence['relation'], evidence['description']), ('direct', '等待进料'))
+        self.assertIn('Ready', evidence['direct'][0]['guard'])
+        self.assertFalse((self.out / 'batches').exists())
 
     def test_rebuild_protects_inputs_and_refuses_a_concurrent_writer(self):
         self.out.mkdir()
@@ -122,7 +115,7 @@ class WorkflowRunTests(unittest.TestCase):
         nested_source = self.out / 'PLC.xml'
         nested_source.write_bytes(self.source.read_bytes())
         with self.assertRaisesRegex(ValueError, '输入分开'):
-            create(nested_source, self.out, force=True)
+            create(nested_source, self.out, trace=self.trace, force=True)
         self.assertTrue(nested_source.is_file())
         self.assertEqual(list(self.root.glob('out.previous-*')), [])
         with lock_run_dir(self.out), self.assertRaisesRegex(SystemExit, '正在由其他工作流命令使用'):

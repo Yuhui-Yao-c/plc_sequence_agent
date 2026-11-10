@@ -31,7 +31,7 @@ def extract(source, out):
 
     Reads <variable>/<Variable> elements and their <documentation> children.
     Returns (merged_count, station_count) and writes JSON to *out*.
-    Safe to import and call from plc_cli.predict (failures caught by caller)."""
+    Safe to import and call from the Trace workflow (failures caught by caller)."""
     docs = {}       # first seen (local) fallback
     gdocs = {}      # global-scope override
     stations = {}

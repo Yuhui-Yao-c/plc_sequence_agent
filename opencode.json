@@ -6,13 +6,8 @@
     "websearch": "deny",
     "external_directory": "ask",
     "skill": {
-      "plc-boundary-normalization": "allow",
-      "plc-signal-tail-merge": "allow",
-      "plc-cross-fb-transport": "allow",
-      "plc-feedback-successor": "allow",
-      "plc-station-identity": "allow",
-      "plc-coverage-evaluation": "allow",
-      "plc-trace-jump-analysis": "allow"
+      "plc-trace-jump-analysis": "allow",
+      "plc-action-description": "allow"
     }
   }
 }
