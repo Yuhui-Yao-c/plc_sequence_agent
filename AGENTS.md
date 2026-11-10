@@ -50,14 +50,13 @@
 
 ## 五个使用入口
 
-用户在 OpenCode 对话中输入简写，agent 按下列规则识别入口并组装对应 `plc_cli.py` 命令。可选项缺省时正常执行，不报错。
+用户在 OpenCode 对话中输入简写，Agent 按下列规则识别入口并执行对应命令。
 
 ### 路由优先级
 
-- `源码路径 变量模式 --trace-setup` 进入入口五。`--trace-setup` 是对话标记，执行时使用 `plc_cli.py trace-setup` 子命令。
-- 入口四的对话简写固定为 `源码路径 Trace路径 -t`，优先于其他简写。第 2 项须为可识别的 Trace 文件或采集目录。`-t` 只用于选路，生成 `trace` 命令时移除该标记。
-- 对话简写中的 `-t` 仅用于入口四。步序变量清单使用完整命令 `python plc_cli.py predict ... --tagvars`；完整 CLI 以子命令为准，显式 `predict -t` 保留为兼容别名。
-- 其他简写按输入顺序和类型匹配入口。带 `-t` 却提供变量模式，或路径和输入用途无法区分时，先确认用途。路径含空格时整段加引号。
+- 三段简写 `XML地址 第二项 -t` 按第二项分流。`re:` 或 `regex:` 开头的正则直接进入入口五。否则按字面核验路径，已有 Trace 文件或采集目录进入入口四。第二项像路径（有盘符、目录分隔符或 Trace 文件扩展名）但找不到时报告路径错误。完整变量名或通配模式进入入口五。
+- 两条简写中的 `-t` 是对话标记。完整 CLI 按子命令执行，`predict --tagvars` 和 `predict -t` 仍表示原步序变量清单。
+- 其他简写按输入顺序和类型匹配入口。含空格的路径或模式整段加引号。有歧义时核实输入用途。
 
 ### 入口一：预测（predict → 处理批次 → finish）
 
@@ -155,13 +154,13 @@ Trace 工作簿在动作描述后显示「描述来源」。A 档原文标「注
 
 ### 入口五 Trace 采集配置（`trace-setup`）
 
-从 PLCopen、Sysmac IEC61131-10 或 SMC2 源码中按完整名称提取显式引用，并生成采集通道配置。先加载 `plc-trace-setup`。使用用户指定的变量名、通配模式或 `re:` 正则。固定下标按源码引用保留，动态下标列入审计。
+简写 `XML地址 匹配模式 -t`。加载 `plc-trace-setup` 后，用独立脚本按完整变量名、通配模式或 `re:` 正则匹配源码文本中的显式引用。固定下标和无下标变量进入清单，动态下标在命令输出中计数。
 
 ```powershell
-python plc_cli.py trace-setup --source "source/PLC.xml" --pattern "Cell.Phase[*]" --out "outputs/工序_trace_setup"
+python extract_step_variables.py --source "source/PLC.xml" --pattern "Cell.Phase[*]" --out "outputs/工序_trace_setup"
 ```
 
-输出 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `<源码名>_trace_config.csv`。自动判定依据源码格式及厂商头。可按实际客户端指定 `--format inovance` 或 `--format sysmac`，并用 `--task-name` 指定采集任务。Sysmac 无法确认类型时保留清单和审计，状态为 `needs_review`。采集配置用独立目录，`--force` 归档同类旧配置。客户端实际采集并导出后，实测记录交给入口四。
+交付 `static_variables.txt` 和 `<源码名>.trace` 或 `<源码名>.csv`。按脚本输出报告数量和提示，配置生成后结束本轮。`python plc_cli.py trace-setup` 也可调用同一个脚本。
 
 ### 隔离与数据规则
 - 新任务仅使用本次指定的输入、本轮输出及当前工程规则。历史会话中的批次、证据索引和语义结论只属于原运行。
