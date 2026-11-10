@@ -44,16 +44,17 @@
 - `evaluate`：plc_cli → atomic_evaluation / pair_evaluation（只读，独立路径）
 - `coverage`：plc_cli → 评价器/gen_coverage_eval（sys.path 注入同目录引擎）
 
-**Skill 加载**：8 个 skill 在 `.opencode/skills/`，由本文件按场景声明加载（非 import，是 Agent 行为规则）。
+项目技能位于 `.opencode/skills/`，按入口加载。
 
 ---
 
-## 四个使用入口
+## 五个使用入口
 
 用户在 OpenCode 对话中输入简写，agent 按下列规则识别入口并组装对应 `plc_cli.py` 命令。可选项缺省时正常执行，不报错。
 
 ### 路由优先级
 
+- `源码路径 变量模式 --trace-setup` 进入入口五。`--trace-setup` 是对话标记，执行时使用 `plc_cli.py trace-setup` 子命令。
 - 入口四的对话简写固定为 `源码路径 Trace路径 -t`，优先于其他简写。第 2 项须为可识别的 Trace 文件或采集目录。`-t` 只用于选路，生成 `trace` 命令时移除该标记。
 - 对话简写中的 `-t` 仅用于入口四。步序变量清单使用完整命令 `python plc_cli.py predict ... --tagvars`；完整 CLI 以子命令为准，显式 `predict -t` 保留为兼容别名。
 - 其他简写按输入顺序和类型匹配入口。带 `-t` 却提供变量模式，或路径和输入用途无法区分时，先确认用途。路径含空格时整段加引号。
@@ -142,7 +143,7 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 
 Trace 工作簿在动作描述后显示「描述来源」。A 档原文标「注释」，已通过引用校验的 B 档标红色「LLM」，空描述的来源留空。对于归属可查的简短步标题或例程名能补足对象的完成阶段注释，在「备注」增加例程及可确认的本步条件。「证据」逐分句列出 B 档引用的指令、实参、条件和源码位置。候选路径、名称类比和推断待核状态各自标明。
 
-同一工位有多个步序变量时，Trace 工作簿按完整变量名分块，子组之间留两行，工位末尾汇总各行时长。
+同一工位有多个步序变量时，Trace 工作簿按完整变量名分块，子组之间留两行，工位末尾汇总各行时长。步序数据行统一为 28 pt。下划线链接打开「文本详情」中的完整原文，可从详情返回主表。
 
 ### PLCopen Trace 描述取证
 
@@ -151,6 +152,16 @@ Trace 工作簿在动作描述后显示「描述来源」。A 档原文标「注
 - A 档采用绑定到本步控制写入的原注释。跨多步的注释只选能归属本步的原文片段。多个适用原文冲突时交复核。读取 `trace_source_evidence.json` 查看 XML 位置、实例绑定、写步表达式及待核原因。全局数组按完整通道和实际写入 POU 分组。
 - 测量触发、工程计时、统计和显示文本属于后加证据。PLCopen Trace 描述使用控制证据包和本工程相关变量文档。避免从旧 `step_comments.json`、候选 CSV 或工程监控补写描述。
 - B 档从证据项的 `subjects` 选择对应对象，结合同一条分支核对门控。引用 `step_condition` 时用 `condition_use=wait/check` 区分等待和判断。对象带 `numeric_predicate` 时省略 `action`、`target`，数值判据由源码生成。写入分句核对实际对象、写值及条件。所有推断保留引用和复核状态。
+
+### 入口五 Trace 采集配置（`trace-setup`）
+
+从 PLCopen、Sysmac IEC61131-10 或 SMC2 源码中按完整名称提取显式引用，并生成采集通道配置。先加载 `plc-trace-setup`。使用用户指定的变量名、通配模式或 `re:` 正则。固定下标按源码引用保留，动态下标列入审计。
+
+```powershell
+python plc_cli.py trace-setup --source "source/PLC.xml" --pattern "Cell.Phase[*]" --out "outputs/工序_trace_setup"
+```
+
+输出 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `<源码名>_trace_config.csv`。自动判定依据源码格式及厂商头。可按实际客户端指定 `--format inovance` 或 `--format sysmac`，并用 `--task-name` 指定采集任务。Sysmac 无法确认类型时保留清单和审计，状态为 `needs_review`。采集配置用独立目录，`--force` 归档同类旧配置。客户端实际采集并导出后，实测记录交给入口四。
 
 ### 隔离与数据规则
 - 新任务仅使用本次指定的输入、本轮输出及当前工程规则。历史会话中的批次、证据索引和语义结论只属于原运行。
@@ -162,6 +173,7 @@ Trace 工作簿在动作描述后显示「描述来源」。A 档原文标「注
 ## 按入口加载 Skill
 预测及预测结果评价加载 `plc-boundary-normalization`。遵循其中 OR 集合、AND、NOT、分支计时和评价规则。
 Trace 按入口四加载跳变分析及动作描述规则。Skill 工具不可用时，读取对应的 `.opencode/skills/<名称>/SKILL.md`。
+采集配置按入口五加载 `plc-trace-setup`。
 尤其不能删掉OR的一支、丢掉AND条件或按步号大小猜后继。主表两端各为单状态等式或单BOOL变量，不能为美化而改变计时语义。
 预测finish后若有人工采集表，必须加载 `plc-coverage-evaluation` 并运行覆盖对比评价器（见评价执行节）。predict/trace 生成 `batches_desc/*.input.json` 后必须加载 `plc-action-description`（v9.29，B档动作描述强制环节协议）。
 

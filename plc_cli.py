@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""PLC Agent v9.28 — four isolated user workflows.
+"""PLC Agent v9.28 — isolated user workflows.
 
   predict   : source XML → candidate pairs → batches → finish → delivery table
   evaluate  : prediction CSV + GT → match metrics (read-only, never modifies prediction)
   coverage  : prediction CSV + manual table → coverage evaluation
   trace     : trace file → state-jump pairs → A/B-tier descriptions → delivery table
+  trace-setup : source XML → explicit channel names → capture configuration
 
 Prediction and trace never open ground truth.  All four share the same
 column-compatible state-pair CSV format so downstream action_describe /
@@ -355,6 +356,10 @@ def main():
  execution.add_argument('--force',action='store_true',help='归档旧输出目录并从空目录开始')
  execution.add_argument('--resume',action='store_true',help='校验并合并同一轮的B档批次')
  x.set_defaults(func=lambda a:_run_trace_mode(Path(a.source).resolve(),Path(a.out).resolve(),a))
+ from extract_step_variables import add_arguments as setup_arguments, run as trace_setup
+ x=sub.add_parser('trace-setup',help='从源码提取变量并生成 Trace 采集配置')
+ setup_arguments(x)
+ x.set_defaults(func=trace_setup)
  a=p.parse_args()
  if a.mode in ('predict','trace','finish'):
   with lock_run_dir(a.run if a.mode=='finish' else a.out):

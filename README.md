@@ -13,6 +13,7 @@ PLC 步序采集 Agent：从 PLC 源码（PLCopen / 欧姆龙 IEC61131-10 / SMC2
 | GT评价 | `预测CSV路径 GT路径 [源码XML]` | `python plc_cli.py evaluate --prediction ... --gt ... --out ... [--xml ...]` |
 | 覆盖评价 | `预测CSV路径 人工表路径` | `python plc_cli.py coverage --prediction ... --manual ... --out ...` |
 | trace步序采集 | `XML地址 trace地址 -t` | `python plc_cli.py trace --source ... --trace ... --out ... [--pattern ...] [--force \| --resume]` |
+| Trace 采集配置 | `XML地址 变量模式 --trace-setup` | `python plc_cli.py trace-setup --source ... --pattern ... --out ...` |
 
 详见 `AGENTS.md`（权威规则源）。
 
@@ -21,6 +22,18 @@ PLCopen Trace 从本轮 XML 的控制网络、FB 实例和 ST 分支取证。A �
 每个新任务使用空目录。`--force` 将旧输出目录整体归档，再创建新一轮。Agent 按当前批次填写结果，并回传输入的 `run_id` 和 `batch_id`。Trace 同轮用原参数加 `--resume`，预测同轮用 `finish`。对话简写仍为 `源码路径 Trace路径 -t`。
 
 `prepared_b_tier_pending` 表示有缺失、过期或待修订的 B 档结果。`done_with_review` 表示工作簿已生成，源码迁移和动作语义复核分别记录。描述覆盖率和语义准确率分别核验。
+
+## 从源码准备 Trace 采集
+
+```powershell
+python plc_cli.py trace-setup --source "source/工序/PLC.xml" --pattern "Cell.Phase[*]" --out "outputs/工序_trace_setup"
+```
+
+`static_variables.txt` 保存匹配到的完整变量名。通配符为 `*` 和 `?`，方括号按字面匹配。`--regex` 或 `re:` 可使用完整名称正则。XML 控制体中的固定下标和标量可纳入清单。动态下标、无法确认的类型和 SMC2 解析问题见 `workflow_status.json`。
+
+默认识别汇川/CODESYS 导出及 Sysmac 格式。也可明确使用 `--format inovance` 或 `--format sysmac`。Sysmac 按变量声明解析整数类型及程序局部变量的限定名。已核实的缺失类型可通过 `--default-type` 提供。配置文件只有通道和采集参数。客户端导入后核对任务名、采样设置与通道容量，完成采集后将实测文件交给 `trace`。
+
+Trace 工作簿数据行固定为 28 pt。长描述和证据保留全文，点击下划线可在「文本详情」查看。
 
 ## 安装
 
@@ -67,7 +80,7 @@ coverage : 预测CSV + 人工表 → 覆盖率评价（只读）
 
 ## Skills
 
-7 个 PLC skill 在 `.opencode/skills/`，由 AGENTS.md 按场景加载：
+PLC 项目技能位于 `.opencode/skills/`，由 AGENTS.md 按入口加载。
 
 - `plc-boundary-normalization` — 起止标签、OR/AND/NOT、最近后继
 - `plc-signal-tail-merge` — 动作后信号/数据收尾合并
@@ -76,6 +89,8 @@ coverage : 预测CSV + 人工表 → 覆盖率评价（只读）
 - `plc-station-identity` — 工位身份映射
 - `plc-coverage-evaluation` — 人工表覆盖对比评价
 - `plc-trace-jump-analysis` — 运行时 trace 跳变分析
+- `plc-action-description` — 动作描述及分句证据
+- `plc-trace-setup` — 从源码准备 Trace 采集配置
 
 ## 变更记录
 

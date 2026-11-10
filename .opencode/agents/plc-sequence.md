@@ -7,12 +7,13 @@ mode: primary
 
 遵循根目录 `AGENTS.md` 的路由、Trace 输入和执行规则。本文件提供主 Agent 的执行要点、工艺批次协议和交付物清单。
 
-## 四个使用入口
+## 五个使用入口
 
 用户在 OpenCode 对话中输入简写，agent 按下列规则识别入口并组装对应 `plc_cli.py` 命令。可选项缺省时正常执行，不报错。
 
 ### 路由优先级
 
+- `源码路径 变量模式 --trace-setup` 进入入口五。将对话标记转换为 `trace-setup` 子命令。
 - 入口四的对话简写固定为 `源码路径 Trace路径 -t`，优先于其他简写。第 2 项须为可识别的 Trace 文件或采集目录。`-t` 只用于选路，生成 `trace` 命令时移除该标记。
 - 对话简写中的 `-t` 仅用于入口四。步序变量清单使用完整命令 `python plc_cli.py predict ... --tagvars`；完整 CLI 以子命令为准，显式 `predict -t` 保留为兼容别名。
 - 其他简写按输入顺序和类型匹配入口。带 `-t` 却提供变量模式，或路径和输入用途无法区分时，先确认用途。路径含空格时整段加引号。
@@ -73,6 +74,10 @@ mode: primary
 
 PLCopen Trace 以 XML 控制网络、FB 实参及 ST 分支为描述依据。按证据包中的实例路径和完整步变量核对原文，排除计时、统计和显示等后加内容。对只有条件或反馈的本步，从对应分支的 `step_condition.subjects` 选择符号并填写 `condition_use`。所选对象带 `numeric_predicate` 时由程序渲染判据，结果省略 `action` 和 `target`。条件、指令和观测迁移分别说明。
 
+### 入口五 Trace 采集配置（`trace-setup`）
+
+调用 `skill({ name: "plc-trace-setup" })`。按 `AGENTS.md` 使用源码、变量选择器和独立输出目录运行 `plc_cli.py trace-setup`。根据 `workflow_status.json` 报告配置路径、通道数和待核项。用户拿到客户端导出的实测采集后，再进入入口四。
+
 ### 通用规则
 - 新任务按本次输入和当前规则运行。只从本轮目录读取证据和批次。需要重建同一路径时用 `--force` 归档旧输出。
 - 工艺批次和 B 档结果原样回传本批输入的 `run_id` 和 `batch_id`。Trace 同时回传各行 `basis`。
@@ -95,6 +100,7 @@ PLCopen Trace 以 XML 控制网络、FB 实参及 ST 分支为描述依据。按
 6. `plc-coverage-evaluation` — 人工表覆盖对比评价（v9.19）
 7. `plc-trace-jump-analysis` 提供两种 Trace 的格式、跳变与审计说明。预测匹配和平均时长回填用于 `predict --trace`，入口四的命令和续跑按根目录 `AGENTS.md` 执行。
 8. `plc-action-description` — 动作描述A档(源码步注释)+B档(LLM工艺语义)统一协议；B档是强制环节，agent必须逐批写result.json（v9.29）
+9. `plc-trace-setup` — 从源码提取显式变量并准备 Trace 采集配置。
 
 若 skill 工具不可用，直接读取对应 `.opencode/skills/<name>/SKILL.md`。
 

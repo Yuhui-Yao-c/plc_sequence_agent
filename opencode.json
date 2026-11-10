@@ -12,7 +12,8 @@
       "plc-feedback-successor": "allow",
       "plc-station-identity": "allow",
       "plc-coverage-evaluation": "allow",
-      "plc-trace-jump-analysis": "allow"
+      "plc-trace-jump-analysis": "allow",
+      "plc-trace-setup": "allow"
     }
   }
 }
