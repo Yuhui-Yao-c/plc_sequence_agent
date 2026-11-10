@@ -84,6 +84,27 @@ class TraceDescriptionTests(unittest.TestCase):
         result = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
         self.assertEqual(result['workstation_groups'], 2)
 
+    def test_workbook_preserves_formula_like_source_comment_as_text(self):
+        from openpyxl import load_workbook
+
+        comment = '====判断步===='
+        self.record(0, 100)
+        source = self.root / 'source.xml'
+        source.write_text(
+            '<project><types><pous><pou name="Load" pouType="program"><body><ST>'
+            f'IF Step[1]=0 THEN //{comment}\n Step[1]:=100; END_IF;'
+            '</ST></body></pou></pous></types></project>', encoding='utf-8')
+        pairs = generate(self.trace, self.run, source=source)['outputs']['pairs_csv']
+        cmd_a(self.run)
+        cmd_validate(self.run)
+        self.assertEqual(self.read_csv(self.run / 'action_desc_final.csv')[0]['动作描述'], comment)
+
+        result = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
+        book = load_workbook(result['out'], read_only=True, data_only=True)
+        self.addCleanup(book.close)
+        self.assertEqual(book.active['C4'].value, comment)
+        self.assertEqual(book.active['D4'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
+
     def test_end_comment_is_context_and_never_start_description(self):
         self.record()
         self.source_edges(self.run, [(10, 30)])

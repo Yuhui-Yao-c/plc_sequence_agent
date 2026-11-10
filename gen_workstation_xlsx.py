@@ -248,6 +248,14 @@ def cell_str(x) -> str:
     return str(x)
 
 
+def _text_cell(ws, row, column, value):
+    cell = ws.cell(row=row, column=column, value=value)
+    if isinstance(value, str):
+        # Keep source annotations such as ====判断步==== as literal text.
+        cell.data_type = 's'
+    return cell
+
+
 def pou_station(pou) -> str:
     first = cell_str(pou).split(";")[0].strip()
     area = first.split("::")[0].strip()
@@ -542,8 +550,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         b_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('B档'))
         note = (f'{proc_name} | {len(df)}个观测状态对 | 源码注释{a_rows}行 | B档归纳待核{b_rows}行 | '
                 '时长为起始状态观测停留中位数，行时长合计仅供表内汇总。源码关系、估算和复核见备注。')
-    ws.cell(row=1, column=2, value=f'{proc_name} 步序采集表（{title}）').font = hfont
-    nc = ws.cell(row=2, column=2, value=note)
+    _text_cell(ws, 1, 2, f'{proc_name} 步序采集表（{title}）').font = hfont
+    nc = _text_cell(ws, 2, 2, note)
     nc.font = nfont
     nc.alignment = left
     for rr in (1, 2):
@@ -551,7 +559,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     # 精简列结构（v9.20）：构成要素|动作描述|时长|动作变量|开始标签|结束标签|备注
     heads = ('构成要素', '动作描述', '时长(ms)', '动作变量（引用）', '开始标签', '结束标签', '备注')
     for j, h in enumerate(heads, 2):
-        c = ws.cell(row=3, column=j, value=h)
+        c = _text_cell(ws, 3, j, h)
         c.font = hfont; c.alignment = center; c.border = border
         c.fill = PatternFill('solid', start_color='F2A08C' if j in (2, 6, 7, 8) else 'FFE9A8')
 
@@ -595,10 +603,10 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         block_dur_sum = 0
         has_trace_dur = False
         for _, row in g.iterrows():
-            ws.cell(row=r, column=2, value=wsname)
+            _text_cell(ws, r, 2, wsname)
             # 动作描述（干净文本，不含标注）
             dtxt = str(row['_dtxt'])
-            ws.cell(row=r, column=3, value=dtxt if dtxt and dtxt.lower() not in ('nan','none') else None)
+            _text_cell(ws, r, 3, dtxt if dtxt and dtxt.lower() not in ('nan','none') else None)
             # v9.23: 时长(ms) — 从trace分析结果回填，无trace时留空
             rt_key = (str(row['开始标签']), str(row['结束标签']))
             rt_dur = trace_rt.get(rt_key) if trace_rt else None
@@ -608,9 +616,9 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
                 has_trace_dur = True
             # 动作变量（引用）
             vtxt = str(row['_vtxt']) if str(row['_vtxt']) not in ('nan', 'None') else ''
-            ws.cell(row=r, column=5, value=vtxt if vtxt else None)
-            ws.cell(row=r, column=6, value=row['开始标签'])
-            ws.cell(row=r, column=7, value=row['结束标签'])
+            _text_cell(ws, r, 5, vtxt if vtxt else None)
+            _text_cell(ws, r, 6, row['开始标签'])
+            _text_cell(ws, r, 7, row['结束标签'])
             # 备注：网络注释（取最具体的1条）+ 待复核标记
             remark_parts = []
             trace_needs_review = False
@@ -650,7 +658,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             if legacy_b_pending:
                 remark_parts.append('【B档未处理】')
             if remark_parts:
-                ws.cell(row=r, column=8, value=' | '.join(remark_parts))
+                _text_cell(ws, r, 8, ' | '.join(remark_parts))
             # 统一样式
             for j in range(2, 9):
                 c = ws.cell(row=r, column=j)
@@ -669,7 +677,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             ws.row_dimensions[r].height = height
             r += 1
         # 块尾"总时长"行
-        ws.cell(row=r, column=3, value='行时长合计' if is_trace else '总时长')
+        _text_cell(ws, r, 3, '行时长合计' if is_trace else '总时长')
         # v9.23: 有trace数据时填入该工位组时长合计
         if has_trace_dur:
             ws.cell(row=r, column=4, value=block_dur_sum)
