@@ -84,6 +84,51 @@ class TraceDescriptionTests(unittest.TestCase):
         self.assertEqual({r['构成要素'] for r in self.read_csv(pairs)}, {'Load', 'Unload'})
         result = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
         self.assertEqual(result['workstation_groups'], 2)
+        from openpyxl import load_workbook
+
+        book = load_workbook(result['out'])
+        self.addCleanup(book.close)
+        sheet = book.active
+        self.assertEqual((sheet['B4'].value, sheet['B6'].value), ('Load', 'Unload'))
+        self.assertEqual(sheet.max_row, 7)
+        self.assertIn('B4:B5', sheet.merged_cells)
+        self.assertIn('B6:B7', sheet.merged_cells)
+
+    def test_trace_workstation_splits_full_channels_and_keeps_one_total(self):
+        from openpyxl import load_workbook
+
+        names = ('Line.Flow[10]', 'Line.Flow[2]', 'Line.Seq[2]', 'Solo')
+        self.write_part(self.FIRST + '_00001.csv', self.EPOCH,
+                        [(0, 20, 10, 50, 0), (1, 30, 20, 60, 10), (2, 30, 30, 60, 10)], channels=names)
+        source = self.root / 'source.xml'
+        source.write_text(
+            '<project><types><pous>'
+            '<pou name="CellA" pouType="program"><body><ST>'
+            'IF Line.Flow[2]=10 THEN Line.Flow[2]:=20; END_IF; '
+            'IF Line.Flow[2]=20 THEN Line.Flow[2]:=30; END_IF; '
+            'IF Line.Flow[10]=20 THEN Line.Flow[10]:=30; END_IF; '
+            'IF Line.Seq[2]=50 THEN Line.Seq[2]:=60; END_IF;'
+            '</ST></body></pou>'
+            '<pou name="CellB" pouType="program"><body><ST>'
+            'IF Solo=0 THEN Solo:=10; END_IF;'
+            '</ST></body></pou>'
+            '</pous></types></project>', encoding='utf-8')
+        pairs = generate(self.trace, self.run, source=source)['outputs']['pairs_csv']
+        result = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
+        book = load_workbook(result['out'])
+        self.addCleanup(book.close)
+        sheet = book.active
+        self.assertEqual(result['rows'], 5)
+        self.assertEqual(result['workstation_groups'], 2)
+        self.assertEqual([sheet[f'B{r}'].value for r in (4, 8, 11)],
+                         ['Line\nLine.Flow[2]', 'Line\nLine.Flow[10]', 'Line\nLine.Seq[2]'])
+        self.assertEqual([sheet[f'G{r}'].value for r in (4, 5, 8, 11, 13)],
+                         ['Line.Flow[2]=10', 'Line.Flow[2]=20', 'Line.Flow[10]=20', 'Line.Seq[2]=50', 'Solo=0'])
+        self.assertIn('B4:B5', sheet.merged_cells)
+        for row in (6, 7, 9, 10):
+            self.assertTrue(all(cell.value is None for cell in sheet[row]))
+        self.assertEqual((sheet['B12'].value, sheet['C12'].value, sheet['E12'].value), ('Line', '行时长合计', 48))
+        self.assertEqual((sheet['B13'].value, sheet['C14'].value, sheet['E14'].value), ('Solo', '行时长合计', 12))
 
     def test_workbook_preserves_formula_like_source_comment_as_text(self):
         from openpyxl import load_workbook

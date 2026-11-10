@@ -283,6 +283,12 @@ def var_of(label: str):
     return m.group(1) if m else None
 
 
+def _trace_channel_sort_key(name):
+    parts = re.split(r'([+-]?\d+)', name.casefold())
+    natural = tuple(int(part) if i % 2 else part for i, part in enumerate(parts))
+    return natural, name
+
+
 def load_action_map(run: str):
     """(state_variable, state_value) -> ordered unique action-variable list.
     PLCopen action trace and omron wired command evidence, source facts only."""
@@ -451,9 +457,12 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     df['_工位序'] = df.apply(_row_sort, axis=1)
     df = df.sort_values(['_工位序', '_变量', '_序'], kind='mergesort').reset_index(drop=True)
     if is_trace:
+        df['_步序变量'] = df['_变量'].fillna(df.get('控制器', '')).fillna('').str.strip()
         hits = sum(bool(cell_str(value).strip()) for value in df.get('动作变量', []))
     else:
         hits = sum(1 for _, row in df.iterrows() if step_text(row, amap).startswith('动作变量'))
+    workstations = df.groupby('_工位', sort=False)
+    has_subgroups = is_trace and workstations['_步序变量'].nunique().gt(1).any()
 
     # v9.18: blind-spot flags for human review highlighting.
     #   A=动作描述不完整(有动作变量但描述是模板文本)  -> 浅黄
@@ -558,7 +567,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         b_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('B档'))
         note = (f'{proc_name} | {len(df)}个观测状态对 | 源码注释{a_rows}行 | B档归纳待核{b_rows}行 | '
                 '时长为起始状态观测停留中位数，行时长合计仅供表内汇总。红色 LLM 表示描述待核。源码关系、估算和复核见备注。')
-    layout = [('构成要素', 18), ('动作描述', 42), ('时长(ms)', 8), ('动作变量（引用）', 28),
+    layout = [('构成要素', 30 if has_subgroups else 18), ('动作描述', 42), ('时长(ms)', 8), ('动作变量（引用）', 28),
               ('开始标签', 26), ('结束标签', 26), ('备注', 22)]
     if is_trace:
         layout.insert(2, ('描述来源', 10))
@@ -605,21 +614,35 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     # v9.23: trace_rt already loaded above (before note construction).
 
     r = 4
-    blocks = []  # (首行, 末行, 工位, 时长合计)
+    blocks = []  # (首行, 末行, 是否为步序变量子组)
     # 统一字体和行高
     data_font = Font(name='Arial', size=9)
     total_font = Font(name='Arial', size=9, bold=True)
     review_font = Font(name='Arial', size=9, color='FF0000', bold=True)
     data_align = Alignment(horizontal='left', vertical='center', wrap_text=False)
     center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    subgroup_align = Alignment(horizontal='center', vertical='top', wrap_text=True)
     total_fill = PatternFill('solid', start_color='F0F0F0')
     trace_review_rows = 0
-    for wsname, g in df.groupby('_工位', sort=False):
+    for wsname, g in workstations:
         b0 = r
         block_dur_sum = 0
         has_trace_dur = False
+        split_channels = has_subgroups and g['_步序变量'].nunique() > 1
+        if split_channels:
+            g = g.sort_values('_步序变量', kind='stable', key=lambda names: names.map(_trace_channel_sort_key))
+        active_channel = None
         for _, row in g.iterrows():
-            _text_cell(ws, r, 2, wsname)
+            if split_channels:
+                channel = row['_步序变量']
+                if channel != active_channel:
+                    if active_channel is not None:
+                        blocks.append((b0, r - 1, True))
+                        r += 2
+                    b0, active_channel = r, channel
+                    _text_cell(ws, r, 2, f'{wsname}\n{channel or "步序变量未识别"}')
+            else:
+                _text_cell(ws, r, 2, wsname)
             # 动作描述（干净文本，不含标注）
             dtxt = str(row['_dtxt'])
             _text_cell(ws, r, 3, dtxt if dtxt and dtxt.lower() not in ('nan','none') else None)
@@ -705,9 +728,17 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
                         cell.alignment = left
                         width = ws.column_dimensions[cell.column_letter].width - 4
                         height = max(height, 18 * _wrapped_lines(cell.value, width))
+            if split_channels and r == b0:
+                width = ws.column_dimensions['B'].width - 4
+                height = max(height, 18 * _wrapped_lines(ws.cell(r, 2).value, width))
             ws.row_dimensions[r].height = min(409, height)
             r += 1
-        # 块尾"总时长"行
+        # 变量子组独立合并。工位合计位于最后一个子组之后。
+        if split_channels:
+            blocks.append((b0, r - 1, True))
+            _text_cell(ws, r, 2, wsname)
+        else:
+            blocks.append((b0, r, False))
         _text_cell(ws, r, 3, '行时长合计' if is_trace else '总时长')
         # v9.23: 有trace数据时填入该工位组时长合计
         if has_trace_dur:
@@ -718,13 +749,13 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             c.border = border
             c.fill = total_fill
             c.alignment = data_align if j != 2 else center_align
-        ws.row_dimensions[r].height = 18
+        total_lines = _wrapped_lines(wsname, ws.column_dimensions['B'].width - 4) if split_channels else 1
+        ws.row_dimensions[r].height = min(409, 18 * total_lines)
         r += 1
-        blocks.append((b0, r - 1, wsname, block_dur_sum if has_trace_dur else None))
-    for b0, b1, _, _ in blocks:
+    for b0, b1, subgroup in blocks:
         if b1 > b0:
             ws.merge_cells(start_row=b0, start_column=2, end_row=b1, end_column=2)
-        ws.cell(row=b0, column=2).alignment = center_align
+        ws.cell(row=b0, column=2).alignment = subgroup_align if subgroup else center_align
     # 标题行行高
     ws.row_dimensions[1].height = 22
     ws.row_dimensions[2].height = 16
@@ -732,7 +763,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     ws.freeze_panes = 'A4'
     wb.save(out)
     return {'proc_name': proc_name, 'rows': len(df), 'action_variable_rows': hits,
-            'workstation_groups': len(blocks), 'group_by': group_by,
+            'workstation_groups': workstations.ngroups, 'group_by': group_by,
             'b_desc_rows': _bcount if desc_stats else None, 'desc_sources': desc_stats,
             'b_tier_pending': b_tier_pending,
             'source_sha16': sha16, 'amap_keys': len(amap), 'out': out,
