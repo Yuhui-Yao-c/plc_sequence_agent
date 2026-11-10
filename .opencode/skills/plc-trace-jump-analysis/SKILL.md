@@ -1,130 +1,50 @@
-# Skill: plc-trace-jump-analysis
+---
+name: plc-trace-jump-analysis
+description: 识别 TwinCAT Scope 和 Sysmac 采集数据，核对观测跳变、预测时长回填及多次采集的时间依据。
+compatibility: opencode
+---
 
-# PLC 运行时 Trace 跳变分析与预测步序时长回填
+# Trace 跳变与时长
 
-## 何时加载
-用户提供了 PLC 运行时 trace 文件（TwinCAT Scope View 导出的 .trace），
-需要把 trace 里的步序值跳变对应到已提取的预测步序对、用实测时长填入
-交付表时加载本 skill。
+## 触发
 
-不生成预测、不修改预测、不替代覆盖评价；trace 是运行时证据，不是
-GT 答案，也不构成对源码迁移逻辑正确性的证明。
+入口四读取实测记录时加载。入口一带 `--trace` 时也加载，用于冻结预测的时长回填。
 
-## 业务目标
-1. 解析 trace 文件，提取每个被监测变量的步值跳变与稳定段时长。
-2. 将预测步序对（开始标签 → 结束标签）与 trace 中的实际跳变匹配，
-   给出该步序在运行时是否发生、发生次数、首次/末次/平均时长。
-3. 把匹配到的实测时长回填到交付表的"时长(ms)"列，并在每个工位
-   组块尾的"总时长"行求和。
-4. 未匹配的预测对与 trace 独有跳变如实记入 review，不静默丢弃。
+## 输入
 
-## Trace 文件格式
+| 入口 | 输入 | Python 模块 |
+| --- | --- | --- |
+| 四 | 源码和 TwinCAT Scope `.trace`、Sysmac 导出表或采集目录 | `trace_to_pairs.py` |
+| 一 | `final_prediction_pairs.csv` 和单个 TwinCAT Scope `.trace` | `trace_jump_analyzer.py` |
 
-支持两种格式（`trace_to_pairs.is_omron_trace_input()` 自动识别）：
+TwinCAT Scope 文件是 UTF-16 XML，`TraceVariable` 下含 `Values`、`Timestamps`，相对时间单位为毫秒。`StartTime` 提供绝对基准。
 
-### TwinCAT Scope（`.trace` 文件，UTF-16 XML）
-- .NET XmlSerializer 序列化，UTF-16 LE with BOM。
-- 每个变量是一个 `<TraceVariable VarName="..." VariableIndex="..." Type="System.Double">` 块。
-- 每块包含 `<Values>v0,v1,v2,...,vN</Values>` 与 `<Timestamps>t0,t1,...,tN</Timestamps>`。
-- 时间戳单位毫秒（ms），事件驱动采样（非固定周期）。
-- `<StartTime>` 是 .NET ticks 绝对基准，时间戳是相对偏移；分析只关心相对差。
+Sysmac 输入是 `.csv/.tsv/.txt`，也可用含这类表的目录。采样行含 `Index`、`RawTime` 及带整型后缀的变量列，例如 `Cell.Phase[0]:INT`。采集配置文件无采样行，应先导出现场实测记录。
 
-### Sysmac Studio（`.csv` 表或采集目录）
-- CSV 表格：每个变量是一列 `m_nNextAutoStep[N]:INT`，每行是一个采样点。
-- 表头含元数据（TraceType/SamplePeriod/SampleRate/StartRawTime）+ 列定义（Index,Date,ClockTime,RawTime,TraceSampID,变量列...）。
-- 保留 `YYYYMMDDhhmmss_00001.csv` 等原始文件名。前缀标识采集，后缀为卷号。每次采集内校验通道、配置、StartRawTime 和 Index，索引缺口写入审计。
-- 每次采集独立识别跳变和时长，再按 `(变量, 起始步, 结束步)` 汇总。周期检测依据采集内的空闲段。审计表含采集 ID，跳变表保留原始 Index。
-- RawTime 是纳秒级时间戳。精度不足时，使用同次采集的精确分卷重建时间，或用已知的 `--sample-interval-ms` 估算。汇总表记录 `估算时长次数`。
-- `parse_omron_trace()` 处理多分卷合并、时间戳重建、估算时长标注。
+## 执行
 
-### 通用说明
-- 部分变量在本次 trace 中完全未活动（值恒为 0）——这是正常现象，不报错。
-- 部分变量（如连续输送线）可能从不归零，周期检测需排除这类变量。
+### 入口四的观测状态对
 
-## 跳变与稳定段
-- 跳变（jump）：连续两个样本值不同，记 (var, from_value, to_value, timestamp_ms, sample_index)。
-- 稳定段（segment）：连续相同值的样本区间，记 (var, value, start_ts, end_ts, duration_ms)。
-- 值 0 = idle（非动作），稳定段单独统计；长 idle（默认 >5 秒）视为周期分界候选。
+1. 目录顶层保留 `YYYYMMDDhhmmss_00001.csv` 等原名。按前缀识别采集，按卷号读取，核验同次采集的通道、设置、`StartRawTime` 和递增索引。重命名的文件仅在采集归属可以唯一确认时读取。索引缺口切断连续段，重复分卷与冲突按审计处理。
+2. 每组独立识别相邻样本跳变和稳定段。非活动通道保留元数据，长空闲段作为周期边界候选。不同采集与断开的索引段之间不构造跳变。保留返回步 0 的观测对。
+3. `RawTime` 为纳秒。精度不足时用同次采集的精确时间重建，或使用已知的 `--sample-interval-ms`。采样依据、估算次数、采集 ID 和原始 Index 可追溯。
+4. 按完整变量、起始步和结束步统计观测次数，取起始状态停留时长的中位数。源码直跳、静态多步路径、经步 0 和无法解析的关系分别核查。静态路径仅用于解释观测。
 
-## 预测匹配规则
-对 `final_prediction_pairs.csv` 每一行：
-1. 解析 开始标签 → (var_start, val_start)；结束标签 → (var_end, val_end)。
-2. 若 var_start ≠ var_end（跨变量对）：不匹配，进 review，标记 `cross_variable_pair`。
-3. 若 var_start == var_end（同变量）：
-   a. **精确匹配**：trace 中存在 from=val_start → to=val_end 的跳变。
-   b. **经 0 中转匹配**：trace 中存在 from=val_start → 0 → val_end 的序列，
-      且 0 段时长 < 中转阈值（默认 1000 ms）。算匹配，标注 `via_zero`。
-   c. 以上均不匹配 → review，标注 `predicted_but_not_observed`。
-4. 多周期重复跳变：记录 `occurrences`（发生次数）、首次时间、末次时间、
-   平均时长、最小/最大时长。时长 = segment(val_end).start_ts - segment(val_start).start_ts。
-5. trace 中有但预测无的跳变：进 review，标注 `trace_only_jump`。
+### 入口一的预测回填
 
-## 时长定义
-- 预测对 A→B 的时长 = trace 中 B 状态段的 start_ts − A 状态段的 start_ts。
-- 即从 A 状态开始到 B 状态开始的时长，等同于 A 状态持续时长。
-- 多周期取平均值；交付表显示平均时长（整数毫秒）。
-- 经 0 中转的时长包含 0 段等待时间，与人工采集表的"开始时间→完成时间"口径一致。
+1. `finish` 按 manifest 的 Trace 读取观测。只匹配同一完整变量的两个状态标签。跨变量和单 BOOL 标签分别标 `cross_variable_pair`、`non_state_label`。
+2. 匹配记为直接 `exact`、短零步间隔 `via_zero` 或放宽的候选 `loose`。短零步默认上限 1000 ms。放宽候选保留匹配类型供核对。
+3. 时长取起始与结束状态段起点之差，经过步 0 时包含等待。多次出现取平均值，记录发生次数、首次、末次及最小、最大时长。
+4. 预测未观测和仅 Trace 出现的跳变进入 `trace_review.csv`，标记 `predicted_but_not_observed` 或 `trace_only_jump`。预测的原子化、收尾合并、输送及反馈后继仍按各自源码证据解释。
 
-## 隔离规则
-| 规则 | 说明 |
-|---|---|
-| 不读人工表（GT） | trace skill 不读人工采集表；coverage 评价独立 |
-| 不生成/修改预测 | trace 只验证已有预测，不新增/修改/删除预测对 |
-| 不修改源码 | trace 是只读输入 |
-| 评价隔离 | trace 匹配结果不回流 coverage 评价；coverage 仍只读预测+人工表 |
-| trace ≠ 源码逻辑证明 | trace 证明"这一跳确实发生了"，不证明"源码迁移逻辑正确" |
+## 验收
 
-## 文件与执行
-**输入**：
-- trace 文件路径（必需）
-- final_prediction_pairs.csv（必需，匹配目标）
-- step_comments.json / station_identity.json（可选，仅用于显示）
+| 入口 | 核对文件 | 核对内容 |
+| --- | --- | --- |
+| 四 | `trace_collection_pairs.csv`、`trace_pairs_summary.json`、`trace_pairs_review.csv` | 唯一状态对、发生次数、中位数、估算时长次数、采集分组和源码待核 |
+| 一 | `trace_analysis/trace_prediction_mapping.csv`、`trace_step_runtime.csv`、`trace_review.csv` | 匹配类型、平均时长、覆盖及遗漏 |
+| 两者 | 对应目录下 `trace_variables.json`、`trace_jumps.csv`、`trace_segments.csv`、`trace_cycles.json` | 活跃与未活动变量、采样跳变、连续段和周期候选 |
 
-**输出**（run 目录下）：
-| 文件 | 内容 |
-|---|---|
-| `trace_variables.json` | trace 元数据：变量列表、样本数、时间范围、活动/未活动 |
-| `trace_jumps.csv` | 所有跳变：变量、from值、to值、时间戳(ms)、样本索引 |
-| `trace_segments.csv` | 稳定段：变量、值、起始ms、结束ms、时长ms |
-| `trace_cycles.json` | 检测到的生产周期边界（基于长 idle 分段） |
-| `trace_prediction_mapping.csv` | **核心**：预测对 ↔ trace 跳变匹配（发生次数、首次时间、平均时长等） |
-| `trace_step_runtime.csv` | 每对预测标签的实测时长（开始标签, 结束标签, 平均时长ms, 发生次数, 匹配类型） |
-| `trace_review.csv` | 未匹配预测、trace 独有跳变、跨变量对、多周期冲突 |
+## 协作
 
-**CLI 集成**：
-```bash
-# predict 接收 --trace（可选），存入 manifest
-python plc_cli.py predict --source "源.xml" --pattern "..." --out "outputs/X" --trace "source/X/xxx.trace" --manual "人工表.xls"
-
-# finish 检测 manifest 中的 trace，自动分析并回填时长
-python plc_cli.py finish --run "outputs/X"
-```
-
-参数顺序：`XML地址 匹配格式 trace地址（可选） 人工表地址（可选）`。
-
-## 边界情况
-| 情况 | 处理 |
-|---|---|
-| 变量 0 跳变（未活动） | trace_variables.json 标记 `inactive: true`，不报错 |
-| 变量无 0 值（连续运行） | 周期检测排除；段分析正常输出 |
-| 长空闲（>5 秒） | 周期分界标志，该段不计入步序时长 |
-| 多周期重复跳变 | 记录 occurrences + 首次/末次/平均/最小/最大时长 |
-| trace 有但预测无 | review 标注 `trace_only_jump` |
-| 预测有但 trace 无 | review 标注 `predicted_but_not_observed` |
-| 跨变量预测对 | review 标注 `cross_variable_pair`，不强制匹配 |
-| BOOL 标签（无 = 值） | review 标注 `non_state_label`，不匹配 |
-| 采样间隔异常（>1 秒） | 标注 `sampling_gap`，不阻断分析 |
-
-## 与现有 SKILL 的关系
-| 现有 SKILL | 关系 |
-|---|---|
-| plc-boundary-normalization | trace 验证其预测的步序对，不改变边界规则 |
-| plc-signal-tail-merge | trace 可验证合并区间是否连续发生，不改变合并逻辑 |
-| plc-cross-fb-transport | trace 可验证跨 FB 触发→接收是否实际发生 |
-| plc-feedback-successor | trace 可验证反馈后继是否实际执行 |
-| plc-coverage-evaluation | 独立——coverage 读人工表，trace 读 .trace 文件，互不干扰 |
-
-## v9.11 / v9.12 / v9.13 兼容
-trace 时长是运行时实测，不改变原子化、合并、跨 FB、反馈后继的边界规则。
-合并区间（signal_merge）的时长 = 合并后起止状态段的 start_ts 差，
-包含内部信号/数据收尾耗时，与合并语义一致。
+[动作描述](../plc-action-description/SKILL.md) 使用本轮源码证据解释观测对。[采集配置](../plc-trace-setup/SKILL.md) 为前置现场采集提供通道。两个 Trace 分支都只读原记录，覆盖评价仍读取冻结预测与指定人工表。

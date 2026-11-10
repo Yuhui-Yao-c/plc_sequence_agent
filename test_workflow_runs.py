@@ -1,5 +1,7 @@
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -41,6 +43,71 @@ class WorkflowRunTests(unittest.TestCase):
 
     def result_path(self, input_path):
         return input_path.with_name(input_path.name.replace('.input.json', '.result.json'))
+
+    def shorthand(self, value, marker, *suffix):
+        cli = Path(__file__).resolve().with_name('plc_cli.py')
+        return subprocess.run([sys.executable, '-X', 'utf8', str(cli), str(self.source),
+                               str(value), marker, *suffix], cwd=self.root,
+                              capture_output=True, encoding='utf-8', check=False)
+
+    def test_trace_shorthand_uses_selected_directory_without_overwriting(self):
+        self.out = self.root / '实测 输出'
+        first = self.shorthand(self.trace, '-t', '-output', self.out.name)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        status = self.read('workflow_status.json')
+        self.assertEqual(status['mode'], 'trace')
+        self.assertEqual(Path(status['out']), self.out.resolve())
+        self.assertTrue((self.out / 'trace_collection_pairs.csv').is_file())
+
+        repeat = self.shorthand(self.trace, '-t', '-output', self.out.name)
+        self.assertNotEqual(repeat.returncode, 0)
+        self.assertIn('空目录', repeat.stderr)
+        self.assertEqual(self.read('workflow_status.json')['run_id'], status['run_id'])
+        self.assertFalse((self.root / 'outputs').exists())
+
+        self.cli('trace', '--resume')
+        self.assertTrue(self.read('workflow_status.json')['preparation_reused'])
+
+    def test_shorthand_defaults_keep_trace_and_setup_separate(self):
+        occupied = self.root / 'outputs' / 'PLC'
+        occupied.mkdir(parents=True)
+        sentinel = occupied / 'keep.txt'
+        sentinel.write_text('prior run', encoding='utf-8')
+        trace = self.shorthand(self.trace, '-t')
+        self.assertEqual(trace.returncode, 0, trace.stderr)
+        self.assertTrue((occupied.with_name('PLC_2') / 'trace_collection_pairs.csv').is_file())
+        self.assertEqual(sentinel.read_text(encoding='utf-8'), 'prior run')
+
+        source = self.source.read_text(encoding='utf-8').replace(
+            '<project>', '<project><fileHeader productName="InoProShop"/>', 1)
+        self.source.write_text(source, encoding='utf-8')
+        setup = self.shorthand('Cell.Phase[*]', '--trace-setup')
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        self.out = occupied.with_name('PLC_trace_setup')
+        self.assertEqual(self.read('workflow_status.json')['mode'], 'trace_setup')
+        variables = (self.out / 'static_variables.txt').read_bytes()
+        self.assertEqual(variables, b'Cell.Phase[4]\n')
+        configuration = (self.out / 'PLC_trace_config.trace').read_bytes()
+
+        custom = self.shorthand('Cell.Phase[*]', '--trace-setup', '-output', '配置 输出')
+        self.assertEqual(custom.returncode, 0, custom.stderr)
+        self.out = self.root / '配置 输出'
+        self.assertEqual(Path(self.read('workflow_status.json')['out']), self.out.resolve())
+        self.assertEqual((self.out / 'static_variables.txt').read_bytes(), variables)
+        self.assertEqual((self.out / 'PLC_trace_config.trace').read_bytes(), configuration)
+
+    def test_trace_shorthand_requires_one_complete_output_suffix(self):
+        for marker, value in (('-t', self.trace), ('--trace-setup', 'Cell.Phase[*]')):
+            for suffix in (('-output',), ('-output', ''), ('-output', '--force'),
+                           ('-output', 'first', '-output', 'second')):
+                with self.subTest(marker=marker, suffix=suffix):
+                    args = ['plc_cli.py', str(self.source), str(value), marker, *suffix]
+                    with patch('sys.argv', args), redirect_stderr(io.StringIO()) as errors:
+                        with self.assertRaises(SystemExit) as error:
+                            main()
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertIn('-output', errors.getvalue())
+        self.assertFalse(self.out.exists())
 
     def test_trace_rebuild_archives_and_only_resumes_current_results(self):
         self.cli('trace')

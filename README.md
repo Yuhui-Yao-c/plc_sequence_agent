@@ -1,97 +1,66 @@
 # PLC Sequence Agent
 
-PLC 步序采集 Agent：从 PLC 源码（PLCopen / 欧姆龙 IEC61131-10 / SMC2）和运行时 trace
-中提取状态迁移对，生成步序采集表、动作描述与时长回填。
+使用 OpenCode 从 PLC 源码和实测 Trace 生成步序、中文动作描述和采集工作簿。全量工作流包含预测、评价、实测 Trace 分析和采集配置。
 
-## 四个使用入口
+## 启动
 
-在 OpenCode 对话中输入简写，Agent 自动识别并组装 `plc_cli.py` 命令：
-
-| 入口 | 简写 | 命令 |
-|---|---|---|
-| 预测 | `XML地址 匹配格式 [trace地址] [人工表地址]` | `python plc_cli.py predict --source ... --pattern ... --out ... [--trace ...] [--manual ...]` |
-| GT评价 | `预测CSV路径 GT路径 [源码XML]` | `python plc_cli.py evaluate --prediction ... --gt ... --out ... [--xml ...]` |
-| 覆盖评价 | `预测CSV路径 人工表路径` | `python plc_cli.py coverage --prediction ... --manual ... --out ...` |
-| trace步序采集 | `XML地址 trace地址 -t` | `python plc_cli.py trace --source ... --trace ... --out ... [--pattern ...] [--force \| --resume]` |
-| Trace 采集配置 | `XML地址 变量模式 --trace-setup` | `python plc_cli.py trace-setup --source ... --pattern ... --out ...` |
-
-详见 `AGENTS.md`（权威规则源）。
-
-PLCopen Trace 从本轮 XML 的控制网络、FB 实例和 ST 分支取证。A 档保留归属明确的原注释，后加监控、统计和显示文本隔离。B 档按 v4 证据包组织动作分句，保留已绑定的执行机构、动作及目标位，分别核验多个对象。新工艺术语按当前工程释义。通用分句验证本步事实、对象绑定和目标实参，命名族仅提供辅助线索。默认输出 `<工序名称>_trace步序采集表.xlsx`，也可用 `--proc-name` 指定。源码修订以 Git 提交和 `CHANGELOG.md` 为准。
-
-每个新任务使用空目录。`--force` 将旧输出目录整体归档，再创建新一轮。Agent 按当前批次填写结果，并回传输入的 `run_id` 和 `batch_id`。Trace 同轮用原参数加 `--resume`，预测同轮用 `finish`。对话简写仍为 `源码路径 Trace路径 -t`。
-
-`prepared_b_tier_pending` 表示有缺失、过期或待修订的 B 档结果。`done_with_review` 表示工作簿已生成，源码迁移和动作语义复核分别记录。描述覆盖率和语义准确率分别核验。
-
-## 从源码准备 Trace 采集
-
-```powershell
-python plc_cli.py trace-setup --source "source/工序/PLC.xml" --pattern "Cell.Phase[*]" --out "outputs/工序_trace_setup"
-```
-
-`static_variables.txt` 保存匹配到的完整变量名。通配符为 `*` 和 `?`，方括号按字面匹配。`--regex` 或 `re:` 可使用完整名称正则。XML 控制体中的固定下标和标量可纳入清单。动态下标、无法确认的类型和 SMC2 解析问题见 `workflow_status.json`。
-
-默认识别汇川/CODESYS 导出及 Sysmac 格式。也可明确使用 `--format inovance` 或 `--format sysmac`。Sysmac 按变量声明解析整数类型及程序局部变量的限定名。已核实的缺失类型可通过 `--default-type` 提供。配置文件只有通道和采集参数。客户端导入后核对任务名、采样设置与通道容量，完成采集后将实测文件交给 `trace`。
-
-Trace 工作簿数据行固定为 28 pt。长描述和证据保留全文，点击下划线可在「文本详情」查看。
-
-## 安装
+在项目根目录执行。
 
 ```powershell
 python -m pip install -r requirements.txt
 opencode
 ```
 
-依赖：`lxml` `openpyxl` `pandas`
+## 五个入口
 
-## 工作流
+下表的简写可直接发给 OpenCode。中括号标记可选项，含空格的路径或模式用引号包住。
 
+| 入口 | OpenCode 对话简写 | 命令 |
+| --- | --- | --- |
+| 一　步序预测 | `源码路径 匹配模式 [Trace文件] [人工表路径]` | `predict` → 填批 → `finish` |
+| 二　GT 评价 | `预测CSV路径 GT路径 [源码路径]` | `evaluate` |
+| 三　人工表覆盖评价 | `预测CSV路径 人工表路径 [输出xlsx路径]` | `coverage` |
+| 四　Trace 步序采集 | `源码路径 Trace路径 -t [-output 输出目录]` | `trace` |
+| 五　Trace 采集配置 | `源码路径 匹配模式 --trace-setup [-output 输出目录]` | `trace-setup` |
+
+完整参数和验收规则见 [AGENTS.md](AGENTS.md)。预测侧可用 `python plc_cli.py predict … --tagvars` 单独输出步序变量表。
+
+### 选择 Trace 输出目录
+
+入口四可分析汇川等工程的 `.trace` 和欧姆龙 Sysmac 导出表或分卷目录。入口五从源码准备采集配置。
+
+```text
+"source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "D:\PLC 输出\包 mylar 实测"
+"source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "D:\PLC 输出\包 mylar 配置"
 ```
-predict  : 源码解析 → 候选冻结 → 原子化 → 信号合并 → 工艺分析 → 批次 → finish → 交付表
-trace    : trace跳变解析 → 状态对 → A/B档动作描述 → 交付表（时长回填）
-evaluate : 预测CSV + GT → 匹配指标（只读，不修改预测）
-coverage : 预测CSV + 人工表 → 覆盖率评价（只读）
-```
 
-预测与 trace 不读 GT；评价独立只读。
+省略 `-output` 时，入口四输出到 `outputs/<源码名>`，入口五输出到 `outputs/<源码名>_trace_setup`。默认目录被占用时选择带数字后缀的新目录。两种简写也可在终端加 `python plc_cli.py` 执行。完整 CLI 使用 `--out`。
 
 ## 主要交付物
 
-| 文件 | 说明 |
-|---|---|
-| `prediction_collection_pairs.csv` | 预测主表（非复合，应用合并粒度） |
-| `prediction_candidate_pairs.csv` | 完整召回档案（不删） |
-| `final_prediction_pairs.csv` | finish 最终主表 |
-| `<工序名>_步序采集表.xlsx` | 交付表（预测侧） |
-| `<工序名>_trace步序采集表.xlsx` | 交付表（trace 侧） |
-| `评价/<工序>_覆盖评价.xlsx` | 覆盖评价（有人工表时） |
+| 入口 | 交付物 |
+| --- | --- |
+| 一 | `prediction_collection_pairs.csv`、完整候选档案、`final_prediction_pairs.csv`、`<工序名>_步序采集表.xlsx` |
+| 二 | `gt_match_metrics.json`、匹配审计和可用的 `gt_match.xlsx` |
+| 三 | 彩色覆盖评价工作簿，含逐条对比、汇总、全量预测 |
+| 四 | `<工序名>_trace步序采集表.xlsx`、`trace_collection_pairs.csv`、观测与源码复核 |
+| 五 | `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv` |
 
-## 模块结构
+Trace 步序采集取起始步观测停留时长的中位数。数据行固定为 28 pt。长文本在「文本详情」查看。`prepared_b_tier_pending` 表示本轮 B 档仍需处理，完成后用原参数加 `--resume` 合并。`done_with_review` 表示工作簿已生成，相关复核保留在输出目录。
 
-根目录含 42 个 Python 模块，另有 2 个回归测试文件，按依赖层次组织（详见 `AGENTS.md` 模块概览章节）：
+采集配置仅含通道和采集参数。导入实际客户端后核对任务、触发、采样和通道容量。客户端导出的实测记录可交给入口四。
 
-- **入口/编排**：`plc_cli.py` `workflow.py` `agent.py`
-- **源码解析**：`omron_native.py` `smc2_*.py` `plcopen_*.py` `source_*.py` `extract_*.py`
-- **边界/候选**：`boundary_*.py` `atomic_*.py` `candidate_filter.py` `recall.py` `successor_graph.py`
-- **合并/后继**：`signal_tail_merge.py` `fb_transport.py` `feedback_successor.py`
-- **动作描述/交付**：`action_describe.py` `gen_*_xlsx.py` `station_identity.py`
-- **trace**：`trace_jump_analyzer.py` `trace_to_pairs.py` `trace_source_evidence.py` `trace_description_context.py`
-- **评价**：`pair_evaluation.py` `atomic_evaluation.py` `评价器/gen_coverage_*.py`
+## 定制与验证
 
-## Skills
+修改入口、默认路径或加载条件时，从 [AGENTS.md](AGENTS.md) 的「文件职责」和「技能加载表」定位修改位置。需要改变入口四或五默认目录时，同步 `plc_cli.py` 简写解析和回归用例。
 
-PLC 项目技能位于 `.opencode/skills/`，由 AGENTS.md 按入口加载。
+在项目根目录用 OpenCode 查看实际配置、主 Agent 和可发现的项目技能。
 
-- `plc-boundary-normalization` — 起止标签、OR/AND/NOT、最近后继
-- `plc-signal-tail-merge` — 动作后信号/数据收尾合并
-- `plc-cross-fb-transport` — 跨 FB 触发—到达—接收区间
-- `plc-feedback-successor` — 反馈条件转直接后继
-- `plc-station-identity` — 工位身份映射
-- `plc-coverage-evaluation` — 人工表覆盖对比评价
-- `plc-trace-jump-analysis` — 运行时 trace 跳变分析
-- `plc-action-description` — 动作描述及分句证据
-- `plc-trace-setup` — 从源码准备 Trace 采集配置
+```powershell
+opencode debug config
+opencode debug agent plc-sequence
+opencode debug skill
+python -m unittest discover -q
+```
 
-## 变更记录
-
-见 `CHANGELOG.md`（v3 ~ v9.28）。
+历次修改见 [CHANGELOG.md](CHANGELOG.md)。

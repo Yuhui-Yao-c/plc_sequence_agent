@@ -1,39 +1,33 @@
-# Skill: plc-coverage-evaluation
+---
+name: plc-coverage-evaluation
+description: 用冻结的预测和人工采集表计算标签覆盖率，生成逐条比对、分型及来源审计。
+compatibility: opencode
+---
 
-# 预测完成后的人工表覆盖对比评价（必做）
+# 人工表覆盖评价
 
-## 何时加载
-预测 `finish` 完成后，**若用户提供了人工采集表**（xls/xlsx），必须加载本 skill
-并运行 `评价器/` 目录下的覆盖对比评价引擎。无人工表时跳过。
+## 触发
 
-这是唯一的评价方式：用 `评价器/gen_coverage_eval.py` 对预测表与人工表逐条对比，
-识别直接匹配、多段可合并、已覆盖·写法不一致、已覆盖·拆分粒度不同、周期待确认、未覆盖（9类根因），
-输出彩色逐条对比工作簿并给出覆盖率。
+入口三独立覆盖评价，或入口一提供人工表时加载。预测 `finish` 会自动运行覆盖评价，检查该轮评价工作簿和状态。
 
-## 使用方法（路径格式，与预测模式一致）
+## 输入
 
-用户直接给出路径，agent 自动识别并执行，无需命令行参数：
+- 首选 `final_prediction_pairs.csv`。也可用明确指定的 `prediction_candidate_pairs.csv`、`final_sequence.csv` 或 `final_process_steps.csv`。有「原始条件」列时作为 guards。
+- 人工表可为 `.xls` 或 `.xlsx`。`--kind auto` 结合后缀和工作表名判定。支持 CODESYS 风格的「时序拆解」和 mylar 风格的「动作拆解」，可显式指定格式。
+- 工序名可由人工表文件名推断。独立运行时输出路径按根目录 `AGENTS.md` 的入口三。`--var-desc` 可指定汇总说明里的变量描述。
 
-```
-预测CSV路径  人工表路径  [输出xlsx路径]
-```
+## 执行
 
-示例：
-```
-outputs/超声波/final_prediction_pairs.csv  source/超声/步序时长采集-XM2-L5-超声波-20260910.xls
-```
+### 入口
 
-- **预测CSV**：推荐 `final_prediction_pairs.csv`；也可 `prediction_candidate_pairs.csv`（含原始条件→guards）、`final_sequence.csv`、`final_process_steps.csv`。
-- **人工表**：`.xls`→codesys（sheet"时序拆解"）；`.xlsx`→mylar（sheet"动作拆解"）。格式自动判断。
-- **输出xlsx**：可省略，默认 `outputs/工序_评价/PLC_Manual_vs_Prediction_工序_final.xlsx`。
-- **工序名/变量描述**：可省略，从人工表文件名自动推断。
-
-agent 识别到上述路径后，自动执行：
-```
-python 评价器/gen_coverage_eval.py --prediction "预测CSV" --manual "人工表" --out "输出xlsx" --proc-name 工序 --kind auto
+```powershell
+python plc_cli.py coverage --prediction "预测.csv" --manual "人工表.xlsx" --out "覆盖评价.xlsx" --kind auto
 ```
 
-## 评价器引擎
+入口一已完成自动评价时直接核对 `workflow_status.json` 中的 `coverage` 及实际工作簿。独立补跑使用已冻结预测。旧的 `评价器/gen_coverage_eval.py` CLI 也可独立调用。
+
+### 匹配引擎
+
 位于 `评价器/gen_coverage_workbook.py`，提供匹配引擎：
 - `match_one`：单条人工标签 vs 预测图，判定 直接匹配/多段可合并/已覆盖·写法不一致/
   已覆盖·拆分粒度不同/周期待确认/未覆盖。
@@ -43,7 +37,8 @@ python 评价器/gen_coverage_eval.py --prediction "预测CSV" --manual "人工�
 
 参数化入口 `评价器/gen_coverage_eval.py` 复用上述引擎，接受任意路径，避免硬编码。
 
-## 判定口径
+### 判定口径
+
 | 类别 | 含义 | 计入覆盖 |
 |------|------|----------|
 | 直接匹配 | 开始、结束标签整对直接出现 | ✅ |
@@ -53,29 +48,20 @@ python 评价器/gen_coverage_eval.py --prediction "预测CSV" --manual "人工�
 | 周期待确认 | 起止相同存在闭环，未确认正常生产周期 | ❌ |
 | 未覆盖 | 端点缺失或路径不连通，按9类根因分型 | ❌ |
 
-**覆盖率 = (直接+多段+写法不一致+拆分粒度) / 人工基准**
+**覆盖率 =（直接匹配 + 多段可合并 + 写法不一致 + 拆分粒度不同）/ 人工基准条数**
 
 未覆盖根因9类：结束为NOT离开型、结束含条件或信号、开始含条件（AND）、开始步值不存在、
 端点存在但路径不连通、跨工位转移·程序无对应、疑似闭环（缺复位转移边）、结束步值不存在、非步序变量。
 
-## 输出文件
-彩色工作簿含3个工作表：
-1. **{工序} 逐条对比**：每条人工GT与预测逐行对照，整行按判定/根因填色。
+## 验收
+
+彩色工作簿有三个工作表。
+1. **{工序} 逐条对比**：每条人工采集记录与预测逐行对照，整行按判定/根因填色。
 2. **{工序} 汇总说明**：判定分布、根因分布、判定规则、来源清单（含SHA256）。
 3. **{工序} 全量步序提取**：预测全部记录，编号与逐条对比 #n 对应。
 
-## 必做性与报告
-- 预测 `finish` 后若有人工表，**必须**运行本评价器，不可省略。
-- 交付报告给出覆盖率，并列出未覆盖项的根因分类。
-- 未覆盖项的根因需在报告中分类列出；不修改预测或人工表来提高覆盖率。
+报告覆盖率、未覆盖根因及来源 SHA256。评价使用 `xlrd` 读旧版表格、`openpyxl` 读写工作簿。依赖缺失或渲染失败时保留已产出的预测和审计，并报告实际错误。
 
-## 依赖
-- `xlrd`（读 .xls）、`openpyxl`（写 .xlsx、读 .xlsx）。缺失时如实提示并改用 CSV 输出。
-- 引擎脚本 `评价器/gen_coverage_workbook.py` 必须存在于项目内（参数化入口 import 它）。
+## 协作
 
-## 不做的事
-- 不读取 GT 来补预测候选；评价只读已有预测与人工表。
-- 不修改 PLC 源程序或预测文件。
-- 不把"路径可连接"当作"分支条件兼容或必定发生"。
-- 不为提高覆盖率而合并、删除或改写预测标签。
-- 覆盖率不等于物理动作 100% 召回证明；只表示标签层面覆盖。
+[边界规范](../plc-boundary-normalization/SKILL.md) 解释原子标签。[Trace 跳变](../plc-trace-jump-analysis/SKILL.md) 独立计算运行时长。人工表覆盖评价只读已冻结的预测及指定人工表，路径可连接仅支持标签层面的覆盖判定。

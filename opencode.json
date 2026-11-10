@@ -13,6 +13,7 @@
       "plc-station-identity": "allow",
       "plc-coverage-evaluation": "allow",
       "plc-trace-jump-analysis": "allow",
+      "plc-action-description": "allow",
       "plc-trace-setup": "allow"
     }
   }
