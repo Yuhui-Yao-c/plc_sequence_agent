@@ -459,13 +459,14 @@ def _validate_action_clauses(result, context):
     reserved = {call for call, _ in anchored}
     reserved.update(item['id'] for item in catalog.values() if item['category'] == 'bound_write'
                     and (item['data']['call_ref'], item['data']['actual'].casefold()) in anchored)
-    used, refs, phrases = set(), [], []
+    used, refs, phrases, clause_evidence = set(), [], [], []
     for clause in actions:
         if not isinstance(clause, dict):
             return None, '动作分句须为JSON对象'
         selected = _clause_refs(clause.get('evidence_refs', []), catalog)
         if selected is None:
             return None, '动作分句须引用本行证据包中的有效证据ID'
+        first_ref = len(refs)
         anchor = clause.get('action_ref')
         if anchor is not None:
             if not isinstance(anchor, str) or anchor not in required or anchor in used:
@@ -499,6 +500,7 @@ def _validate_action_clauses(result, context):
                 subject = _CONDITION_USES[clause['condition_use']] + subject
             phrases.append(subject + action + target)
         refs.extend(item['id'] for item in selected)
+        clause_evidence.append((phrases[-1], list(dict.fromkeys(refs[first_ref:]))))
     if missing := required - used:
         labels = [catalog[ref]['data']['object'] for ref in context['required_actions'] if ref in missing]
         return None, '遗漏本步已绑定的动作对象 ' + '、'.join(dict.fromkeys(labels))
@@ -511,7 +513,7 @@ def _validate_action_clauses(result, context):
              else '上下文证据推断')
     return {'desc': prefix + '，'.join(phrases), 'kind': result['kind'],
             'refs': list(dict.fromkeys(refs)), 'reasoning': reasoning.strip(),
-            'evidence_level': level}, ''
+            'evidence_level': level, 'clause_evidence': clause_evidence}, ''
 
 
 def validate_context_result(result, context):

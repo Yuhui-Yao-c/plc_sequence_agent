@@ -1,14 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Gen workstation-engineering xlsx from a final_prediction_pairs.csv.
+"""Render the workstation workbook from prediction or observed Trace pairs.
 
-Layout (matches the human collection workbook style):
-  col B 工位   — merged cells per workstation (rows contiguous)
-  col C 步序   — ACTION VARIABLES of the start state when available:
-                 PLCopen:  plcopen_action_trace.csv targets by (state_variable, state_value)
-                 omron  :  native_command_evidence.csv arguments by start == 开始标签
-                 fallback: real transition <变量>: <起步>→<止步>; source-code notes
-                 (*...*) appended when present. No invented descriptions.
-  col D/E tags — 开始标签 / 结束标签 verbatim.
+Rows are grouped by workstation and preserve the pair's start and end labels.
+Trace reports also display description provenance and validated clause evidence.
 
 Usage:
   python gen_workstation_xlsx.py --prediction outputs/X/final_prediction_pairs.csv [--proc-name 工序名] [--group-by auto|构成要素|证据POU|控制器]
@@ -257,6 +251,14 @@ def _text_cell(ws, row, column, value):
     return cell
 
 
+def _wrapped_lines(text, width):
+    lines = 0
+    for line in text.splitlines():
+        length = sum(2 if east_asian_width(ch) in ('W', 'F') else 1 for ch in line)
+        lines += max(1, ceil(length / width))
+    return lines
+
+
 def pou_station(pou) -> str:
     first = cell_str(pou).split(";")[0].strip()
     area = first.split("::")[0].strip()
@@ -399,10 +401,11 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             vt = '' if pd.isna(vt) or str(vt).strip() in ('nan', 'None') else str(vt)
             desc_text = r.get('动作描述', '')
             desc_text = '' if pd.isna(desc_text) or str(desc_text).strip().lower() in ('nan', 'none') else str(desc_text).strip()
-            desc_map[(str(r['开始标签']), str(r['结束标签']))] = (
-                desc_text, vt, str(r.get('行性质', '')), str(r.get('描述来源', 'A档(源码模板)')),
-                cell_str(r.get('描述状态', '')), cell_str(r.get('推断依据', '')),
-                cell_str(r.get('证据等级', '')))
+            desc_map[(str(r['开始标签']), str(r['结束标签']))] = {
+                '动作描述': desc_text, '动作变量': vt,
+                **{field: cell_str(r.get(field, '')) for field in (
+                    '描述来源', '描述状态', '推断依据', '证据等级', '注释补充', '证据')},
+            }
         desc_stats = dd['描述来源'].value_counts().to_dict()
     df = pd.read_csv(prediction, dtype=str, encoding='utf-8-sig')
     for col in ('开始标签', '结束标签'):
@@ -532,7 +535,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     # v9.29: detect B-tier not processed (input.json exists but no result.json).
     # When True, rows with empty descriptions get 【B档未处理】 in the remark column.
     if is_trace:
-        b_tier_pending = any(row[4] in ('B档待处理', 'B档待修订') for row in desc_map.values())
+        b_tier_pending = any(row['描述状态'] in ('B档待处理', 'B档待修订') for row in desc_map.values())
     elif b_tier_pending is None:
         b_tier_pending = False
         bd = os.path.join(run, 'batches_desc')
@@ -554,27 +557,34 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         a_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('A档'))
         b_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('B档'))
         note = (f'{proc_name} | {len(df)}个观测状态对 | 源码注释{a_rows}行 | B档归纳待核{b_rows}行 | '
-                '时长为起始状态观测停留中位数，行时长合计仅供表内汇总。源码关系、估算和复核见备注。')
+                '时长为起始状态观测停留中位数，行时长合计仅供表内汇总。红色 LLM 表示描述待核。源码关系、估算和复核见备注。')
+    layout = [('构成要素', 18), ('动作描述', 42), ('时长(ms)', 8), ('动作变量（引用）', 28),
+              ('开始标签', 26), ('结束标签', 26), ('备注', 22)]
+    if is_trace:
+        layout.insert(2, ('描述来源', 10))
+        layout[-1:] = [('备注', 62), ('证据', 90)]
+    columns = {heading: j for j, (heading, _) in enumerate(layout, 2)}
+    last_col = len(columns) + 1
+    duration_col = columns['时长(ms)']
+    remark_col = columns['备注']
     _text_cell(ws, 1, 2, f'{proc_name} 步序采集表（{title}）').font = hfont
     nc = _text_cell(ws, 2, 2, note)
     nc.font = nfont
     nc.alignment = left
     for rr in (1, 2):
-        ws.merge_cells(start_row=rr, start_column=2, end_row=rr, end_column=8)
-    # 精简列结构（v9.20）：构成要素|动作描述|时长|动作变量|开始标签|结束标签|备注
-    heads = ('构成要素', '动作描述', '时长(ms)', '动作变量（引用）', '开始标签', '结束标签', '备注')
-    for j, h in enumerate(heads, 2):
+        ws.merge_cells(start_row=rr, start_column=2, end_row=rr, end_column=last_col)
+    for j, (h, width) in enumerate(layout, 2):
         c = _text_cell(ws, 3, j, h)
         c.font = hfont; c.alignment = center; c.border = border
-        c.fill = PatternFill('solid', start_color='F2A08C' if j in (2, 6, 7, 8) else 'FFE9A8')
+        c.fill = PatternFill('solid', start_color='F2A08C' if h in ('构成要素', '开始标签', '结束标签', '备注', '证据') else 'FFE9A8')
+        ws.column_dimensions[c.column_letter].width = width
 
     # 预取每行动作描述（v9.21: desc_map优先，空描述时不再fallback到变量翻译）
     def _row_desc(row):
         key = (str(row['开始标签']), str(row['结束标签']))
         d = desc_map.get(key)
         if d:
-            # d = (desc_text, var_text, is_b_tier)
-            return d[0], d[1], d[3].startswith('B档')
+            return d['动作描述'], d['动作变量'], d['描述来源'].startswith('B档')
         # No desc_map entry — use step_text only for the 动作变量 column (引用),
         # but leave the description itself empty (no variable names in desc column).
         stxt = cell_str(row.get('动作变量', '')) if is_trace else step_text(row, amap)
@@ -599,6 +609,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     # 统一字体和行高
     data_font = Font(name='Arial', size=9)
     total_font = Font(name='Arial', size=9, bold=True)
+    review_font = Font(name='Arial', size=9, color='FF0000', bold=True)
     data_align = Alignment(horizontal='left', vertical='center', wrap_text=False)
     center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
     total_fill = PatternFill('solid', start_color='F0F0F0')
@@ -615,27 +626,38 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             # v9.23: 时长(ms) — 从trace分析结果回填，无trace时留空
             rt_key = (str(row['开始标签']), str(row['结束标签']))
             rt_dur = trace_rt.get(rt_key) if trace_rt else None
-            ws.cell(row=r, column=4, value=rt_dur if rt_dur is not None else None)
+            ws.cell(row=r, column=duration_col, value=rt_dur)
             if rt_dur is not None:
                 block_dur_sum += rt_dur
                 has_trace_dur = True
             # 动作变量（引用）
             vtxt = str(row['_vtxt']) if str(row['_vtxt']) not in ('nan', 'None') else ''
-            _text_cell(ws, r, 5, vtxt if vtxt else None)
-            _text_cell(ws, r, 6, row['开始标签'])
-            _text_cell(ws, r, 7, row['结束标签'])
+            _text_cell(ws, r, columns['动作变量（引用）'], vtxt if vtxt else None)
+            _text_cell(ws, r, columns['开始标签'], row['开始标签'])
+            _text_cell(ws, r, columns['结束标签'], row['结束标签'])
             # 备注：网络注释（取最具体的1条）+ 待复核标记
             remark_parts = []
             trace_needs_review = False
+            origin = ''
             if is_trace:
                 remark = cell_str(row.get('备注', '')).strip()
                 remark_parts.extend(part for part in remark.split(' | ')
                                     if part and part != '无步注释，等待LLM综合上下文描述')
-                desc_entry = desc_map.get(rt_key)
-                desc_status = desc_entry[4] if desc_entry else ''
+                desc_entry = desc_map.get(rt_key, {})
+                desc_status = desc_entry.get('描述状态', '')
+                desc_source = desc_entry.get('描述来源', '')
                 trace_needs_review = row.get('源码关系') != 'direct' or desc_status != '源码注释'
-                if desc_entry and desc_entry[5]:
-                    remark_parts.append(f'{desc_entry[6]}：{desc_entry[5]}')
+                if reasoning := desc_entry.get('推断依据'):
+                    remark_parts.append(f'{desc_entry["证据等级"]}：{reasoning}')
+                if dtxt and (desc_status == '源码注释' or (not desc_status and desc_source.startswith('A档') and '注释' in desc_source)):
+                    origin = '注释'
+                    if detail := desc_entry.get('注释补充'):
+                        remark_parts.append(detail)
+                elif dtxt and desc_source.startswith('B档') and desc_status in ('', 'LLM推断待核验'):
+                    origin = 'LLM'
+                    _text_cell(ws, r, columns['证据'], desc_entry.get('证据') or '分句证据待核')
+                if origin:
+                    _text_cell(ws, r, columns['描述来源'], origin)
                 if trace_needs_review:
                     trace_review_rows += 1
                     remark_parts.append(f'【{desc_status or "描述待核验"}】')
@@ -663,30 +685,34 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             if legacy_b_pending:
                 remark_parts.append('【B档未处理】')
             if remark_parts:
-                _text_cell(ws, r, 8, ' | '.join(remark_parts))
+                _text_cell(ws, r, remark_col, ' | '.join(remark_parts))
             # 统一样式
-            for j in range(2, 9):
+            for j in range(2, last_col + 1):
                 c = ws.cell(row=r, column=j)
                 c.font = data_font
                 c.border = border
-                c.alignment = center_align if j == 2 else data_align
+                c.alignment = center_align if j in (2, columns.get('描述来源')) else data_align
             # 待复核行/B档未处理行的备注列用红色字体
             if needs_review or trace_needs_review or legacy_b_pending:
-                ws.cell(row=r, column=8).font = Font(name='Arial', size=9, color='FF0000', bold=True)
+                ws.cell(row=r, column=remark_col).font = review_font
+            if origin == 'LLM':
+                ws.cell(row=r, column=columns['描述来源']).font = review_font
             height = 18
-            if is_trace and dtxt:
-                ws.cell(row=r, column=3).alignment = left
-                lines = sum(max(1, ceil(sum(2 if east_asian_width(ch) in ('W', 'F') else 1
-                                            for ch in line) / 38)) for line in dtxt.splitlines())
-                height = min(409, max(height, 18 * lines))
-            ws.row_dimensions[r].height = height
+            if is_trace:
+                for heading in ('动作描述', '备注', '证据'):
+                    cell = ws.cell(row=r, column=columns[heading])
+                    if cell.value:
+                        cell.alignment = left
+                        width = ws.column_dimensions[cell.column_letter].width - 4
+                        height = max(height, 18 * _wrapped_lines(cell.value, width))
+            ws.row_dimensions[r].height = min(409, height)
             r += 1
         # 块尾"总时长"行
         _text_cell(ws, r, 3, '行时长合计' if is_trace else '总时长')
         # v9.23: 有trace数据时填入该工位组时长合计
         if has_trace_dur:
-            ws.cell(row=r, column=4, value=block_dur_sum)
-        for j in range(2, 9):
+            ws.cell(row=r, column=duration_col, value=block_dur_sum)
+        for j in range(2, last_col + 1):
             c = ws.cell(row=r, column=j)
             c.font = total_font
             c.border = border
@@ -699,9 +725,6 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         if b1 > b0:
             ws.merge_cells(start_row=b0, start_column=2, end_row=b1, end_column=2)
         ws.cell(row=b0, column=2).alignment = center_align
-    # 列宽优化：动作描述最宽，标签次之，工位/时长/备注适中
-    for col, w in (('B', 18), ('C', 42), ('D', 8), ('E', 28), ('F', 26), ('G', 26), ('H', 22)):
-        ws.column_dimensions[col].width = w
     # 标题行行高
     ws.row_dimensions[1].height = 22
     ws.row_dimensions[2].height = 16

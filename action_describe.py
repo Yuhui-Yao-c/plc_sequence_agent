@@ -16,6 +16,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_workstation_xlsx import load_action_map, var_of, load_var_docs
 from trace_source_evidence import RELATION_TEXT, read_trace_evidence
+from trace_description_report import action_evidence_text, annotation_supplement
 from trace_description_context import (
     LEGACY_CLAUSE_SCHEMA, SCHEMA as TRACE_CONTEXT_SCHEMA, validate_context_result,
 )
@@ -598,13 +599,15 @@ def _validate_trace(run, a, evidence, allowed, stats):
             '描述状态': status, '证据引用': '; '.join(refs),
             '推断依据': candidate.get('reasoning', '') if status == 'LLM推断待核验' else '',
             '证据等级': candidate.get('evidence_level', '') if status == 'LLM推断待核验' else '源码注释' if desc else '',
+            '注释补充': annotation_supplement(info) if status == '源码注释' else '',
+            '证据': action_evidence_text(info, candidate) if candidate else '',
         })
         if reason:
             review.append({**record, '描述状态': status, '原因': reason})
     fields = ['行号', '开始标签', '结束标签', '动作变量']
     out = run / 'action_desc_final.csv'
-    pd.DataFrame(rows, columns=fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用', '推断依据', '证据等级']).to_csv(
-        out, index=False, encoding='utf-8-sig')
+    columns = fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用', '推断依据', '证据等级', '注释补充', '证据']
+    pd.DataFrame(rows, columns=columns).to_csv(out, index=False, encoding='utf-8-sig')
     pd.DataFrame(review, columns=fields + ['描述状态', '原因']).to_csv(
         run / 'action_desc_review.csv', index=False, encoding='utf-8-sig')
     counts['description_review_count'] = len(review)

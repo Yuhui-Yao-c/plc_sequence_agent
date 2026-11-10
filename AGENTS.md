@@ -140,6 +140,8 @@ python plc_cli.py trace --source "source/PLC.xml" --trace "source/trace目录" -
 
 核验 `workflow_status.json`、状态对、动作描述和工作簿。`prepared_b_tier_pending` 表示有缺失、过期或需修订的 B 档结果。`done_with_review` 表示工作簿已出且有源码或描述待核。源码迁移项见 `trace_pairs_review.csv`，动作描述项见 `action_desc_review.csv`。工作簿按状态对合计待核行。
 
+Trace 工作簿在动作描述后显示「描述来源」。A 档原文标「注释」，已通过引用校验的 B 档标红色「LLM」，空描述的来源留空。对于归属可查的简短步标题或例程名能补足对象的完成阶段注释，在「备注」增加例程及可确认的本步条件。「证据」逐分句列出 B 档引用的指令、实参、条件和源码位置。候选路径、名称类比和推断待核状态各自标明。
+
 ### PLCopen Trace 描述取证
 
 - 使用本轮 PLC XML。通过 LD/FBD 接线、功能块具名引用实参和 ST 分支定位本步。读取 `EXECUTE` 内嵌 ST 时保留外层使能和内部写入条件。

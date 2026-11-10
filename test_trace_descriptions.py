@@ -104,7 +104,55 @@ class TraceDescriptionTests(unittest.TestCase):
         book = load_workbook(result['out'], read_only=True, data_only=True)
         self.addCleanup(book.close)
         self.assertEqual(book.active['C4'].value, comment)
-        self.assertEqual(book.active['D4'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
+        self.assertEqual(book.active['D4'].value, '注释')
+        self.assertEqual(book.active['E4'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
+        self.assertIsNone(book.active['J4'].value)
+
+    def test_vague_notes_get_only_their_own_routine_and_control_details(self):
+        self.write_part(self.FIRST + '_00001.csv', self.EPOCH,
+                        [(0, 0, 20, 20), (1, 20, 0, 0), (2, 0, 0, 0)],
+                        channels=('Step[1]', 'Step[2]', 'Step[3]'))
+        source = self.root / 'source.xml'
+        source.write_text(
+            '<project><types><pous>'
+            '<pou name="托盘高度测量" pouType="program"><body><ST>'
+            'IF Step[1]=0 AND HeightRequest THEN //====判断步====\n Step[1]:=10; END_IF;\n'
+            'IF Step[1]=10 AND Ready THEN Step[1]:=20; END_IF;\n'
+            'IF Step[1]=20 AND NOT HeightBusy THEN //20：测量完成\n Step[1]:=0; END_IF;'
+            '</ST></body></pou>'
+            '<pou name="极片厚度测量" pouType="program"><body><ST>'
+            'IF Step[2]=20 AND NOT ThicknessBusy THEN //20：测量完成\n Step[2]:=0; END_IF;'
+            '</ST></body></pou>'
+            '<pou name="输送机构" pouType="program"><body><ST>'
+            'IF Step[3]=20 THEN //====定位轴上升至检测位====\n Step[3]:=0; END_IF;'
+            '</ST></body></pou></pous></types></project>', encoding='utf-8')
+        pairs = generate(self.trace, self.run, source=source)['outputs']['pairs_csv']
+        cmd_a(self.run)
+        final = {r['开始标签']: r for r in self.read_csv(cmd_validate(self.run))}
+        self.assertEqual(final['Step[1]=0']['动作描述'], '====判断步====')
+        first = final['Step[1]=0']['注释补充']
+        self.assertIn('托盘高度测量', first)
+        self.assertIn('候选路径 0 → 10 → 20', first)
+        self.assertIn('HeightRequest', first)
+        self.assertNotIn('Ready', first)
+        self.assertEqual(final['Step[1]=20']['动作描述'], '20：测量完成')
+        self.assertIn('HeightBusy', final['Step[1]=20']['注释补充'])
+        second = final['Step[2]=20']['注释补充']
+        self.assertIn('极片厚度测量', second)
+        self.assertIn('ThicknessBusy', second)
+        self.assertNotIn('HeightBusy', second)
+        self.assertEqual(final['Step[3]=20']['注释补充'], '')
+        self.assertEqual(final['Step[3]=20']['动作描述'], '====定位轴上升至检测位====')
+
+        from openpyxl import load_workbook
+        rendered = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
+        with open(rendered['out'], 'rb') as stream:
+            book = load_workbook(stream, read_only=True)
+            sheet_rows = {r[6]: r for r in book.active.iter_rows(min_row=4, values_only=True) if r[6]}
+            book.close()
+        self.assertIn(first, sheet_rows['Step[1]=0'][8])
+        self.assertIn(second, sheet_rows['Step[2]=20'][8])
+        self.assertIsNone(sheet_rows['Step[2]=20'][9])
 
     def test_source_station_name_is_used_for_csv_and_existing_workbook_export(self):
         from openpyxl import load_workbook
@@ -133,7 +181,7 @@ class TraceDescriptionTests(unittest.TestCase):
         book = load_workbook(result['out'], read_only=True, data_only=True)
         self.addCleanup(book.close)
         self.assertEqual(book.active['B4'].value, name)
-        self.assertEqual(book.active['F4'].value, f'{controller}=0')
+        self.assertEqual(book.active['G4'].value, f'{controller}=0')
 
     def test_same_documented_name_does_not_merge_station_groups(self):
         doc = 'Dock_进料单元'
@@ -208,21 +256,41 @@ class TraceDescriptionTests(unittest.TestCase):
         stats = {}
         final = cmd_validate(self.run, stats=stats)
         self.assertEqual(stats['b_candidates'], 1)
-        self.assertEqual(self.read_csv(final)[0]['证据等级'], '同类命名推断')
+        result_row, = self.read_csv(final)
+        self.assertEqual(result_row['证据等级'], '同类命名推断')
+        self.assertIn(effect['id'], result_row['证据'])
+        self.assertIn('命名类比', result_row['证据'])
+        self.assertNotIn('方向未知', result_row['证据'])
         ws = workbook(str(self.run / 'trace_collection_pairs.csv'), run=str(self.run), sheet='trace步序采集表')
         self.assertEqual(Path(ws['out']).name, '包mylar_trace步序采集表.xlsx')
         from openpyxl import load_workbook
         book = load_workbook(ws['out'], read_only=True)
-        remarks = [str(row[0]) for row in book.active.iter_rows(min_col=8, max_col=8, values_only=True)]
+        sheet = book.active
+        self.assertEqual(sheet['D4'].value, 'LLM')
+        self.assertEqual(sheet['D4'].font.color.rgb[-6:], 'FF0000')
+        self.assertEqual(sheet['J4'].value, result_row['证据'])
+        remarks = [str(row[0]) for row in sheet.iter_rows(min_col=9, max_col=9, values_only=True)]
         book.close()
         self.assertTrue(any('同类命名推断' in text and '方向未知' in text for text in remarks))
         result['actions'][0].update(action='伸出', source_ref=analogies[0]['id'])
         (self.run / 'batches_desc/batch_001.result.json').write_text(json.dumps(data, ensure_ascii=False))
         cmd_validate(self.run, stats=stats)
         self.assertEqual(stats['b_candidates'], 0)
+        rejected, = self.read_csv(final)
+        self.assertEqual((rejected['动作描述'], rejected['证据']), ('', ''))
         self.assertIn('本步', self.read_csv(self.run / 'action_desc_review.csv')[0]['原因'])
         result['actions'][0]['source_ref'] = command['id']
         self.assertIn('缺少本步动作效果', validate_context_result(result, info['description_context'])[1])
+
+    def test_legacy_evidence_lists_references_without_assigning_them_to_a_clause(self):
+        from trace_description_report import action_evidence_text
+
+        mapping = {'id': 'legacy-name', 'category': 'annotated_mapping', 'data': {
+            'target': 'Actuator[2]', 'example_symbol': 'Actuator[2]', 'mechanism_classes': ['气缸'],
+        }}
+        info = {'description_context': {'evidence': [mapping]}}
+        evidence = action_evidence_text(info, {'refs': [mapping['id']]})
+        self.assertEqual(evidence, '同对象注释，Actuator[2] 参考 Actuator[2]「气缸」〔legacy-name〕')
 
     def test_source_change_invalidates_old_context_results(self):
         info = self.analogy_fixture()
@@ -310,6 +378,10 @@ class TraceDescriptionTests(unittest.TestCase):
         candidate, issue = validate_context_result(result, context)
         self.assertFalse(issue)
         self.assertEqual(candidate['desc'], '向下料A侧夹子气缸发出回原位请求，向下料B侧夹子气缸发出工位侧请求')
+        facts = {item['id']: item for item in context['evidence']}
+        targets = [{facts[ref]['data']['target'] for ref in refs if facts[ref]['category'] == 'bound_write'}
+                   for _, refs in candidate['clause_evidence']]
+        self.assertEqual(targets, [{'Cylinder[3].AutoAnastole'}, {'Cylinder[4].AutoStrOut'}])
         call_ref = next(e['id'] for e in context['evidence'] if e['category'] == 'current_command')
         result['actions'].append({'subject': '下料A侧夹子气缸', 'action': '松开', 'source_ref': call_ref,
                                   'subject_symbol': 'Cylinder[3]'})
