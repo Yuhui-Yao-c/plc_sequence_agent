@@ -5,7 +5,7 @@
   evaluate  : prediction CSV + GT → match metrics (read-only, never modifies prediction)
   coverage  : prediction CSV + manual table → coverage evaluation
   trace     : trace file → state-jump pairs → A/B-tier descriptions → delivery table
-  trace-setup : standalone source variable extraction and capture configuration
+  trace-setup : source XML → explicit channel names → capture configuration
 
 Prediction and trace never open ground truth.  All four share the same
 column-compatible state-pair CSV format so downstream action_describe /
@@ -364,9 +364,6 @@ def main():
  if a.mode in ('predict','trace','finish'):
   with lock_run_dir(a.run if a.mode=='finish' else a.out):
    a.func(a)
- elif a.mode=='trace-setup':
-  code=a.func(a)
-  if code:raise SystemExit(code)
  else:
   a.func(a)
 if __name__=='__main__':main()

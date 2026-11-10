@@ -227,7 +227,7 @@ def _scan_part(path, encoding, delimiter):
             last_index, last_time = index, raw_time
             count += 1
     if not count:
-        raise ValueError(f'{path}: 无采样数据')
+        raise ValueError(f'{path}: 无采样数据，请提供采集后导出的 Trace 记录')
     # Round the inferred nominal period to microseconds to avoid extending jitter.
     interval_ns = max(1, round(statistics.median(intervals) / 1000) * 1000) if precise and intervals else None
     settings = tuple(metadata.get(key, '').casefold() for key in CAPTURE_SETTINGS)
@@ -720,6 +720,8 @@ def generate(trace_path, run, source=None, proc_name=None,
             trace_path, sample_interval_ms=sample_interval_ms, matches=matches)
     else:
         variables = parse_trace(trace_path)
+        if not any(channel['sample_count'] for channel in variables.values()):
+            raise ValueError(f'{trace_path}: 无采样数据，请提供采集后导出的 Trace 记录')
         if matches is not None:
             variables = {name: vd for name, vd in variables.items() if matches(name)}
         trace_input = {'format': 'twincat_scope_xml'}

@@ -1,7 +1,6 @@
 import csv
 import io
-import subprocess
-import sys
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -9,11 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
-from extract_step_variables import ExtractionError, extract
+from extract_step_variables import generate
 from plc_cli import main
-
-
-SCRIPT = Path(__file__).with_name('extract_step_variables.py')
+from trace_to_pairs import generate as analyze_trace
 
 
 class TraceSetupTests(unittest.TestCase):
@@ -21,105 +18,137 @@ class TraceSetupTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        self.source = self.root / '工序 源码.xml'
+        self.source = self.root / '工程.xml'
         self.out = self.root / 'setup'
 
-    def test_standalone_script_keeps_original_source_text_matching(self):
-        self.source.write_text('''<project>
-            <fileHeader productName="InoProShop"/>
+    def plcopen(self, body, *, header='<fileHeader productName="InoProShop"/>', encoding='utf-8'):
+        self.source.write_text(f'<project>{header}<pou name="Run"><body>{body}</body></pou></project>',
+                               encoding=encoding)
+
+    def sysmac(self, body):
+        self.source.write_text(
+            '<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10">' + body + '</Project>', encoding='utf-8')
+
+    def test_cli_inovance_uses_full_names_and_serializes_configuration_only(self):
+        self.plcopen('''
             <ST><![CDATA[
-                Cell . Phase [ 2 ] := 3;
+                Cell . Phase [ INT#002 ] := 4;
                 Cell.Phase[10] := 5;
                 CELL.Phase[2] := 6;
-                Outer.Cell.Phase[11] := 6;
-                Cell.Phase[index] := 7;
-                x := 'Cell.Phase[5]';
+                Outer.Cell.Phase[4] := 5;
+                Cell.Phase[Map[Grid[8]]] := 5;
+                // Cell.Phase[22]
+                (* Cell.Phase[23] (* comment *) Cell.Phase[24] *)
+                String := 'Cell.Phase[25]';
             ]]></ST>
-            <expression>Cell.Phase&#91;3&#93;</expression>
-            <!-- Cell.Phase[4] -->
-        </project>''', encoding='utf-16')
-        source_bytes = self.source.read_bytes()
-        result = subprocess.run(
-            [sys.executable, '-S', str(SCRIPT), '--source', str(self.source),
-             '--pattern', 'Cell.Phase[*]', '--out', str(self.out)],
-            check=True, text=True, capture_output=True,
-        )
-        names = ['Cell.Phase[2]', 'Cell.Phase[3]', 'Cell.Phase[4]', 'Cell.Phase[5]', 'Cell.Phase[10]']
-        self.assertIn('动态/表达式引用：1', result.stdout)
-        self.assertEqual((self.out / 'static_variables.txt').read_text(encoding='utf-8').splitlines(), names)
-        config = self.out / '工序 源码.trace'
-        xml = ET.parse(config)
-        samples = xml.findall('.//TraceVariable')
-        self.assertEqual([el.get('VarName') for el in samples], names)
-        self.assertTrue(all(not el.findtext('Values') and not el.findtext('Timestamps') for el in samples))
-        self.assertEqual({p.name for p in self.out.iterdir()}, {'static_variables.txt', config.name})
-        self.assertEqual(self.source.read_bytes(), source_bytes)
-
-    def test_cli_alias_forwards_full_name_regex_to_same_extractor(self):
-        self.source.write_text('<project><ST>Cell.Phase[2]; Cell.Other[3];</ST></project>', encoding='utf-8')
-        direct = self.root / 'direct'
-        matcher = r'Cell\.Phase\[\d+\]'
-        args = ['plc_cli.py', 'trace-setup', '--source', str(self.source),
-                '--pattern', 're:' + matcher, '--out', str(self.out)]
-        with patch('sys.argv', args), redirect_stdout(io.StringIO()):
+            <LD>
+              <contact><expression>Cell.Phase&#91;3&#93;</expression></contact>
+              <comment><content>Cell.Phase[26]</content></comment>
+            </LD>
+            <!-- Cell.Phase[27] -->
+        ''', encoding='utf-16')
+        before = self.source.read_bytes()
+        args = ['plc_cli.py', 'trace-setup', '--source', str(self.source), '--pattern', 'Cell.Phase[*]',
+                '--out', str(self.out), '--task-name', 'CaptureTask']
+        with patch('sys.argv', args), redirect_stdout(io.StringIO()) as output:
             main()
-        extract(self.source, matcher, direct, mode='regex')
-        self.assertEqual({p.name: p.read_bytes() for p in self.out.iterdir()},
-                         {p.name: p.read_bytes() for p in direct.iterdir()})
+        report = json.loads(output.getvalue())
+        variables = ['Cell.Phase[2]', 'Cell.Phase[3]', 'Cell.Phase[10]']
+        self.assertEqual((self.out / 'static_variables.txt').read_text(encoding='utf-8').splitlines(), variables)
+        self.assertEqual(report['dynamic_variables'], ['Cell.Phase[Map[Grid[8]]]'])
+        self.assertEqual(before, self.source.read_bytes())
+        trace = Path(report['configuration'])
+        self.assertTrue(trace.read_bytes().startswith((b'\xff\xfe', b'\xfe\xff')))
+        xml = ET.parse(trace)
+        self.assertEqual(xml.findtext(".//Single[@Name='TaskName']"), 'CaptureTask')
+        self.assertEqual([el.text for el in xml.findall(".//Single[@Name='VariableName']")], variables)
+        self.assertEqual([el.text for el in xml.findall(".//Single[@Name='guid']")],
+                         [el.text for el in xml.findall(".//Single[@Name='ReferencedVarGuid']")])
+        samples = xml.findall('.//TraceVariable')
+        self.assertEqual([el.get('VarName') for el in samples], variables)
+        self.assertTrue(all(not el.findtext('Values') and not el.findtext('Timestamps') for el in samples))
+        with self.assertRaisesRegex(ValueError, '无采样数据'):
+            analyze_trace(trace, self.root / 'analysis', source=self.source)
 
-    def test_omron_csv_preserves_declared_type_and_quotes_multi_index(self):
-        self.source.write_text('''<project>
-            <fileHeader companyName="OMRON"/>
-            <Variable name="Cell">
-                <Type><TypeName>ARRAY[0..5,0..5] OF DINT</TypeName></Type>
-            </Variable>
-            <ST>Cell[1,2] := 5; CellAux[1] := 1;</ST>
-        </project>''', encoding='utf-8')
-        result = extract(self.source, 'Cell*[*]', self.out)
-        with (self.out / result['trace_file']).open(encoding='utf-8-sig', newline='') as stream:
+    def test_sysmac_scoped_types_and_quoted_multi_index_csv(self):
+        self.sysmac('''
+            <DataTypeDecl name="Machine"><UserDefinedTypeSpec>
+                <Member name="Phase"><Type><TypeName>ARRAY[-1..3,0..8] OF DINT</TypeName></Type></Member>
+            </UserDefinedTypeSpec></DataTypeDecl>
+            <GlobalVars><Variable name="Cell"><Type><TypeName>Machine</TypeName></Type></Variable></GlobalVars>
+            <Program name="Feed"><LocalVars>
+                <Variable name="Phase"><Type><TypeName>UINT</TypeName></Type></Variable>
+            </LocalVars><BodyContent><ST>Phase := 10;</ST>
+                <FbdObject identifier="Cell.Phase[-1,2]"/>
+            </BodyContent></Program>
+        ''')
+        report = generate(self.source, self.out, r're:(Cell|Feed)\.Phase.*')
+        self.assertEqual(report['status'], 'done')
+        self.assertEqual([(c['name'], c['type']) for c in report['channels']],
+                         [('Cell.Phase[-1,2]', 'DINT'), ('Feed.Phase', 'UINT')])
+        config = Path(report['configuration'])
+        with config.open(encoding='utf-8-sig', newline='') as stream:
             rows = list(csv.reader(stream))
-        self.assertEqual(result['trace_file'], '工序 源码.csv')
         self.assertEqual(rows[-1], ['Index', 'Date', 'ClockTime', 'RawTime', 'TraceSampID',
-                                    'Cell[1,2]:DINT', 'CellAux[1]:INT'])
+                                    'Cell.Phase[-1,2]:DINT', 'Feed.Phase:UINT'])
+        with self.assertRaisesRegex(ValueError, '无采样数据'):
+            analyze_trace(config, self.root / 'analysis', source=self.source)
 
-    def test_conflict_leaves_both_outputs_and_other_files_alone(self):
-        self.source.write_text('<project><ST>Step[1] := 20;</ST></project>', encoding='utf-8')
-        self.out.mkdir()
-        existing = self.out / '工序 源码.trace'
-        existing.write_bytes(b'prior config')
-        unrelated = self.out / 'summary.json'
-        unrelated.write_bytes(b'other workflow')
-        with self.assertRaisesRegex(ExtractionError, '输出文件已存在'):
-            extract(self.source, 'Step[*]', self.out)
-        self.assertFalse((self.out / 'static_variables.txt').exists())
-        self.assertEqual(existing.read_bytes(), b'prior config')
-        extract(self.source, 'Step[*]', self.out, overwrite=True)
-        self.assertEqual(unrelated.read_bytes(), b'other workflow')
+    def test_unsupported_and_missing_types_need_review(self):
+        self.sysmac('''
+            <GlobalVars>
+                <Variable name="Flags"><Type><TypeName>BOOL</TypeName></Type></Variable>
+                <Variable name="States"><Type><TypeName>ARRAY[0..2] OF INT</TypeName></Type></Variable>
+            </GlobalVars>
+            <Program name="Line"><BodyContent>
+                <ST>Flags := TRUE; States[3] := 1; Unknown := 2;</ST>
+            </BodyContent></Program>
+        ''')
+        report = generate(self.source, self.out, r're:Flags|States\[3\]|Unknown')
+        self.assertEqual(report['status'], 'needs_review')
+        self.assertIsNone(report['configuration'])
+        self.assertEqual(set(report['unresolved_types']), {'Flags', 'States[3]', 'Unknown'})
+        self.assertEqual({p.name for p in self.out.iterdir()}, {'static_variables.txt', 'workflow_status.json'})
+        rebuilt = generate(self.source, self.out, 'Unknown', default_type='DINT', force=True)
+        self.assertEqual(rebuilt['status'], 'done')
+        self.assertEqual(rebuilt['channels'][0]['type_source'], '用户指定')
 
-    def test_overwrite_rolls_back_list_if_configuration_cannot_be_replaced(self):
-        self.source.write_text('<project><ST>Step[1] := 20; Step[2] := 30;</ST></project>', encoding='utf-8')
-        result = extract(self.source, 'Step[1]', self.out)
-        before = {p.name: p.read_bytes() for p in self.out.iterdir()}
-        replace = Path.replace
+    def test_force_stages_complete_replacement_and_protects_other_output(self):
+        self.plcopen('<ST>Step[1] := 20; Step[2] := 30;</ST>')
+        first = generate(self.source, self.out, 'Step[1]')
+        before = Path(first['configuration']).read_bytes()
+        with self.assertRaisesRegex(ValueError, '未找到'):
+            generate(self.source, self.out, 'DoesNotExist', force=True)
+        self.assertEqual(Path(first['configuration']).read_bytes(), before)
+        self.assertEqual(list(self.root.glob('setup.previous-*')), [])
+        generate(self.source, self.out, 'Step[2]', force=True)
+        archive, = self.root.glob('setup.previous-*')
+        self.assertEqual((archive / Path(first['configuration']).name).read_bytes(), before)
+        other = self.root / 'trace-analysis'
+        other.mkdir()
+        (other / 'workflow_status.json').write_text('{"mode":"trace"}', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, '其他任务'):
+            generate(self.source, other, 'Step[1]', force=True)
 
-        def block_config(staged, target):
-            if target.name == result['trace_file']:
-                raise PermissionError('配置正在被打开')
-            return replace(staged, target)
+    def test_smc2_decodes_json_values_and_audits_malformed_input(self):
+        network = {'CMT': '步序[99]', 'CLs': [{'Var': '步序[10]'}, {'TXT': '步序[2] := 20;'}]}
+        payload = json.dumps(network, ensure_ascii=True)
+        wrapped = '<smc2><entry type="json" name="Run"><![CDATA[%s]]></entry></smc2>'
+        self.source.write_text(wrapped % payload, encoding='utf-8')
+        report = generate(self.source, self.out, '步序[*]', default_type='INT')
+        self.assertEqual([c['name'] for c in report['channels']], ['步序[2]', '步序[10]'])
+        self.assertEqual(report['status'], 'done')
+        self.source.write_text(wrapped % (payload + '\n{bad JSON'), encoding='utf-8')
+        report = generate(self.source, self.out, '步序[*]', default_type='INT', force=True)
+        self.assertEqual(report['status'], 'needs_review')
+        self.assertTrue(report['parse_issues'])
+        self.assertIsNone(report['configuration'])
 
-        with patch.object(Path, 'replace', block_config), self.assertRaises(PermissionError):
-            extract(self.source, 'Step[2]', self.out, overwrite=True)
-        self.assertEqual(before, {p.name: p.read_bytes() for p in self.out.iterdir()})
-
-    def test_no_static_match_or_input_collision_leaves_source_alone(self):
-        self.source.write_text('<project><ST>Step[index] := 20;</ST></project>', encoding='utf-8')
-        with self.assertRaisesRegex(ExtractionError, '没有匹配的静态变量'):
-            extract(self.source, 'Step[*]', self.out)
+    def test_unknown_xml_vendor_requires_explicit_configuration_format(self):
+        self.plcopen('<ST>Phase := 10;</ST>', header='')
+        with self.assertRaisesRegex(ValueError, '匹配空名称'):
+            generate(self.source, self.out, '*')
+        with self.assertRaisesRegex(ValueError, '指定 --format'):
+            generate(self.source, self.out, 'Phase')
         self.assertFalse(self.out.exists())
-        source = self.root / 'Source.csv'
-        raw = b'<project><fileHeader companyName="OMRON"/><ST>Step[1];</ST></project>'
-        source.write_bytes(raw)
-        with self.assertRaisesRegex(ExtractionError, '拒绝覆盖源码'):
-            extract(source, 'Step[*]', self.root, overwrite=True)
-        self.assertEqual(source.read_bytes(), raw)
-        self.assertFalse((self.root / 'static_variables.txt').exists())
+        self.assertEqual(generate(self.source, self.out, 'Phase', capture_format='inovance')['status'], 'done')
