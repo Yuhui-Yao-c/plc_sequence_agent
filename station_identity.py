@@ -114,9 +114,9 @@ def build_identity(run, variables, scopes):
             'source': 'variable_documentation' if doc else 'none',
             'needs_review': not doc,
         }
-    # Use evidence from the matching indexed channel to identify global arrays.
+    # Use the scope of the exact indexed channel, including qualified members.
     for variable in variables:
-        if not re.fullmatch(r'[^.\[\]]+\[\d+\]', variable):
+        if not re.search(r'\[\d+\]$', variable):
             continue
         counts = scopes.get(variable.casefold())
         if not counts:

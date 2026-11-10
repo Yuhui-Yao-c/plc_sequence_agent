@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import tempfile
@@ -108,6 +109,82 @@ class WorkflowRunTests(unittest.TestCase):
         self.assertEqual((evidence['relation'], evidence['description']), ('direct', '等待进料'))
         self.assertIn('Ready', evidence['direct'][0]['guard'])
         self.assertFalse((self.out / 'batches').exists())
+
+    def test_native_comparison_only_channels_keep_their_source_station(self):
+        from openpyxl import load_workbook
+
+        self.source.write_text('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10">'
+                               '<Program name="EM01_上料"><BodyContent><ST>'
+                               'IF State[1]=10 THEN Ready:=TRUE; END_IF; '
+                               'IF Machine.Phase[1]=10 THEN Done:=TRUE; END_IF;'
+                               '</ST></BodyContent></Program>'
+                               '<Program name="EM02_下料"><BodyContent><ST>'
+                               'IF State[2]=10 THEN Ready:=TRUE; END_IF; '
+                               'IF Machine.Phase[2]=10 THEN Done:=TRUE; END_IF;'
+                               '</ST></BodyContent></Program></Project>', encoding='utf-8')
+        self.trace.write_text('TraceType,Continuous\nSampleTimingType,interval\n'
+                              'StartRawTime,1700000000000000000\n'
+                              'Index,RawTime,State[1]:INT,State[2]:INT,Machine.Phase[1]:INT,Machine.Phase[2]:INT\n'
+                              '0,1700000000000000000,10,10,10,10\n1,1700000000012000000,20,20,20,20\n',
+                              encoding='utf-8')
+        self.cli('trace')
+        with (self.out / 'trace_collection_pairs.csv').open(encoding='utf-8-sig', newline='') as stream:
+            pairs = list(csv.DictReader(stream))
+        self.assertEqual({r['控制器']: r['构成要素'] for r in pairs}, {
+            'State[1]': 'EM01_上料', 'Machine.Phase[1]': 'EM01_上料',
+            'State[2]': 'EM02_下料', 'Machine.Phase[2]': 'EM02_下料',
+        })
+        self.assertEqual({r['源码关系'] for r in pairs}, {'unresolved'})
+        status = self.read('workflow_status.json')
+        self.assertEqual(status['workstation_xlsx']['workstation_groups'], 2)
+        with Path(status['workstation_xlsx']['out']).open('rb') as stream:
+            book = load_workbook(stream, read_only=True)
+            self.assertEqual({r[1] for r in book.active.iter_rows(min_row=4, values_only=True) if r[6]}, {
+                'EM01_上料\nMachine.Phase[1]', 'EM01_上料\nState[1]',
+                'EM02_下料\nMachine.Phase[2]', 'EM02_下料\nState[2]',
+            })
+            book.close()
+
+    def test_smc2_uses_annotated_comparison_when_earlier_comparison_has_no_comment(self):
+        self.source = self.root / 'PLC.smc2'
+        networks = []
+        for value, comment in ((10, ''), (10, '等待夹具到位'), (20, '启动定位'), (20, '等待定位完成')):
+            networks.append(json.dumps({'CMT': comment, 'CLs': [{'__type': 'F', 'Name': 'EQ', 'In': [
+                {'__type': 'PRM', 'Arg': 'In1', 'Var': 'Cell.Phase[4]'},
+                {'__type': 'PRM', 'Arg': 'In2', 'Var': str(value)},
+            ]}]}, ensure_ascii=False))
+        self.source.write_text('<smc2><entry type="json" name="Fixture"><![CDATA['
+                               + '\n'.join(networks) + ']]></entry></smc2>', encoding='utf-8')
+        with self.trace.open('a', encoding='utf-8') as stream:
+            stream.write('2,1700000000024000000,30\n')
+        self.cli('trace')
+        pairs = self.read('trace_source_evidence.json')['pairs']
+        evidence = pairs['Cell.Phase[4]=10|||Cell.Phase[4]=20']
+        self.assertEqual((evidence['relation'], evidence['description']), ('unresolved', '等待夹具到位'))
+        self.assertEqual(pairs['Cell.Phase[4]=20|||Cell.Phase[4]=30']['description'], '')
+        self.assertEqual(self.read('workflow_status.json')['a_sourced'], 1)
+
+    def test_existing_trace_workbook_export_flag_is_compatible(self):
+        from gen_workstation_xlsx import main as export
+        from openpyxl import load_workbook
+
+        self.cli('trace')
+        tables = []
+        for flag in ('--pairs', '--prediction'):
+            workbook = self.root / f'{flag[2:]}.xlsx'
+            with patch('sys.argv', ['gen_workstation_xlsx.py', flag, str(self.out / 'trace_collection_pairs.csv'),
+                                    '--out', str(workbook)]), redirect_stdout(io.StringIO()):
+                export()
+            with workbook.open('rb') as stream:
+                book = load_workbook(stream, read_only=True)
+                tables.append(list(book.active.values))
+                book.close()
+        self.assertEqual(*tables)
+        no_duration = self.root / 'pairs_without_duration.csv'
+        no_duration.write_text('开始标签,结束标签\nCell.Phase[4]=10,Cell.Phase[4]=20\n', encoding='utf-8')
+        with patch('sys.argv', ['gen_workstation_xlsx.py', '--prediction', str(no_duration)]):
+            with self.assertRaisesRegex(SystemExit, '中位数时长ms'):
+                export()
 
     def test_rebuild_protects_inputs_and_refuses_a_concurrent_writer(self):
         self.out.mkdir()

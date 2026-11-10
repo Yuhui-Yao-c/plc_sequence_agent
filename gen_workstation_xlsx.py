@@ -264,6 +264,7 @@ def generate(pairs, out=None, group_by='auto', proc_name=None, run=None, sheet='
     out = Path(out) if out else pairs.parent / f'{proc_name}_trace步序采集表.xlsx'
     indexed_stations = meta.get('source_evidence_audit', {}).get('indexed_stations', {})
     identity = load_station_identity(run)
+    channel_identity = {name: entry for name, entry in identity.items() if entry.get('source') == 'pou_evidence'}
     df = pd.read_csv(pairs, dtype=str, encoding='utf-8-sig', keep_default_na=False)
     required = {'开始标签', '结束标签', '中位数时长ms'}
     if missing := required - set(df.columns):
@@ -279,8 +280,11 @@ def generate(pairs, out=None, group_by='auto', proc_name=None, run=None, sheet='
     df['_序'] = df['开始标签'].str.extract(r'=\s*([+-]?\d+)\s*$', expand=False).fillna(str(10 ** 9)).map(int)
     if group_by == '构成要素':
         docs = load_var_docs(run)
-        df['_工位'] = [indexed_stations.get(channel) or workstation(comp, root, docs, identity)
-                    for channel, root, comp in zip(df['_步序变量'], df['_变量根'], df[group_by])]
+        df['_工位'] = [
+            indexed_stations.get(channel) or channel_identity.get(channel, {}).get('display')
+            or workstation(comp, root, docs, identity)
+            for channel, root, comp in zip(df['_步序变量'], df['_变量根'], df[group_by])
+        ]
         if '证据POU' in df:
             names = source_station_displays(zip(df['_工位'], df['_步序变量'], df['证据POU']), identity)
             df['_工位'] = df['_工位'].replace(names)
@@ -292,7 +296,8 @@ def generate(pairs, out=None, group_by='auto', proc_name=None, run=None, sheet='
     def sort_key(channel, root, station):
         if group_by == '构成要素' and channel in indexed_stations:
             return _em_sort_key(station)
-        entry = identity.get(root) or identity.get(re.sub(r'\[\d+\]', '', root))
+        entry = channel_identity.get(channel) if group_by == '构成要素' else None
+        entry = entry or identity.get(root) or identity.get(re.sub(r'\[\d+\]', '', root))
         return tuple(entry['sort_key']) if entry and 'sort_key' in entry else _em_sort_key(station)
 
     df['_工位序'] = [sort_key(channel, root, station)
@@ -427,14 +432,17 @@ def generate(pairs, out=None, group_by='auto', proc_name=None, run=None, sheet='
 
 def main():
     parser = argparse.ArgumentParser(description='从已有 Trace 状态对重导工作簿')
-    parser.add_argument('--pairs', required=True, help='trace_collection_pairs.csv')
+    parser.add_argument('--pairs', '--prediction', dest='pairs', required=True, help='trace_collection_pairs.csv')
     parser.add_argument('--run', help='动作描述和源码信息所在目录，缺省使用 CSV 所在目录')
     parser.add_argument('--out', help='输出 XLSX 路径')
     parser.add_argument('--proc-name', help='工序名称')
     parser.add_argument('--sheet', default='trace步序采集表')
     parser.add_argument('--group-by', choices=('auto', '构成要素', '证据POU', '控制器'), default='auto')
     args = parser.parse_args()
-    stats = generate(args.pairs, args.out, args.group_by, args.proc_name, args.run, args.sheet)
+    try:
+        stats = generate(args.pairs, args.out, args.group_by, args.proc_name, args.run, args.sheet)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
 

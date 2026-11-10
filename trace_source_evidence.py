@@ -257,22 +257,40 @@ class TraceSourceIndex:
                            row['node'], 'PLC XML' if model is not None else 'native_command_evidence.csv', 2)
 
         if model is not None:
-            # Use the source inventory for step notes independently of observed successors.
-            observations = defaultdict(dict)
-            for row in model['state_observations']:
-                variable = row['variable'].casefold()
-                if variable in wanted:
-                    observations[variable, row.get('binding_scope', '')].setdefault(row['value'], row)
-            for (variable, _), states in observations.items():
-                for value, row in states.items():
-                    self._note((variable, value), row['comment'], row['entry'], str(row['network']),
-                               row['node'], 'PLC XML', 1)
+            self._load_inventory(model['state_observations'], wanted)
         else:
             for row in _read_csv(run / 'indexed_candidates.csv'):
                 start = _state(row.get('开始标签', ''))
                 if start and start[0] in wanted and row.get('状态') != 'reset_hypothesis':
                     self._note(start, row.get('动作描述', ''), row.get('证据POU', ''), '',
                                row.get('证据节点', ''), 'indexed_candidates.csv', 1)
+
+    def _load_inventory(self, records, wanted):
+        observations = defaultdict(list)
+        comparison_scopes = defaultdict(set)
+        for row in records:
+            variable = row['variable'].casefold()
+            if variable not in wanted:
+                continue
+            observations[variable, row['value'], row.get('binding_scope', '')].append(row)
+            if (self.source_format == 'omron_iec61131_10' and row['kind'] in ('comparison', 'st_comparison')
+                    and row['operator'] == '=' and row['entry']):
+                comparison_scopes[variable].add(row['entry'].split('::', 1)[0])
+
+        # Native IEC inventory can identify the channel's POU without a local MOVE.
+        for variable, scopes in comparison_scopes.items():
+            if variable not in self.station_scopes and len(scopes) == 1:
+                self.station_scopes[variable].update(scopes)
+
+        for (variable, value, _), rows in observations.items():
+            notes = rows[:1]
+            if self.source_format == 'smc2':
+                comparisons = [r for r in rows if r['kind'] in ('comparison', 'st_comparison')
+                               and r['operator'] == '=']
+                notes = comparisons or [r for r in rows if r['kind'] in ('assignment', 'st_assignment')]
+            for row in notes:
+                self._note((variable, value), row['comment'], row['entry'], str(row['network']),
+                           row['node'], 'PLC XML', 1)
 
     def _note(self, state, comment, scope, network, source_id, source_file, rank):
         text = _comment_text(comment, state[1])
