@@ -7,6 +7,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
+from plc_trace import __version__
 from plc_trace.paths import PACKAGE_ROOT, PROJECT_ROOT, RESOURCE_ROOT
 from plc_trace.source.agent import run as extract
 from plc_trace.analysis.candidate_filter import filter_rows,filter_csv
@@ -221,7 +222,7 @@ def create(source,out,batch_size=120,force=False,pattern=None,manual=None,trace=
  (out/'candidate_audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
 
 
- meta={**run_meta,'version':'9.28','collection_projection':collection_stats,'atomic_projection':atomic_stats,'boundary_normalization':boundary_stats,'source':str(Path(source).resolve()),'manual':str(Path(manual).resolve()) if manual else None,'trace':str(Path(trace).resolve()) if trace else None,'extraction':report,'batches':batches,'batch_size':batch_size,'candidate_count':len(rows),'candidate_pairs_count':len(pair_rows),'event_count':len(events),'status':'PREPARED','filter':filter_summary,'process_triage':process_triage,'plcopen_action_trace':report.get('plcopen_action_trace'),'timing_relation_hypotheses':len(time_rows)}
+ meta={**run_meta,'version':__version__,'collection_projection':collection_stats,'atomic_projection':atomic_stats,'boundary_normalization':boundary_stats,'source':str(Path(source).resolve()),'manual':str(Path(manual).resolve()) if manual else None,'trace':str(Path(trace).resolve()) if trace else None,'extraction':report,'batches':batches,'batch_size':batch_size,'candidate_count':len(rows),'candidate_pairs_count':len(pair_rows),'event_count':len(events),'status':'PREPARED','filter':filter_summary,'process_triage':process_triage,'plcopen_action_trace':report.get('plcopen_action_trace'),'timing_relation_hypotheses':len(time_rows)}
  (out/'RESULT_SCHEMA.md').write_text('''# 每批结果JSON协议\n```json\n{"run_id":"复制本批输入的run_id","batch_id":"B00001","steps":[{"构成要素":"...","动作":"...","动作描述":"...","开始标签":"...","结束标签":"...","核验状态":"confirmed_or_candidate","证据候选ID":["C0000001"],"证据事件ID":["E0000001"],"说明":"..."}],"unresolved_events":[{"event_id":"E0000002","reason":"无法确定使能或反馈"}],"notes":"..."}\n```\n\n要求：开始标签必须来自候选开始标签（或明确写出证据候选ID）；结束标签必须来自候选结束标签；特殊的新条件只能标记 `source_review_required` 并注明源码位置，不能无证据认定已验证。每个事件ID必须出现在某个steps.证据事件ID或unresolved_events中；不可只凭同网络共现证明因果。每条step还要填写：过程类型（机械动作/加工保持/检测测量/工艺等待/交接数据/周期汇总/内部辅助/未分类）、统计对象、起点含义、终点含义、工艺依据、边界依据。缺字段仅进入复核队列，不能删主候选。\n''',encoding='utf-8')
  tmp=manifest.with_suffix('.tmp')
  tmp.write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')

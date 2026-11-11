@@ -12,3 +12,4 @@
 - 对齐完整工作流时比较证据内容与业务结果，单独核验本轮标识和程序指纹。修改本分支时保全 `full-workflow` 的分支指向。
 - 使用规范 Markdown。技能采用 YAML `name`、`description`，技能名与目录一致。Agent 配置和工作流放在命名 Agent 文件，领域协议放在相应技能。
 - 使用说明维护在 `README.md`，当前变更记入 `docs/CHANGELOG.md`，历史记录归档于 `docs/history.md`。
+- 版本与分支遵循 [VERSIONING.md](docs/VERSIONING.md)。程序版本只读取根目录 `VERSION`，发布时同步版本说明和验证记录，不再硬编码旧版本。

@@ -2,6 +2,7 @@
 """Trace analysis and capture setup using the full workflow source pipeline."""
 import argparse, json, sys
 from pathlib import Path
+from plc_trace import __version__
 from plc_trace.runtime.workflow import create, fingerprint, lock_run_dir, pipeline_fingerprint
 
 def _extract_source_evidence(src,out,include_comments=True,include_station_identity=True):
@@ -88,7 +89,7 @@ def _run_trace_mode(src,out,args):
     raise ValueError('输入或准备产物已变化')
   except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
    raise SystemExit(f'Trace准备结果无法续跑（{exc}）。请用新目录或显式 --force 重建。') from exc
- stats = {'mode':'trace','source':str(src),'trace':str(trace),'out':str(out),
+ stats = {'version':__version__,'mode':'trace','source':str(src),'trace':str(trace),'out':str(out),
           'preparation_reused': cached is not None}
  stage = 'source'
  try:
@@ -187,6 +188,7 @@ def _expand_trace_shorthand(parser, args):
 
 def main():
  p=argparse.ArgumentParser(description='PLC Trace 步序采集与采集配置')
+ p.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
  p.epilog = ('Trace 简写可用 源码 Trace路径 -t [-output 输出根目录] '
              '或 源码 匹配模式 --trace-setup [-output 输出根目录]')
  sub=p.add_subparsers(dest='mode',required=True)

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
+from plc_trace import __version__
 from plc_trace.capture.extract_step_variables import generate
 from plc_trace.cli import main
 from plc_trace.trace.trace_to_pairs import generate as analyze_trace
@@ -53,6 +54,7 @@ class TraceSetupTests(unittest.TestCase):
         with patch('sys.argv', args), redirect_stdout(io.StringIO()) as output:
             main()
         report = json.loads(output.getvalue())
+        self.assertEqual(report['version'], __version__)
         variables = ['Cell.Phase[2]', 'Cell.Phase[3]', 'Cell.Phase[10]']
         self.assertEqual((self.out / 'static_variables.txt').read_text(encoding='utf-8').splitlines(), variables)
         self.assertEqual(report['dynamic_variables'], ['Cell.Phase[Map[Grid[8]]]'])

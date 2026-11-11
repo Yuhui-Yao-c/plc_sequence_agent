@@ -17,6 +17,7 @@ from xml.etree import ElementTree as ET
 
 from lxml import etree
 
+from plc_trace import __version__
 from plc_trace.paths import PROJECT_ROOT, RESOURCE_ROOT
 
 from plc_trace.analysis.boundary_logic import integer, symbol
@@ -431,7 +432,7 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, def
             files[config] = (_sysmac_config(ordered, task) if capture_format == 'sysmac'
                              else _inovance_config(ordered, task, digest))
         report = {
-            'mode': 'trace_setup', 'status': 'done' if config else 'needs_review',
+            'version': __version__, 'mode': 'trace_setup', 'status': 'done' if config else 'needs_review',
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,
             'pattern': pattern, 'capture_format': capture_format, 'task_name': task,
             'task_name_source': '用户指定' if task_name else '模板默认',

@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 from typing import Any
+from plc_trace import __version__
 from plc_trace.analysis.boundary_logic import (parse, canonical, positive_states, exit_states, Expr,
                             BoundarySyntaxError, compatible)
 from plc_trace.analysis.feedback_successor import FeedbackResolver
@@ -311,7 +312,7 @@ def export_atomic(rows: list[dict],graph: dict,output_dir: str | Path,
     evidence={'schema':'plc.atomic_boundaries.v1','source_sha256':graph.get('source_sha256'),
               'input_rows':len(rows),'prediction_uses_gt':False,'groups':groups}
     (out/condition_name).write_text(json.dumps(evidence,ensure_ascii=False,indent=2),encoding='utf-8')
-    stats={'version':'9.13','input_complete_pairs':len(rows),'unique_atomic_pairs':len(result),
+    stats={'version':__version__,'input_complete_pairs':len(rows),'unique_atomic_pairs':len(result),
            'rows_with_atomic_output':sum(bool(r['原子对ID']) for r in lineage),
            'rows_without_atomic_output':sum(not r['原子对ID'] for r in lineage),
            'feedback_successor_audit_rows':len(feedback_rows),'review_rows_including_conditional':len(review),'categories':dict(status),

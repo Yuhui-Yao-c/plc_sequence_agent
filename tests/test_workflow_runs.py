@@ -8,6 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from plc_trace import __version__
 from plc_trace.description.action_describe import cmd_validate
 from plc_trace.cli import main
 from plc_trace.runtime.workflow import create, lock_run_dir, pipeline_fingerprint
@@ -54,6 +55,7 @@ class WorkflowRunTests(unittest.TestCase):
             resources / 'action_wordbook.json': '{}',
             project / '.opencode' / 'agents' / 'plc-sequence.md': 'agent rules',
             project / '.opencode' / 'skills' / 'example' / 'SKILL.md': 'skill rules',
+            project / 'VERSION': '10.1.0',
         }
         for path, contents in tracked.items():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +74,17 @@ class WorkflowRunTests(unittest.TestCase):
             test.parent.mkdir()
             test.write_text('test-only change', encoding='utf-8')
             self.assertEqual(pipeline_fingerprint(), before)
+
+    def test_version_query_works_without_a_task_from_an_external_directory(self):
+        project = Path(__file__).resolve().parents[1]
+        expected = (project / 'VERSION').read_text(encoding='utf-8').strip()
+        self.assertEqual(__version__, expected)
+        result = subprocess.run([sys.executable, str(project / 'plc_cli.py'), '--version'],
+                                cwd=self.root, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f'plc_cli.py {expected}')
+        self.assertEqual(result.stderr, '')
+        self.assertFalse(self.out.exists())
 
     def shorthand(self, value, marker, *suffix):
         cli = Path(__file__).resolve().parents[1] / 'plc_cli.py'
@@ -211,6 +224,9 @@ class WorkflowRunTests(unittest.TestCase):
         self.cli('trace')
         manifest = self.read('workflow_manifest.json')
         self.assertEqual(manifest['mode'], 'trace')
+        self.assertEqual(manifest['version'], __version__)
+        self.assertEqual(manifest['atomic_projection']['version'], __version__)
+        self.assertEqual(self.read('workflow_status.json')['version'], __version__)
         self.assertGreater(manifest['candidate_count'], 0)
         for name in ('sequence_candidates.csv', 'indexed_candidates.csv', 'indexed_events.csv',
                      'source_transition_edges.csv', 'source_transition_graph.json',
