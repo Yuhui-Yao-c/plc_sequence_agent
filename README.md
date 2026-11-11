@@ -20,8 +20,8 @@ opencode
 | 一　步序预测 | `源码路径 匹配模式 [Trace文件] [人工表路径]` | `predict` → 填批 → `finish` |
 | 二　GT 评价 | `预测CSV路径 GT路径 [源码路径]` | `evaluate` |
 | 三　人工表覆盖评价 | `预测CSV路径 人工表路径 [输出xlsx路径]` | `coverage` |
-| 四　Trace 步序采集 | `源码路径 Trace路径 -t [-output 输出目录]` | `trace` |
-| 五　Trace 采集配置 | `源码路径 匹配模式 --trace-setup [-output 输出目录]` | `trace-setup` |
+| 四　Trace 步序采集 | `源码路径 Trace路径 -t [-output 输出根目录]` | `trace` |
+| 五　Trace 采集配置 | `源码路径 匹配模式 --trace-setup [-output 输出根目录]` | `trace-setup` |
 
 完整参数和验收规则见 [AGENTS.md](AGENTS.md)。预测侧可用 `python plc_cli.py predict … --tagvars` 单独输出步序变量表。
 
@@ -30,11 +30,13 @@ opencode
 入口四可分析汇川等工程的 `.trace` 和欧姆龙 Sysmac 导出表或分卷目录。入口五从源码准备采集配置。
 
 ```text
-"source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "D:\PLC 输出\包 mylar 实测"
-"source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "D:\PLC 输出\包 mylar 配置"
+"source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "D:\PLC 输出"
+"source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "D:\PLC 输出"
 ```
 
-省略 `-output` 时，入口四输出到 `outputs/<源码名>`，入口五输出到 `outputs/<源码名>_trace_setup`。默认目录被占用时选择带数字后缀的新目录。两种简写也可在终端加 `python plc_cli.py` 执行。完整 CLI 使用 `--out`。
+`-output` 指定输出根目录。上述两个任务分别生成 `D:\PLC 输出\包mylar_trace\` 和 `D:\PLC 输出\包mylar_trace_setup\`，交付表和中间产物放在各自子目录内。工序名沿用交付表的识别规则。
+
+省略 `-output` 时使用 `outputs` 根目录，子目录规则相同。同名子目录已有产物时自动选 `_2`、`_3` 等新目录。两种简写也可在终端加 `python plc_cli.py` 执行。完整 CLI 的 `--out` 指定实际运行子目录，续跑从 `workflow_status.json` 的 `out` 读取该路径。
 
 ## 主要交付物
 

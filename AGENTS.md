@@ -18,8 +18,8 @@
 - 显式命令以子命令为准。`predict --tagvars`（兼容别名 `predict -t`）仍是预测侧的步序变量清单。
 - 对话简写先识别第三项 `--trace-setup`（入口五）或 `-t`（入口四），再检查第二项是否为所选入口需要的匹配模式或 Trace 路径。带标记的输入类型不符时指出具体问题。
 - 其余简写按下列输入类型识别。两个路径可能同时符合 GT 评价和人工表覆盖评价时，按用户说明、文件角色和实际格式确认用途。仅凭 `.xlsx` 后缀不能判定 GT 或人工表。
-- 入口四、五允许在标记后加一次 `-output "输出目录"`。路径或匹配模式含空格时整段加引号。中括号表示可选，不属于命令文本。`-output` 指定目录，完整 CLI 对应 `--out`。
-- 新任务用独立空目录。省略输出时使用该入口的默认路径，目录被占用时用 `_2`、`_3` 等可用后缀。显式指定路径时沿用该路径，冲突时报告原因。仅在明确要求重建时使用 `--force`。程序将识别到的旧运行整体归档为邻接的 `.previous-…` 目录。
+- 入口四、五允许在标记后加一次 `-output "输出根目录"`，省略时根目录为 `outputs`。脚本在根目录下按工序创建本轮子目录。入口四使用 `<工序名>_trace`，入口五使用 `<工序名>_trace_setup`。复用交付表的工序名规则，优先取源码所在工序目录，缺失时从源码名推断。路径或模式含空格时整段加引号，中括号表示可选。
+- 新任务用独立空目录。入口四、五在默认或指定根目录下选择可用子目录，已有产物时加 `_2`、`_3` 等后缀。完整 CLI 的 `--out` 接收实际运行目录，续跑使用该轮状态文件的 `out`。仅在明确要求重建时使用 `--force`，程序将识别到的旧运行整体归档为邻接的 `.previous-…` 目录。
 - 输出路径与源码、Trace、项目根及其他任务产物分开。续跑使用本轮原目录，读取当前批次和证据。历史批次、索引及语义结论属于原运行。
 
 ## 五个入口
@@ -73,18 +73,18 @@ GT 是用于独立评价的标准答案。可选源码为 PLCopen、SMC2 或 Sys
 
 ### 入口四　Trace 步序采集
 
-**输入**　`源码路径 Trace路径 -t [-output 输出目录]`
+**输入**　`源码路径 Trace路径 -t [-output 输出根目录]`
 
 - 源码支持 `.xml/.smc2/.txt`，提供控制、步注释和工位证据。Trace 接受 TwinCAT Scope `.trace`，以及 Sysmac 的 `.csv/.tsv/.txt` 或采集目录。
-- 默认输出 `outputs/<源码名>`。工序名优先取源码所在工序目录。比如 `source/包mylar/PLC程序.xml` 生成 `包mylar_trace步序采集表.xlsx`。
+- 默认输出 `outputs/<工序名>_trace`。比如 `source/包mylar/PLC程序.xml` 的产物进入 `outputs/包mylar_trace`，工作簿名为 `包mylar_trace步序采集表.xlsx`。
 
 **命令**
 
 ```powershell
-python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "outputs/包 mylar 实测"
+python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "outputs"
 ```
 
-完整命令 `python plc_cli.py trace --source "源码" --trace "Trace路径" --out "目录"`。可加 `--pattern` 限定变量、`--proc-name` 指定工序、`--sample-interval-ms` 指定已知采样间隔。缺省分析全部可解析变量。存在不同的手动采样间隔时，按采集分别运行。
+此例输出到 `outputs/包mylar_trace`。完整命令 `python plc_cli.py trace --source "源码" --trace "Trace路径" --out "实际运行子目录"`。可加 `--pattern` 限定变量、`--proc-name` 指定工序、`--sample-interval-ms` 指定已知采样间隔。缺省分析全部可解析变量。存在不同的手动采样间隔时，按采集分别运行。
 
 **执行**
 
@@ -100,17 +100,17 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录"
 
 ### 入口五　Trace 采集配置
 
-**输入**　`源码路径 匹配模式 --trace-setup [-output 输出目录]`
+**输入**　`源码路径 匹配模式 --trace-setup [-output 输出根目录]`
 
-从 PLCopen、Sysmac IEC61131-10 或 SMC2 源码提取可配置的显式引用。默认输出 `outputs/<源码名>_trace_setup`。
+从 PLCopen、Sysmac IEC61131-10 或 SMC2 源码提取可配置的显式引用。默认输出 `outputs/<工序名>_trace_setup`。
 
 **命令**
 
 ```powershell
-python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "outputs/包 mylar 采集配置"
+python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "outputs"
 ```
 
-完整命令 `python plc_cli.py trace-setup --source "源码" --pattern "模式" --out "目录"`。可用 `--regex` 代替 `--pattern`，或用 `--format`、`--task-name` 指定采集客户端设置。
+此例输出到 `outputs/包mylar_trace_setup`。完整命令 `python plc_cli.py trace-setup --source "源码" --pattern "模式" --out "实际运行子目录"`。可用 `--regex` 代替 `--pattern`，或用 `--format`、`--task-name` 指定采集客户端设置。
 
 **执行**　由 `extract_step_variables.py` 按完整变量路径匹配显式引用，核对固定下标、声明类型与程序作用域。配置交给对应的采集客户端。导出实测记录后可独立进入入口四。
 

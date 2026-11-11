@@ -344,19 +344,20 @@ def _expand_trace_shorthand(parser, args):
         parser.error('Trace 简写须为 源码 Trace路径 -t 或 源码 匹配模式 --trace-setup')
 
     source, value, marker, *suffix = args
+    root = Path('outputs')
     if suffix:
         if len(suffix) != 2 or suffix[0] != '-output' or not suffix[1].strip() or suffix[1].startswith('-'):
-            parser.error('简写的输出选项须在末尾写成 -output "输出目录"')
-        out = suffix[1]
-    else:
-        name = Path(source).stem
-        if marker == '--trace-setup':
-            name += '_trace_setup'
-        out = Path('outputs') / name
-        index = 2
-        while out.is_symlink() or (out.exists() and (not out.is_dir() or any(out.iterdir()))):
-            out = out.with_name(f'{name}_{index}')
-            index += 1
+            parser.error('简写的输出选项须在末尾写成 -output "输出根目录"')
+        root = Path(suffix[1])
+
+    from utils import infer_proc_name
+    proc_name = infer_proc_name(source)
+    name = proc_name + ('_trace_setup' if marker == '--trace-setup' else '_trace')
+    out = root / name
+    index = 2
+    while out.is_symlink() or (out.exists() and (not out.is_dir() or any(out.iterdir()))):
+        out = root / f'{name}_{index}'
+        index += 1
 
     mode, option = routes[marker]
     return [mode, f'--source={source}', f'{option}={value}', f'--out={out}']
@@ -364,8 +365,8 @@ def _expand_trace_shorthand(parser, args):
 
 def main():
  p=argparse.ArgumentParser(description='PLC Agent v9.28，候选保全、逻辑后继统一、动作描述纯中文化(A档步注释自动+B档LLM补充/变量文档注入/简短动作重点)、predict生成A档+B档(finish一次完成)、预测评价隔离、trace跳变分析与时长回填(--trace)、覆盖评价(--manual自动触发)、步序变量清单提取(--tagvars/-t短路模式)、STCode状态比较补充轨道、trace步序采集模式(trace子命令)')
- p.epilog = ('Trace 简写可用 源码 Trace路径 -t [-output 输出目录] '
-             '或 源码 匹配模式 --trace-setup [-output 输出目录]')
+ p.epilog = ('Trace 简写可用 源码 Trace路径 -t [-output 输出根目录] '
+             '或 源码 匹配模式 --trace-setup [-output 输出根目录]')
  sub=p.add_subparsers(dest='mode',required=True)
  x=sub.add_parser('predict',help='源码+变量模式；不接受GT')
  x.add_argument('--source',required=True);x.add_argument('--pattern');x.add_argument('--out',required=True);x.add_argument('--batch-size',type=int,default=120);x.add_argument('--force',action='store_true',help='归档旧输出目录并从空目录开始'); x.add_argument('--manual',default=None,help='可选：人工采集表路径，传入后finish自动运行覆盖评价');x.add_argument('--trace',default=None,help='可选：运行时trace文件路径(.trace)，传入后finish自动分析跳变并回填交付表时长列');x.add_argument('--tagvars','-t',action='store_true',help='步序变量提取模式：跳过候选/批次/交付表，只输出<工序名>_步序变量表.xlsx');x.set_defaults(func=predict)
