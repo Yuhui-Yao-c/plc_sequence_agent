@@ -8,13 +8,13 @@ compatibility: opencode
 
 ## 触发
 
-入口四读取实测记录时加载。
+入口一读取实测记录时加载。
 
 ## 输入
 
 | 入口 | 输入 | Python 模块 |
 | --- | --- | --- |
-| 四 | 源码和 TwinCAT Scope `.trace`、Sysmac 导出表或采集目录 | `trace_to_pairs.py` |
+| 一 | 源码和 TwinCAT Scope `.trace`、Sysmac 导出表或采集目录 | `plc_trace.trace.trace_to_pairs` |
 
 TwinCAT Scope 文件是 UTF-16 XML，`TraceVariable` 下含 `Values`、`Timestamps`，相对时间单位为毫秒。`StartTime` 提供绝对基准。
 
@@ -22,7 +22,7 @@ Sysmac 输入是 `.csv/.tsv/.txt`，也可用含这类表的目录。采样行�
 
 ## 执行
 
-### 入口四的观测状态对
+### 入口一的观测状态对
 
 1. 目录顶层保留 `YYYYMMDDhhmmss_00001.csv` 等原名。按前缀识别采集，按卷号读取，核验同次采集的通道、设置、`StartRawTime` 和递增索引。重命名的文件仅在采集归属可以唯一确认时读取。索引缺口切断连续段，重复分卷与冲突按审计处理。
 2. 每组独立识别相邻样本跳变和稳定段。非活动通道保留元数据，长空闲段作为周期边界候选。不同采集与断开的索引段之间不构造跳变。保留返回步 0 的观测对。
@@ -33,8 +33,8 @@ Sysmac 输入是 `.csv/.tsv/.txt`，也可用含这类表的目录。采样行�
 
 | 入口 | 核对文件 | 核对内容 |
 | --- | --- | --- |
-| 四 | `trace_collection_pairs.csv`、`trace_pairs_summary.json`、`trace_pairs_review.csv` | 唯一状态对、发生次数、中位数、估算时长次数、采集分组和源码待核 |
-| 四 | 本轮目录下 `trace_variables.json`、`trace_jumps.csv`、`trace_segments.csv`、`trace_cycles.json` | 活跃与未活动变量、采样跳变、连续段和周期候选 |
+| 一 | `trace_collection_pairs.csv`、`trace_pairs_summary.json`、`trace_pairs_review.csv` | 唯一状态对、发生次数、中位数、估算时长次数、采集分组和源码待核 |
+| 一 | 本轮目录下 `trace_variables.json`、`trace_jumps.csv`、`trace_segments.csv`、`trace_cycles.json` | 活跃与未活动变量、采样跳变、连续段和周期候选 |
 
 ## 协作
 

@@ -1,0 +1,867 @@
+# -*- coding: utf-8 -*-
+"""Render the workstation workbook from prediction or observed Trace pairs.
+
+Rows are grouped by workstation and preserve the pair's start and end labels.
+Trace reports also display description provenance and validated clause evidence.
+
+Usage:
+  python -m plc_trace.output.gen_workstation_xlsx --prediction outputs/X/final_prediction_pairs.csv [--proc-name 工序名] [--group-by auto|构成要素|证据POU|控制器]
+  [--out outputs/X/<工序名>_步序采集表.xlsx]  (缺省输出: prediction 同目录/<工序名>_步序采集表.xlsx, 最终交付文件命名)
+  [--run outputs/X]  (directory containing the action-trace / command-evidence files)
+The prediction file and evidence files are only read; never modified.
+
+工位分组缺省auto：构成要素含SC04命名用构成要素，否则有证据POU列用证据POU；
+也可显式指定 证据POU（取「区域::POU」的区域前缀）或 控制器。表头上方注明工序名、来源文件、行数、
+SHA256戳与分组方式；排序仅为展示查找便利，不代表执行顺序或工艺路径。
+步序/标签内容完全来自同一行预测记录与源码证据文件，无推断文本；
+该xlsx仅供人阅读，评价仍直接读CSV。finish(workflow.validate)成功后自动生成本表。
+"""
+import argparse, hashlib, json, re, os
+from copy import copy
+from math import ceil
+from unicodedata import east_asian_width
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import quote_sheetname
+from openpyxl.worksheet.hyperlink import Hyperlink
+
+from plc_trace.output.station_identity import source_station_displays
+from plc_trace.output.utils import load_station_identity, infer_proc_name
+
+
+def clean_doc(text: str) -> str:
+    """Documentation may wrap a GrpComment XML fragment with embedded monitor
+    JSON ( <Sub/>{k:...} ); keep only the plain zh name before <Sub/>."""
+    t = str(text)
+    m = re.search(r'<GrpComment_zh-cn>(.*?)</GrpComment_zh-cn>', t, re.S)
+    if m:
+        t = m.group(1)
+    i = t.find('<Sub/>')
+    if i >= 0:
+        t = t[:i]
+    t = re.sub(r'<[^>]+>', '', t)
+    return re.sub(r'\s+', '', t).strip()
+
+
+def load_var_docs(run: str):
+    """variable root name -> cleaned Chinese documentation (source facts)."""
+    docs = {}
+    if run:
+        p = os.path.join(run, 'variable_documentation.json')
+        if os.path.exists(p):
+            data = json.load(open(p, encoding='utf-8'))
+            st = data.get('stations') or {}
+            src = st if st else data.get('all', {})
+            for k, v in src.items():
+                c = clean_doc(v)
+                if c:
+                    docs[k] = c
+    return docs
+
+
+def load_network_comments(run: str) -> dict:
+    """v9.18: load network_comments.json (action_name -> [comment, ...]).
+    Returns {} when absent."""
+    if run:
+        p = os.path.join(run, 'network_comments.json')
+        if os.path.exists(p):
+            try:
+                return json.load(open(p, encoding='utf-8'))
+            except Exception:
+                return {}
+    return {}
+
+
+def load_trace_runtime(run: str) -> dict:
+    """v9.23: load trace_step_runtime.csv from trace_analysis/ subdirectory.
+    v9.28: also load trace_collection_pairs.csv (trace mode) with 中位数时长ms.
+    Returns dict: (start_label, end_label) -> duration_ms (int or None).
+    Returns {} when absent (no trace analyzed — duration column stays empty).
+    Priority: trace_collection_pairs.csv (trace mode, median) > trace_analysis/trace_step_runtime.csv (predict mode, avg)."""
+    if not run:
+        return {}
+    rt = {}
+    # v9.28: trace mode — trace_collection_pairs.csv with 中位数时长ms
+    p_trace = os.path.join(run, 'trace_collection_pairs.csv')
+    if os.path.exists(p_trace):
+        try:
+            import csv as _csv
+            with open(p_trace, encoding='utf-8-sig', newline='') as f:
+                for row in _csv.DictReader(f):
+                    dur = (row.get('中位数时长ms') or '').strip()
+                    key = (row.get('开始标签', ''), row.get('结束标签', ''))
+                    try:
+                        rt[key] = int(dur) if dur else None
+                    except ValueError:
+                        rt[key] = None
+            if rt:
+                return rt
+        except Exception:
+            pass
+    # v9.23: predict mode — trace_analysis/trace_step_runtime.csv with 平均时长ms
+    p_pred = os.path.join(run, 'trace_analysis', 'trace_step_runtime.csv')
+    if os.path.exists(p_pred):
+        try:
+            import csv as _csv
+            with open(p_pred, encoding='utf-8-sig', newline='') as f:
+                for row in _csv.DictReader(f):
+                    dur = (row.get('平均时长ms') or '').strip()
+                    key = (row.get('开始标签', ''), row.get('结束标签', ''))
+                    try:
+                        rt[key] = int(dur) if dur else None
+                    except ValueError:
+                        rt[key] = None
+            return rt
+        except Exception:
+            return {}
+    return {}
+
+
+_GENERIC_COMMENT = re.compile(
+    r'^(启动条件|运行条件|互锁条件|报警|初始化|模式定义|工位计时|非同启同停|自动步计时|'
+    r'网络注释|程序版本号|主控指示灯|步序描述|自动运行|模式跳转|记忆传递|数据传递|'
+    r'IO转换|动子上电|动子自由|流程监控|命令传递|站点丢失|站点错误|'
+    r'三色灯|指示灯|蜂鸣器|急停|安全门|光电开关)'
+)
+
+
+def _best_comments(comments: list, max_n: int = 2) -> str:
+    """Pick the most specific comments (non-generic) from a list."""
+    specific = [c for c in comments if not _GENERIC_COMMENT.match(c)]
+    pool = specific if specific else comments
+    return ' | '.join(pool[:max_n])
+
+
+def _station_code(root: str) -> str:
+    """Station number from the state-variable root.
+    omron native structs 'stEM310' -> 'EM310' (strip leading st/St/ST only when
+    followed by an uppercase letter); 'udt_EM01'/'udt_EM07_1' -> 'EM01'/'EM07_1'
+    (strip udt_ prefix, v9.16); SC04-style roots ('ST06', 'HJXHX_ST06')
+    are already the station number and kept verbatim.
+    Returns '' for NaN/None/empty so it never leaks into display names."""
+    s = str(root)
+    if not s.strip() or s.lower() in ('nan', 'none'):
+        return ''
+    # v9.16: udt_EMxx -> EMxx (omron global user-data-type station structs)
+    m = re.match(r'^udt_(EM\d+(?:_\d+)?)$', s)
+    if m:
+        return m.group(1)
+    m = re.match(r'^[sS][tT]([A-Z].*)$', s)
+    return m.group(1) if m else s
+
+
+def workstation(comp: str, var_root: str = '', var_docs: dict = None,
+                si_map: dict = None) -> str:
+    """Resolve a workstation display name for a row.
+
+    v9.20 priority:
+      0. POU path in 构成要素 (EMxx_name::SCxx_...) — direct extraction,
+         handles codesys array-type state machines where 构成要素 carries
+         the full POU path.  This is the most specific source.
+      1. station_identity.json (built by predict) — provides code, doc, sort_key.
+         For array-type controllers (m_nNextAutoStep[N]), identity keys include
+         the array index so each index resolves to a distinct workstation.
+      2. 构成要素 SC04 Chinese suffix — sub-station granularity refinement.
+      3. var_docs fallback (v9.16 path).
+      4. bare code + section fallback (v9.16 path).
+    """
+    var_docs = var_docs or {}
+    si_map = si_map or {}
+    var_root = str(var_root) if pd.notna(var_root) and var_root else ''
+    parts = [p.strip() for p in str(comp).split(';')]
+    cjk = re.compile(r'[\u4e00-\u9fff]')
+
+    # v9.20: POU path extraction (EMxx_name::SCxx_...)
+    for p in parts:
+        m = re.match(r'(EM\d+)_(.+?)(?:_L\d+.*)?::', p)
+        if m and cjk.search(m.group(2)):
+            code = m.group(1)
+            name = re.sub(r'_L\d+.*$', '', m.group(2))
+            return f'{code}_{name}'
+
+    # v9.17/v9.20: station_identity — try indexed key first, then bare root.
+    si_entry = si_map.get(var_root) if var_root else None
+    if not si_entry and var_root:
+        bare_root = re.sub(r'\[\d+\]', '', var_root)
+        if bare_root != var_root:
+            si_entry = si_map.get(bare_root)
+    code = si_entry['code'] if si_entry else (_station_code(var_root) if var_root else '')
+
+    # Sub-station granularity: SC04 Chinese suffix is finer than station_identity.
+    # Use the station_identity CODE (never lose identity) + the sub-station name.
+    best = None
+    for p in parts:
+        m = re.match(r'SC04_(?:RUN\d*_?|Run\d*_?)\s*(.+)', p)
+        if m and m.group(1).strip():
+            name = m.group(1).strip()
+            if cjk.search(name):
+                return f'{code}_{name}' if code else name
+            best = best or name
+        elif p.startswith('SC04') and cjk.search(p):
+            return p
+
+    # v9.17: station_identity display (station-level, e.g. EM04_长边清洗工位)
+    if si_entry and si_entry.get('doc'):
+        return si_entry['display']
+
+    # v9.16 fallback: var_docs (station-level Chinese name)
+    if var_root:
+        root = var_root.split('.')[0].split('[')[0]
+        if root in var_docs:
+            zh = var_docs[root]
+            return f'{code}_{zh}' if code else zh
+    # non-Chinese best (e.g. '1' from 'SC04_Run1') as last resort before bare code
+    if best:
+        return f'{code}_{best}' if code else best
+    # v9.16: bare section name (e.g. 'SC04_Run') with no Chinese suffix and no
+    # var_docs hit — prefix the station code from the variable root so each EM
+    # is a distinct workstation block instead of collapsing 12 EMs into one
+    # mixed 'SC04_Run' block with broken step ordering.
+    if code:
+        sec = parts[0] if parts and parts[0].startswith('SC04') else ''
+        return f'{code}_{sec}' if sec else code
+    for p in parts:
+        if p.startswith('SC04'):
+            return p
+    return parts[0] if parts else str(comp)
+
+
+def _em_sort_key(name: str):
+    """Numeric sort key for workstation names like 'EM07_1_长边焊接1工位'
+    or 'ST06_铜上盘' — extracts (prefix_num, sub_num) so EM01<EM02<…<EM10
+    and EM07_1<EM07_2; non-matching names sort last stably."""
+    m = re.search(r'(?:EM|ST)(\d+)(?:_(\d+))?', str(name))
+    if m:
+        return (int(m.group(1)), int(m.group(2)) if m.group(2) else 0)
+    return (10 ** 9, 0)
+
+
+def cell_str(x) -> str:
+    try:
+        if pd.isna(x):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(x)
+
+
+def _text_cell(ws, row, column, value):
+    cell = ws.cell(row=row, column=column, value=value)
+    if isinstance(value, str):
+        # Keep source annotations such as ====判断步==== as literal text.
+        cell.data_type = 's'
+    return cell
+
+
+def _wrapped_lines(text, width):
+    lines = 0
+    for line in text.splitlines():
+        length = sum(2 if east_asian_width(ch) in ('W', 'F') else 1 for ch in line)
+        lines += max(1, ceil(length / width))
+    return lines
+
+
+TRACE_STEP_HEIGHT = 28
+_TRACE_HEADER = Font(name='Arial', bold=True, size=10, color='FFFFFF')
+_TRACE_HEADER_FILL = PatternFill('solid', fgColor='25435D')
+_TRACE_BODY = Font(name='Arial', size=9, color='23364B')
+_TRACE_REVIEW = Font(name='Arial', size=9, color='9C3829')
+_TRACE_BORDER = Border(bottom=Side(style='thin', color='DBE4EC'), right=Side(style='thin', color='E5EBF1'))
+_TRACE_GROUP_FILL = PatternFill('solid', fgColor='F2F7FB')
+_TRACE_TOTAL_FILL = PatternFill('solid', fgColor='E8F0F7')
+_TRACE_NUMBER = Alignment(horizontal='right', vertical='center', indent=1)
+
+
+def _trace_details(book):
+    sheet = book.create_sheet('文本详情')
+    sheet.sheet_view.showGridLines = False
+    for column, (label, width) in enumerate(
+            (('主表行', 10), ('开始标签', 31), ('结束标签', 31), ('字段', 18), ('完整内容', 112)), 1):
+        cell = _text_cell(sheet, 1, column, label)
+        cell.fill, cell.font = _TRACE_HEADER_FILL, _TRACE_HEADER
+        sheet.column_dimensions[cell.column_letter].width = width
+    sheet.row_dimensions[1].height = 25
+    sheet.freeze_panes = 'A2'
+    return sheet
+
+
+def _link_trace_detail(detail, row, original, start, end, field):
+    for column, value in enumerate((original.row, start, end, field, original.value), 1):
+        cell = _text_cell(detail, row, column, value)
+        cell.font, cell.border = _TRACE_BODY, _TRACE_BORDER
+        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    back = detail.cell(row, 1)
+    back.hyperlink = Hyperlink(ref=back.coordinate,
+                               location=f'{quote_sheetname(original.parent.title)}!{original.coordinate}',
+                               tooltip='返回步序采集表')
+    back.font = Font(name='Arial', size=9, underline='single', color='235B87')
+    original.hyperlink = Hyperlink(ref=original.coordinate, location=f'{quote_sheetname(detail.title)}!E{row}',
+                                   tooltip='查看完整文本')
+    font, alignment = copy(original.font), copy(original.alignment)
+    font.underline, alignment.vertical = 'single', 'top'
+    original.font, original.alignment = font, alignment
+    detail.row_dimensions[row].height = min(409, max(TRACE_STEP_HEIGHT, 15 * _wrapped_lines(original.value, 106) + 8))
+
+
+def pou_station(pou) -> str:
+    first = cell_str(pou).split(";")[0].strip()
+    area = first.split("::")[0].strip()
+    return area or "未分组"
+
+
+def pick_group_by(df) -> str:
+    """auto: actual section naming -> 构成要素 (SC04 sections or equivalent omron
+    struct paths like stEM310.ProcessCtrl.iCmdStep, which are equally per-workstation);
+    fall back to 证据POU only when 构成要素 is absent/empty."""
+    if "构成要素" in df.columns:
+        comp = df["构成要素"].fillna("").astype(str)
+        if comp.str.strip().ne("").mean() >= 0.5:
+            return "构成要素"
+    if "证据POU" in df.columns:
+        return "证据POU"
+    return "构成要素"
+
+
+def var_of(label: str):
+    m = re.match(r'\s*([A-Za-z_]\w*(?:\[[^\]]*\])?(?:\.\w+(?:\[[^\]]*\])?)*)\s*=', str(label))
+    return m.group(1) if m else None
+
+
+def _trace_channel_sort_key(name):
+    parts = re.split(r'([+-]?\d+)', name.casefold())
+    natural = tuple(int(part) if i % 2 else part for i, part in enumerate(parts))
+    return natural, name
+
+
+def load_action_map(run: str):
+    """(state_variable, state_value) -> ordered unique action-variable list.
+    PLCopen action trace and omron wired command evidence, source facts only."""
+    amap = {}
+    if run:
+        p = os.path.join(run, 'plcopen_action_trace.csv')
+        if os.path.exists(p):
+            t = pd.read_csv(p, dtype=str)
+            for _, r in t.iterrows():
+                sym = r.get('target_symbol')
+                if pd.isna(sym) or not str(sym).strip() or str(r.get('target_type')) != 'coil':
+                    continue
+                key = (str(r.get('state_variable')), str(r.get('state_value')))
+                lst = amap.setdefault(key, [])
+                if str(sym) not in lst:
+                    lst.append(str(sym))
+        p = os.path.join(run, 'native_command_evidence.csv')
+        if os.path.exists(p):
+            t = pd.read_csv(p, dtype=str)
+            for _, r in t.iterrows():
+                start = str(r.get('start', ''))
+                if '=' not in start:
+                    continue
+                var, _, val = start.rpartition('=')
+                arg = str(r.get('arguments', '')).strip()
+                cmd = str(r.get('command', '')).strip()
+                if not arg or cmd in ('coil_write',):
+                    continue
+                key = (var, val)
+                lst = amap.setdefault(key, [])
+                if arg not in lst:
+                    lst.append(arg)
+        # omron ST assignments: events carry the full guard containing the
+        # state anchor; the assigned variable is that state's action write.
+        p = os.path.join(run, 'indexed_events.csv')
+        if os.path.exists(p):
+            t = pd.read_csv(p, dtype=str)
+            if 'command' in t.columns:
+                st = t[t['command'].fillna('') == 'ST_assignment']
+                anchor = re.compile(
+                    r'([A-Za-z_]\w*(?:\[[^\]]*\])?(?:\.\w+(?:\[[^\]]*\])?)*)'
+                    r'=([+-]?\d+)(?![\w#])')
+                for _, r in st.iterrows():
+                    arg = str(r.get('arguments', ''))
+                    if ':=' not in arg:
+                        continue
+                    var_name = arg.split(':=', 1)[0].strip()
+                    if not var_name:
+                        continue
+                    for var, val in set(anchor.findall(str(r.get('guard', '')))):
+                        lst = amap.setdefault((var, val), [])
+                        if var_name not in lst:
+                            lst.append(var_name)
+    return amap
+
+
+def step_text(row, amap) -> str:
+    s, e = str(row['开始标签']), str(row['结束标签'])
+    vs, ve = var_of(s), var_of(e)
+    acts = []
+    if vs:
+        m = re.search(r'=\s*(\S+)\s*$', s)
+        if m:
+            acts = amap.get((vs, m.group(1)), [])
+    if acts:
+        shown = acts[:4] + (['…'] if len(acts) > 4 else [])
+        txt = '动作变量: ' + '; '.join(shown)
+    elif vs and ve and vs == ve:
+        ns = re.search(r'=\s*(\S+)\s*$', s)
+        ne = re.search(r'=\s*(\S+)\s*$', e)
+        txt = f'{vs}: {ns.group(1)}→{ne.group(1)}' if (ns and ne) else f'{s} → {e}'
+    else:
+        txt = f'{s} → {e}'
+    notes = re.findall(r'\*[^*]{2,40}\*', str(row.get('动作描述', '') or ''))
+    if notes:
+        txt += '  ' + ' '.join(notes[:2])
+    return txt
+
+
+def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sheet='步序采集表', *, b_tier_pending=None):
+    """Build the workstation delivery xlsx. Inputs are read-only; returns stats dict.
+    group_by='auto' picks 构成要素 for SC04 naming, else 证据POU when available.
+    out/proc_name default like the CLI: <proc_name>_步序采集表.xlsx beside the prediction.
+    Raises ValueError on missing columns (caller decides how to report)."""
+    run = run or os.path.dirname(prediction)
+    is_trace = sheet == 'trace步序采集表' or os.path.basename(prediction) == 'trace_collection_pairs.csv'
+    indexed_stations = {}
+    if is_trace:
+        summary_path = os.path.join(run, 'trace_pairs_summary.json')
+        if os.path.isfile(summary_path):
+            with open(summary_path, encoding='utf-8-sig') as stream:
+                summary = json.load(stream)
+            proc_name = proc_name or summary.get('proc_name')
+            indexed_stations = summary.get('source_evidence_audit', {}).get('indexed_stations', {})
+    proc_name = infer_proc_name(None, run, proc_name)
+    if not out:
+        suffix = 'trace步序采集表' if is_trace else '步序采集表'
+        out = os.path.join(os.path.dirname(prediction), f'{proc_name}_{suffix}.xlsx')
+    amap = {} if is_trace else load_action_map(run)
+    # 动作描述（A档模板/B档LLM工艺语义，action_describe.py 产物；存在则升级 col C）
+    # v9.19: fallback chain: action_desc_final.csv (B+A merged) -> action_desc_a.csv (A only)
+    desc_map = {}
+    desc_stats = None
+    dp = os.path.join(run, 'action_desc_final.csv')
+    if not os.path.exists(dp):
+        dp = os.path.join(run, 'action_desc_a.csv')
+    if os.path.exists(dp):
+        dd = pd.read_csv(dp, dtype=str, encoding='utf-8-sig')
+        # A档 has 'A档描述' not '动作描述'; normalize column names
+        if 'A档描述' in dd.columns and '动作描述' not in dd.columns:
+            dd = dd.rename(columns={'A档描述': '动作描述'})
+        if '描述来源' not in dd.columns:
+            dd['描述来源'] = 'A档(源码模板)'
+        for _, r in dd.iterrows():
+            vt = r.get('动作变量', '')
+            vt = '' if pd.isna(vt) or str(vt).strip() in ('nan', 'None') else str(vt)
+            desc_text = r.get('动作描述', '')
+            desc_text = '' if pd.isna(desc_text) or str(desc_text).strip().lower() in ('nan', 'none') else str(desc_text).strip()
+            desc_map[(str(r['开始标签']), str(r['结束标签']))] = {
+                '动作描述': desc_text, '动作变量': vt,
+                **{field: cell_str(r.get(field, '')) for field in (
+                    '描述来源', '描述状态', '推断依据', '证据等级', '注释补充', '证据')},
+            }
+        desc_stats = dd['描述来源'].value_counts().to_dict()
+    df = pd.read_csv(prediction, dtype=str, encoding='utf-8-sig')
+    for col in ('开始标签', '结束标签'):
+        if col not in df.columns:
+            raise ValueError(f'prediction file lacks column: {col}')
+    if group_by == 'auto':
+        group_by = '构成要素' if is_trace and '构成要素' in df else pick_group_by(df)
+    if group_by not in df.columns:
+        raise ValueError(f'prediction file lacks column: {group_by} (needed by --group-by {group_by})')
+    df['_变量'] = df['开始标签'].map(var_of)
+    df['_序'] = df['开始标签'].map(
+        lambda x: (lambda m: int(m.group(1)) if m else 10 ** 9)(re.search(r'=\s*([+-]?\d+)\s*$', str(x))))
+    if group_by == '构成要素':
+        var_docs = load_var_docs(run)
+        si_map = load_station_identity(run)
+        df['_变量根'] = df['_变量'].map(lambda v: (str(v).split('.')[0] if pd.notna(v) and v else ''))
+        df['_工位'] = df.apply(
+            lambda r: indexed_stations.get(r['_变量']) or workstation(r['构成要素'], r['_变量根'], var_docs, si_map),
+            axis=1)
+        if is_trace and '证据POU' in df:
+            display_names = source_station_displays(
+                zip(df['_工位'], df['_变量'], df['证据POU'].fillna('')), si_map)
+            df['_工位'] = df['_工位'].replace(display_names)
+    elif group_by == '证据POU':
+        df['_工位'] = df['证据POU'].map(pou_station)
+    else:
+        df['_工位'] = df['控制器'].map(lambda x: cell_str(x).strip() or '未分组')
+    # v9.17: sort by station_identity sort_key when available, else _em_sort_key;
+    # then variable, then step number.  Numeric so EM01<EM02<…<EM10.
+    si_map = load_station_identity(run)
+    def _row_sort(row):
+        if group_by == '构成要素' and row['_变量'] in indexed_stations:
+            return _em_sort_key(row['_工位'])
+        vr = row.get('_变量根', '')
+        if pd.notna(vr) and vr:
+            if vr in si_map:
+                return tuple(si_map[vr].get('sort_key', [10**9, 0]))
+            # v9.20: try bare root (without array index) as fallback
+            bare = re.sub(r'\[\d+\]', '', str(vr))
+            if bare != str(vr) and bare in si_map:
+                return tuple(si_map[bare].get('sort_key', [10**9, 0]))
+        return _em_sort_key(row.get('_工位', ''))
+    df['_工位序'] = df.apply(_row_sort, axis=1)
+    df = df.sort_values(['_工位序', '_变量', '_序'], kind='mergesort').reset_index(drop=True)
+    if is_trace:
+        df['_步序变量'] = df['_变量'].fillna(df.get('控制器', '')).fillna('').str.strip()
+        hits = sum(bool(cell_str(value).strip()) for value in df.get('动作变量', []))
+    else:
+        hits = sum(1 for _, row in df.iterrows() if step_text(row, amap).startswith('动作变量'))
+    workstations = df.groupby('_工位', sort=False)
+    has_subgroups = is_trace and workstations['_步序变量'].nunique().gt(1).any()
+
+    # v9.18: blind-spot flags for human review highlighting.
+    #   A=动作描述不完整(有动作变量但描述是模板文本)  -> 浅黄
+    #   B=跨工序步(开始标签变量根≠结束标签变量根)     -> 浅橙
+    #   C=合并区间(合并ID非空，需人工确认合并合理性)   -> 浅蓝
+    #   D=边界待核验(来源候选ID在final_atomic_review) -> 浅红
+    # Priority D > B > C > A (most severe wins).
+    _TEMPLATE_DESC = re.compile(r'相邻已观察|源码局部状态迁移|步进保持|0状态已出现|触发.*到达信号.*参与接收条件')
+    review_cids = set()
+    rp = os.path.join(run, 'final_atomic_review.csv') if run else ''
+    if rp and os.path.exists(rp):
+        try:
+            rv = pd.read_csv(rp, dtype=str, encoding='utf-8-sig')
+            review_cids = set(rv['候选ID'].dropna().unique())
+        except Exception:
+            pass
+    # v9.20: single light-yellow for D (boundary review) and A (incomplete desc).
+    # B (cross-station) and C (merged interval) are not errors — not colored.
+
+    def _blind_flag(row):
+        flags = []
+        # D: boundary review
+        if review_cids:
+            for part in str(row.get('来源候选ID', '')).split(';'):
+                if part.strip() and part.strip() in review_cids:
+                    flags.append('D')
+                    break
+        # B: cross-station (start root != end root)
+        # var_of requires '=value'; BOOL start labels (e.g. HJXHX_ST01.Signal[1])
+        # have no '=' so fall back to the first identifier token.
+        s_var = row['_变量']
+        if pd.notna(s_var) and s_var:
+            s_root = str(s_var).split('.')[0]
+        else:
+            m = re.match(r'\s*([A-Za-z_]\w*)', str(row['开始标签']))
+            s_root = m.group(1) if m else ''
+        e_label = str(row['结束标签'])
+        e_var = var_of(e_label)
+        if e_var:
+            e_root = str(e_var).split('.')[0]
+        else:
+            m = re.match(r'\s*([A-Za-z_]\w*)', e_label)
+            e_root = m.group(1) if m else ''
+        if s_root and e_root and s_root != e_root:
+            flags.append('B')
+        # C: merged interval
+        mid = str(row.get('合并ID', '') or '')
+        if mid.strip() and mid.strip() != 'nan':
+            flags.append('C')
+        # A: action variable present but description is template
+        stxt = step_text(row, amap)
+        if stxt.startswith('动作变量') and _TEMPLATE_DESC.search(str(row.get('动作描述', '') or '')):
+            flags.append('A')
+        return flags
+
+    df['_盲区'] = df.apply(_blind_flag, axis=1)
+    blind_counts = {k: 0 for k in 'ABCD'}
+    for fl in df['_盲区']:
+        for f in fl:
+            blind_counts[f] = blind_counts.get(f, 0) + 1
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet
+    details_sheet = None
+    detail_row = 2
+    thin = Side(style='thin', color='999999')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hfont = Font(name='Arial', bold=True, size=10)
+    nfont = Font(name='Arial', size=8, color='666666')
+    cfont = Font(name='Arial', size=9)
+    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    left = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    digest = hashlib.sha256()
+    with open(prediction, 'rb') as f:
+        for blk in iter(lambda: f.read(1 << 20), b''):
+            digest.update(blk)
+    sha16 = digest.hexdigest()[:16]
+    # v9.23: load trace runtime map early so note + row fill can both use it.
+    trace_rt = load_trace_runtime(run)
+    # v9.29: detect B-tier not processed (input.json exists but no result.json).
+    # When True, rows with empty descriptions get 【B档未处理】 in the remark column.
+    if is_trace:
+        b_tier_pending = any(row['描述状态'] in ('B档待处理', 'B档待修订') for row in desc_map.values())
+    elif b_tier_pending is None:
+        b_tier_pending = False
+        bd = os.path.join(run, 'batches_desc')
+        if os.path.isdir(bd):
+            _bd_files = os.listdir(bd)
+            has_input = any(f.endswith('.input.json') for f in _bd_files)
+            has_result = any(f.endswith('.result.json') for f in _bd_files)
+            b_tier_pending = has_input and not has_result
+    note = (f'工序: {proc_name} | 来源: {os.path.basename(prediction)} | 行数: {len(df)} | 分组: {group_by} | '
+            + (f'动作描述: B档(LLM工艺语义) {desc_stats.get("B档(LLM工艺语义)", 0)}条/A档(源码步注释) {desc_stats.get("A档(源码步注释)", 0)}条 | ' if desc_stats else '')
+            + f'SHA256: {sha16}… | 排序仅为展示查找便利，不代表执行顺序或工艺路径；'
+              '步序/标签/描述内容完全来自同一行预测记录与源码证据文件，无推断文本。'
+              + (f' 时长(ms)与总时长由运行时trace跳变分析自动回填。' if trace_rt else ' 时长列为现场实测项，预测侧不填。')
+              + (f' 备注列标记【待复核】=动作描述待完善(A={blind_counts["A"]})。'
+                 if (blind_counts["A"]) else '')
+              + (f' 【B档未处理】=动作描述B档待agent补充，请处理后重跑。' if b_tier_pending else ''))
+    title = 'Trace观测交付' if is_trace else '预测交付'
+    if is_trace:
+        a_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('A档'))
+        b_rows = sum(n for src, n in (desc_stats or {}).items() if src.startswith('B档'))
+        note = (f'{len(df)} 个观测状态对，源码注释 {a_rows} 行，B 档归纳待核 {b_rows} 行。'
+                '时长为起始状态观测停留中位数，行时长合计仅供表内汇总。源码关系、估算和复核见备注。')
+        ws.sheet_view.showGridLines = False
+        ws.sheet_view.zoomScale = 85
+        ws.column_dimensions['A'].width = 3
+    layout = [('构成要素', 30 if has_subgroups else 18), ('动作描述', 42), ('时长(ms)', 8), ('动作变量（引用）', 28),
+              ('开始标签', 26), ('结束标签', 26), ('备注', 22)]
+    if is_trace:
+        layout = [('构成要素', 33 if has_subgroups else 24), ('动作描述', 38), ('描述来源', 10),
+                  ('时长(ms)', 12), ('动作变量（引用）', 31), ('开始标签', 30), ('结束标签', 30),
+                  ('备注', 36), ('证据', 51)]
+    columns = {heading: j for j, (heading, _) in enumerate(layout, 2)}
+    last_col = len(columns) + 1
+    duration_col = columns['时长(ms)']
+    remark_col = columns['备注']
+    _text_cell(ws, 1, 2, f'{proc_name} 步序采集表（{title}）').font = (
+        Font(name='Arial', size=14, bold=True, color='20364A') if is_trace else hfont)
+    nc = _text_cell(ws, 2, 2, note)
+    nc.font = nfont
+    nc.alignment = left
+    for rr in (1, 2):
+        ws.merge_cells(start_row=rr, start_column=2, end_row=rr, end_column=last_col)
+    for j, (h, width) in enumerate(layout, 2):
+        c = _text_cell(ws, 3, j, h)
+        c.alignment = center
+        if is_trace:
+            c.font, c.fill, c.border = _TRACE_HEADER, _TRACE_HEADER_FILL, _TRACE_BORDER
+        else:
+            c.font, c.border = hfont, border
+            c.fill = PatternFill('solid', start_color='F2A08C' if h in ('构成要素', '开始标签', '结束标签', '备注', '证据') else 'FFE9A8')
+        ws.column_dimensions[c.column_letter].width = width
+
+    # 预取每行动作描述（v9.21: desc_map优先，空描述时不再fallback到变量翻译）
+    def _row_desc(row):
+        key = (str(row['开始标签']), str(row['结束标签']))
+        d = desc_map.get(key)
+        if d:
+            return d['动作描述'], d['动作变量'], d['描述来源'].startswith('B档')
+        # No desc_map entry — use step_text only for the 动作变量 column (引用),
+        # but leave the description itself empty (no variable names in desc column).
+        stxt = cell_str(row.get('动作变量', '')) if is_trace else step_text(row, amap)
+        return '', stxt, False
+
+    df['_dtxt'] = None
+    df['_vtxt'] = None
+    _bcount = 0
+    for i, row in df.iterrows():
+        dtxt, vtxt, is_b = _row_desc(row)
+        if is_b:
+            _bcount += 1
+        df.at[i, '_dtxt'] = dtxt
+        df.at[i, '_vtxt'] = vtxt
+
+    # v9.18: load network comments for the 备注 column
+    nc_map = {} if is_trace else load_network_comments(run)
+    # v9.23: trace_rt already loaded above (before note construction).
+
+    r = 4
+    blocks = []  # (首行, 末行, 是否为步序变量子组)
+    # 统一字体和行高
+    data_font = Font(name='Arial', size=9)
+    total_font = Font(name='Arial', size=9, bold=True)
+    review_font = Font(name='Arial', size=9, color='FF0000', bold=True)
+    data_align = Alignment(horizontal='left', vertical='center', wrap_text=False)
+    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    subgroup_align = Alignment(horizontal='center', vertical='top', wrap_text=True)
+    total_fill = PatternFill('solid', start_color='F0F0F0')
+    trace_review_rows = 0
+    for wsname, g in workstations:
+        b0 = r
+        block_dur_sum = 0
+        has_trace_dur = False
+        split_channels = has_subgroups and g['_步序变量'].nunique() > 1
+        if split_channels:
+            g = g.sort_values('_步序变量', kind='stable', key=lambda names: names.map(_trace_channel_sort_key))
+        active_channel = None
+        for _, row in g.iterrows():
+            if split_channels:
+                channel = row['_步序变量']
+                if channel != active_channel:
+                    if active_channel is not None:
+                        blocks.append((b0, r - 1, True))
+                        for gap in (r, r + 1):
+                            ws.row_dimensions[gap].height = 10
+                        r += 2
+                    b0, active_channel = r, channel
+                    _text_cell(ws, r, 2, f'{wsname}\n{channel or "步序变量未识别"}')
+            else:
+                _text_cell(ws, r, 2, wsname)
+            # 动作描述（干净文本，不含标注）
+            dtxt = str(row['_dtxt'])
+            _text_cell(ws, r, 3, dtxt if dtxt and dtxt.lower() not in ('nan','none') else None)
+            # v9.23: 时长(ms) — 从trace分析结果回填，无trace时留空
+            rt_key = (str(row['开始标签']), str(row['结束标签']))
+            rt_dur = trace_rt.get(rt_key) if trace_rt else None
+            ws.cell(row=r, column=duration_col, value=rt_dur)
+            if rt_dur is not None:
+                block_dur_sum += rt_dur
+                has_trace_dur = True
+            # 动作变量（引用）
+            vtxt = str(row['_vtxt']) if str(row['_vtxt']) not in ('nan', 'None') else ''
+            _text_cell(ws, r, columns['动作变量（引用）'], vtxt if vtxt else None)
+            _text_cell(ws, r, columns['开始标签'], row['开始标签'])
+            _text_cell(ws, r, columns['结束标签'], row['结束标签'])
+            # 备注：网络注释（取最具体的1条）+ 待复核标记
+            remark_parts = []
+            trace_needs_review = False
+            origin = ''
+            if is_trace:
+                remark = cell_str(row.get('备注', '')).strip()
+                remark_parts.extend(part for part in remark.split(' | ')
+                                    if part and part != '无步注释，等待LLM综合上下文描述')
+                desc_entry = desc_map.get(rt_key, {})
+                desc_status = desc_entry.get('描述状态', '')
+                desc_source = desc_entry.get('描述来源', '')
+                trace_needs_review = row.get('源码关系') != 'direct' or desc_status != '源码注释'
+                if reasoning := desc_entry.get('推断依据'):
+                    remark_parts.append(f'{desc_entry["证据等级"]}：{reasoning}')
+                if dtxt and (desc_status == '源码注释' or (not desc_status and desc_source.startswith('A档') and '注释' in desc_source)):
+                    origin = '注释'
+                    if detail := desc_entry.get('注释补充'):
+                        remark_parts.append(detail)
+                elif dtxt and desc_source.startswith('B档') and desc_status in ('', 'LLM推断待核验'):
+                    origin = 'LLM'
+                    _text_cell(ws, r, columns['证据'], desc_entry.get('证据') or '分句证据待核')
+                if origin:
+                    _text_cell(ws, r, columns['描述来源'], origin)
+                if trace_needs_review:
+                    trace_review_rows += 1
+                    remark_parts.append(f'【{desc_status or "描述待核验"}】')
+            if nc_map:
+                comp = str(row.get('构成要素', '') or '')
+                best_nc = ''
+                for part in comp.split(';'):
+                    p = part.strip()
+                    if p and p in nc_map:
+                        comments = nc_map[p]
+                        # 取最具体的注释（过滤泛化注释）
+                        specific = [c for c in comments if not _GENERIC_COMMENT.match(c)]
+                        if specific:
+                            best_nc = specific[0]
+                            break  # 只取第一条具体的
+                if best_nc:
+                    remark_parts.append(best_nc)
+            # v9.22: 待复核标记写在备注列（仅标记动作描述不完整；D边界待核验覆盖率太高不标）
+            needs_review = 'A' in row['_盲区'] and not str(row['_dtxt']).strip()
+            if needs_review:
+                remark_parts.append('【待复核】')
+            # v9.29: B档未处理标记——有动作变量但描述为空且B档待agent补充
+            legacy_b_pending = (not is_trace and b_tier_pending and not str(row['_dtxt']).strip()
+                                and str(row['_vtxt']).strip() and str(row['_vtxt']) not in ('nan', 'None'))
+            if legacy_b_pending:
+                remark_parts.append('【B档未处理】')
+            if remark_parts:
+                _text_cell(ws, r, remark_col, ' | '.join(remark_parts))
+            # 统一样式
+            for j, (heading, width) in enumerate(layout, 2):
+                c = ws.cell(row=r, column=j)
+                c.font = data_font
+                c.border = border
+                c.alignment = center_align if j in (2, columns.get('描述来源')) else data_align
+                if is_trace:
+                    c.font, c.border = _TRACE_BODY, _TRACE_BORDER
+                    if j == duration_col:
+                        c.alignment, c.number_format = _TRACE_NUMBER, '#,##0'
+                    elif j == 2:
+                        c.fill = _TRACE_GROUP_FILL
+                        c.alignment = subgroup_align if split_channels else center_align
+                    elif heading != '描述来源':
+                        c.alignment = left
+                    if isinstance(c.value, str) and _wrapped_lines(c.value, width - 4) > 2:
+                        if details_sheet is None:
+                            details_sheet = _trace_details(wb)
+                        _link_trace_detail(details_sheet, detail_row, c, *rt_key, heading)
+                        detail_row += 1
+            # 待复核行/B档未处理行的备注列用红色字体
+            if needs_review or trace_needs_review or legacy_b_pending:
+                remark_cell = ws.cell(row=r, column=remark_col)
+                font = _TRACE_REVIEW if is_trace else review_font
+                if remark_cell.hyperlink:
+                    font = copy(font)
+                    font.underline = 'single'
+                remark_cell.font = font
+            if origin == 'LLM':
+                ws.cell(row=r, column=columns['描述来源']).font = review_font
+            ws.row_dimensions[r].height = TRACE_STEP_HEIGHT if is_trace else 18
+            r += 1
+        # 变量子组独立合并。工位合计位于最后一个子组之后。
+        if split_channels:
+            blocks.append((b0, r - 1, True))
+            _text_cell(ws, r, 2, wsname)
+        else:
+            blocks.append((b0, r, False))
+        _text_cell(ws, r, 3, '行时长合计' if is_trace else '总时长')
+        # v9.23: 有trace数据时填入该工位组时长合计
+        if has_trace_dur:
+            ws.cell(row=r, column=duration_col, value=block_dur_sum)
+        for j in range(2, last_col + 1):
+            c = ws.cell(row=r, column=j)
+            c.font = total_font
+            c.border = _TRACE_BORDER if is_trace else border
+            c.fill = _TRACE_TOTAL_FILL if is_trace else total_fill
+            c.alignment = data_align if j != 2 else center_align
+            if is_trace and j == duration_col:
+                c.alignment, c.number_format = _TRACE_NUMBER, '#,##0'
+        ws.row_dimensions[r].height = 23 if is_trace else 18
+        r += 1
+    for b0, b1, subgroup in blocks:
+        if b1 > b0:
+            ws.merge_cells(start_row=b0, start_column=2, end_row=b1, end_column=2)
+        label = ws.cell(row=b0, column=2)
+        if not label.hyperlink:
+            label.alignment = subgroup_align if subgroup else center_align
+    # 标题行行高
+    if details_sheet is not None:
+        _text_cell(ws, 2, 2, note + ' 点击带下划线的单元格查看完整文本。')
+    ws.row_dimensions[1].height = 28 if is_trace else 22
+    ws.row_dimensions[2].height = 25 if is_trace else 16
+    ws.row_dimensions[3].height = 26 if is_trace else 20
+    ws.freeze_panes = 'D4' if is_trace else 'A4'
+    wb.save(out)
+    return {'proc_name': proc_name, 'rows': len(df), 'action_variable_rows': hits,
+            'workstation_groups': workstations.ngroups, 'group_by': group_by,
+            'b_desc_rows': _bcount if desc_stats else None, 'desc_sources': desc_stats,
+            'b_tier_pending': b_tier_pending,
+            'source_sha16': sha16, 'amap_keys': len(amap), 'out': out,
+            'trace_duration_backfilled': bool(trace_rt),
+            **({'trace_review_rows': trace_review_rows} if is_trace else {'blind_spot_counts': blind_counts})}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--prediction', required=True)
+    ap.add_argument('--out', default=None,
+                    help='缺省: prediction 同目录/<工序名>_步序采集表.xlsx（最终交付文件命名）')
+    ap.add_argument('--proc-name', default=None,
+                    help='工序名（交付文件与标题命名）；缺省从 prediction 目录名推断并去掉 _vN 后缀')
+    ap.add_argument('--sheet', default='步序采集表')
+    ap.add_argument('--run', default=None, help='prediction run dir with action trace / command evidence')
+    ap.add_argument('--group-by', choices=('auto', '构成要素', '证据POU', '控制器'), default='auto',
+                    help='工位分组：auto=SC04命名用构成要素，否则证据POU；可显式指定')
+    a = ap.parse_args()
+    try:
+        stats = generate(a.prediction, a.out, a.group_by, a.proc_name, a.run, a.sheet)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    print(f"proc-name: {stats['proc_name']}  rows: {stats['rows']}  action-variable rows: {stats['action_variable_rows']}  "
+          f"workstation groups: {stats['workstation_groups']}  group-by: {stats['group_by']}  "
+          f"source-sha16: {stats['source_sha16']}  ->  {stats['out']}")
+
+
+if __name__ == '__main__':
+    main()

@@ -8,7 +8,7 @@ compatibility: opencode
 
 ## 触发
 
-入口四核验工位展示或排查工位名、分组与排序时加载。
+入口一核验工位展示或排查工位名、分组与排序时加载。
 
 ## 输入
 
@@ -27,7 +27,7 @@ compatibility: opencode
 
 ### 工位展示
 
-1. `gen_workstation_xlsx.py` 优先使用 `station_identity.json` 的 `display`。有明确的 SC04 子区段时，用该工位的 `code` 加子区段名。
+1. `plc_trace.output.gen_workstation_xlsx` 优先使用 `station_identity.json` 的 `display`。有明确的 SC04 子区段时，用该工位的 `code` 加子区段名。
 2. 显示名有重复前缀时按确认的源码作用域和文档归属处理，保持分组身份。缺映射时兼容变量文档和默认排序。排序仅供查阅。
 3. Trace 在一个工位有多个变量时用完整变量分块，下标按数值排序。
 4. 无文档时保留原变量根供复核，避免按某个项目的前缀正则推断工位。

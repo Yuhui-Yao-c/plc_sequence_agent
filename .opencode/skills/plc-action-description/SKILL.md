@@ -8,13 +8,13 @@ compatibility: opencode
 
 ## 触发
 
-入口四 Trace 生成 `batches_desc/*.input.json` 后、写入结果和合并前加载。存在待处理 B 档批次时由 Agent 逐批处理。
+入口一 Trace 生成 `batches_desc/*.input.json` 后、写入结果和合并前加载。存在待处理 B 档批次时由 Agent 逐批处理。
 
 ## 输入
 
 | 入口 | 当前输入 | 使用协议 |
 | --- | --- | --- |
-| 四 | 观测对、`trace_source_evidence.json`、A 档和批次上下文 | Trace `trace-description-context-v4` |
+| 一 | 观测对、`trace_source_evidence.json`、A 档和批次上下文 | Trace `trace-description-context-v4` |
 
 本环节使用本轮源码和观测证据。GT、人工表、历史结果和后加监控不得作为描述依据。
 
