@@ -164,6 +164,37 @@ class WorkflowRunTests(unittest.TestCase):
         self.assertEqual(reserved.read_text(encoding='utf-8'), 'existing file')
         self.assertFalse((custom_root / 'static_variables.txt').exists())
 
+    def test_capture_multiple_patterns_in_shorthand_and_repeated_cli_options(self):
+        self.source.write_text('<project><fileHeader productName="InoProShop"/>'
+                               '<pou name="Run"><body><ST>Cell.Phase[4] := 10; Aux.Stage := 1;'
+                               '</ST></body></pou></project>', encoding='utf-8')
+        cli = Path(__file__).resolve().parents[1] / 'plc_cli.py'
+        patterns = ['Cell.Phase[*]', r're:Aux\.Stage', 'Cell.Phase[4]']
+        selected_root = self.root / '采集 输出'
+        shorthand = subprocess.run(
+            [sys.executable, '-X', 'utf8', str(cli), str(self.source), *patterns,
+             '--trace-setup', '-output', str(selected_root)], cwd=self.root,
+            capture_output=True, encoding='utf-8', check=False)
+        self.assertEqual(shorthand.returncode, 0, shorthand.stderr)
+        expected = selected_root / '工序_trace_setup'
+        status = json.loads((expected / 'workflow_status.json').read_bytes())
+        self.assertEqual(status['patterns'], patterns)
+        self.assertEqual(status['static_variables'], 2)
+        self.assertEqual(Path(status['out']), expected)
+        full = ['plc_cli.py', 'trace-setup', '--source', str(self.source), '--out', str(self.out)]
+        for pattern in patterns:
+            full += ['--pattern', pattern]
+        with patch('sys.argv', full), redirect_stdout(io.StringIO()):
+            main()
+        self.assertEqual((expected / 'static_variables.txt').read_bytes(),
+                         (self.out / 'static_variables.txt').read_bytes())
+        self.assertEqual((expected / 'PLC_trace_config.trace').read_bytes(),
+                         (self.out / 'PLC_trace_config.trace').read_bytes())
+        invalid = subprocess.run([sys.executable, str(cli), str(self.source),
+                                  str(self.trace), str(self.trace), '-t'], cwd=self.root,
+                                 capture_output=True, check=False)
+        self.assertEqual(invalid.returncode, 2)
+
     def test_trace_shorthand_requires_one_complete_output_suffix(self):
         for marker, value in (('-t', self.trace), ('--trace-setup', 'Cell.Phase[*]')):
             for suffix in (('-output',), ('-output', ''), ('-output', '--force'),

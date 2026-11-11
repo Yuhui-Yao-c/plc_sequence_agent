@@ -1,6 +1,6 @@
 ---
 name: plc-trace-setup
-description: 从 PLC XML 的显式步序引用生成汇川或 Sysmac 的 Trace 采集配置和变量清单，核验类型、下标及输出状态。
+description: 按一个或多个匹配模式从 PLC XML 的显式步序引用生成汇川或 Sysmac 的 Trace 采集配置和变量清单，核验类型、下标及输出状态。
 compatibility: opencode
 ---
 
@@ -13,7 +13,7 @@ compatibility: opencode
 ## 输入
 
 - PLCopen、Sysmac IEC61131-10 或 SMC2 源码、用户指定的选择器和独立输出目录。入口语法及输出规则见[主 Agent](../../agents/plc-sequence.md)。
-- 选择器支持完整名称、`*`/`?` 通配、`re:` 或完整 CLI 的 `--regex`。通配中的方括号按字面匹配，正则匹配完整变量引用。可用 `--case-sensitive` 保留大小写匹配。
+- 选择器支持完整名称、`*`/`?` 通配、`re:` 或完整 CLI 的 `--regex`。多个模式分别作为独立参数，完整 CLI 重复传 `--pattern`。取并集并按完整变量名去重，可混用通配和 `re:`。通配中的方括号按字面匹配，正则匹配完整变量引用。可用 `--case-sensitive` 保留大小写匹配。
 
 ## 执行
 
@@ -24,7 +24,7 @@ compatibility: opencode
 
 ## 验收
 
-- `static_variables.txt` 保存完整的静态通道。`workflow_status.json` 报告静态通道数、动态下标、未解析类型、XML 问题、采样数及配置路径。
+- `static_variables.txt` 保存完整的静态通道。`workflow_status.json` 的 `patterns` 记录本轮全部模式，同时报告静态通道数、动态下标、未解析类型、XML 问题、采样数及配置路径。类型缺失或功能块路径未解析时按实际问题交付复核信息。
 - `done` 生成 `<源码名>_trace_config.trace` 或 `.csv`，配置只含通道和采集参数。`needs_review` 提供清单和具体待核原因。
 - 已有配置的显式重建使用 `--force` 归档同类产物。无可匹配的显式引用或厂商无法确定时报告实际错误。
 

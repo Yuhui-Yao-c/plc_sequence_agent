@@ -41,9 +41,9 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录"
 
 ### 入口二　Trace 采集配置
 
-**输入**　`源码路径 匹配模式 --trace-setup [-output 输出根目录]`
+**输入**　`源码路径 模式1 [模式2 ...] --trace-setup [-output 输出根目录]`
 
-选择器支持完整变量名、`*`/`?` 通配、`re:` 全匹配正则。通配中的方括号按字面匹配。
+选择器支持完整变量名、`*`/`?` 通配、`re:` 全匹配正则。每个模式作为独立参数，命中任一即纳入同一清单并按完整变量名去重。可混用不同形式，通配中的方括号按字面匹配。
 
 **命令**
 
@@ -51,7 +51,7 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录"
 python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "outputs"
 ```
 
-完整 CLI 使用 `trace-setup --source "源码" --pattern "模式" --out "实际运行子目录"`。可用 `--regex`、`--case-sensitive`、`--format` 和 `--task-name`。`--default-type` 仅用于已核实的 Sysmac 缺失根声明类型。
+完整 CLI 使用 `trace-setup --source "源码" --pattern "模式1" --pattern "模式2" --out "实际运行子目录"`，也可只传一个模式。可用 `--regex`、`--case-sensitive`、`--format` 和 `--task-name`。`--default-type` 仅用于已核实的 Sysmac 缺失根声明类型。
 
 **执行**
 

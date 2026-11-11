@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -95,6 +96,43 @@ class TraceSetupTests(unittest.TestCase):
                                     'Cell.Phase[-1,2]:DINT', 'Feed.Phase:UINT'])
         with self.assertRaisesRegex(ValueError, '无采样数据'):
             analyze_trace(config, self.root / 'analysis', source=self.source)
+        multiple = generate(self.source, self.root / 'multiple',
+                            ['Cell.Phase[-1,2]', 'Feed.Phase', 'Cell.Phase[-1,2]'])
+        self.assertEqual(multiple['channels'], report['channels'])
+        self.assertEqual(Path(multiple['configuration']).read_bytes(), config.read_bytes())
+
+    def test_multiple_patterns_union_deduplicates_and_preserves_configuration(self):
+        self.plcopen('<ST>Cell.Phase[2] := 10; Cell.Phase[10] := 20; Flow.Stage := 1; '
+                     'Cell.Phase[Which] := 5;</ST>')
+        patterns = ['Cell.Phase[*]', r're:Flow\.Stage', 'Cell.Phase[2]', 'Cell.Phase[*]']
+        report = generate(self.source, self.out, patterns)
+        self.assertEqual([c['name'] for c in report['channels']],
+                         ['Cell.Phase[2]', 'Cell.Phase[10]', 'Flow.Stage'])
+        self.assertEqual(report['patterns'], patterns[:3])
+        self.assertIsNone(report['pattern'])
+        self.assertEqual(report['dynamic_variables'], ['Cell.Phase[Which]'])
+        single_pattern = r' re:Cell\.Phase\[.*\]|Flow\.Stage '
+        single = generate(self.source, self.root / 'single', single_pattern)
+        self.assertEqual(report['channels'], single['channels'])
+        self.assertEqual(Path(report['configuration']).read_bytes(),
+                         Path(single['configuration']).read_bytes())
+        self.assertEqual(single['pattern'], single_pattern)
+
+    def test_multiple_patterns_validate_every_selector_before_output(self):
+        self.plcopen('<ST>Cell.Phase[2] := 10;</ST>')
+        for patterns in ([], ['Cell.Phase[*]', ' '], ['Cell.Phase[*]', 're:.*'],
+                         ['Cell.Phase[*]', 're:[']):
+            with self.subTest(patterns=patterns), self.assertRaises((ValueError, re.error)):
+                generate(self.source, self.out, patterns)
+            self.assertFalse(self.out.exists())
+
+    def test_multiple_patterns_respect_case_sensitive_matching(self):
+        self.plcopen('<ST>Cell.Phase[2] := 10; Flow.Stage := 1;</ST>')
+        patterns = ['cell.phase[*]', r're:Flow\.Stage']
+        report = generate(self.source, self.out, patterns, case_sensitive=True)
+        self.assertEqual([c['name'] for c in report['channels']], ['Flow.Stage'])
+        insensitive = generate(self.source, self.root / 'insensitive', patterns)
+        self.assertEqual([c['name'] for c in insensitive['channels']], ['Cell.Phase[2]', 'Flow.Stage'])
 
     def test_unsupported_and_missing_types_need_review(self):
         self.sysmac('''

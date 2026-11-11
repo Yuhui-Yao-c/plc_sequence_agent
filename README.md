@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码提取显式变量，生成采集通道配置。
 
-当前简化版为 **10.1.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **10.2.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -18,7 +18,7 @@ opencode
 | 入口 | 输入 |
 | --- | --- |
 | 一　Trace 步序采集 | `源码路径 Trace路径 -t [-output 输出根目录]` |
-| 二　Trace 采集配置 | `源码路径 匹配模式 --trace-setup [-output 输出根目录]` |
+| 二　Trace 采集配置 | `源码路径 模式1 [模式2 ...] --trace-setup [-output 输出根目录]` |
 
 ```text
 "source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "D:\工作成果"
@@ -26,6 +26,12 @@ opencode
 ```
 
 两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。已有产物时自动选用带 `_2`、`_3` 等后缀的新子目录。
+
+入口二可连续输入多个独立模式，每个模式用引号包住。命中任一模式的变量进入同一清单，完整变量名去重后自然排序。可混用完整名称、通配符和 `re:` 正则；单模式写法继续有效。
+
+```powershell
+python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" "re:Line\.Stage[0-9]+" --trace-setup -output "D:\工作成果"
+```
 
 ## 命令与续跑
 
@@ -35,6 +41,8 @@ opencode
 python plc_cli.py trace --source "source/包mylar/PLC程序.xml" --trace "source/包mylar/采集记录" --out "outputs/包mylar_trace"
 python plc_cli.py trace-setup --source "source/包mylar/PLC程序.xml" --pattern "m_nNextAutoStep[*]" --out "outputs/包mylar_trace_setup"
 ```
+
+入口二完整 CLI 可重复指定 `--pattern`。状态文件的 `patterns` 保存本轮全部模式；单模式时保留原 `pattern` 字符串，多模式时该字段为 `null`，以 `patterns` 为准。多模式选择仍核验作用域、类型和动态下标，不自动推定缺失类型或展开功能块模板。
 
 Trace 分析支持 TwinCAT Scope `.trace` 和 Sysmac 导出表、分卷目录，时长取起始步观测停留中位数。源码原注释优先进入 A 档，其余行由 Agent 按本步证据完成 B 档。
 

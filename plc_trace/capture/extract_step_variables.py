@@ -134,6 +134,30 @@ class _Frame:
     type_name: str
 
 
+class _Selectors:
+    """Match any independently compiled selector in one source scan."""
+
+    def __init__(self, patterns, case_sensitive):
+        values = [patterns] if isinstance(patterns, str) else patterns
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError('匹配规则不能为空')
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError('每个匹配规则须为非空字符串')
+        self.patterns = list(dict.fromkeys(value.strip() for value in values))
+        self.single_pattern = values[0] if len(self.patterns) == 1 else None
+        self.matchers = []
+        for pattern in self.patterns:
+            matcher = glob_regex(pattern)
+            if matcher.fullmatch(''):
+                raise ValueError('匹配规则可以匹配空名称，请限定所需的步序变量')
+            if case_sensitive:
+                matcher = re.compile(matcher.pattern, matcher.flags & ~re.IGNORECASE)
+            self.matchers.append(matcher)
+
+    def fullmatch(self, value):
+        return any(matcher.fullmatch(value) for matcher in self.matchers)
+
+
 class _SourceScan:
     def __init__(self, matcher, source_format, case_sensitive):
         self.matcher = matcher
@@ -360,17 +384,11 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, def
     if (source_input.is_relative_to(out) or source.is_relative_to(out) or Path.cwd().is_relative_to(out)
             or PROJECT_ROOT.is_relative_to(out)):
         raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
-    if not pattern or not pattern.strip():
-        raise ValueError('匹配规则不能为空')
+    matcher = _Selectors(pattern, case_sensitive)
     if capture_format not in ('auto', 'sysmac', 'inovance'):
         raise ValueError('采集格式须为 auto、sysmac 或 inovance')
     if default_type and default_type not in INTEGER_TYPES:
         raise ValueError('默认类型须为采集分析支持的整数类型')
-    matcher = glob_regex(pattern.strip())
-    if matcher.fullmatch(''):
-        raise ValueError('匹配规则可以匹配空名称，请限定所需的步序变量')
-    if case_sensitive:
-        matcher = re.compile(matcher.pattern, matcher.flags & ~re.IGNORECASE)
     with lock_run_dir(out):
         if out.exists() and not out.is_dir():
             raise ValueError('输出路径须为目录')
@@ -434,7 +452,8 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, def
         report = {
             'version': __version__, 'mode': 'trace_setup', 'status': 'done' if config else 'needs_review',
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,
-            'pattern': pattern, 'capture_format': capture_format, 'task_name': task,
+            'pattern': matcher.single_pattern,
+            'patterns': matcher.patterns, 'capture_format': capture_format, 'task_name': task,
             'task_name_source': '用户指定' if task_name else '模板默认',
             'static_variables': len(ordered), 'channels': ordered,
             'dynamic_variables': sorted(scan.dynamic.values(), key=_sort_key),
@@ -449,7 +468,8 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, def
 def add_arguments(parser):
     parser.add_argument('--source', required=True, help='PLCopen、Sysmac IEC61131-10 或 SMC2 XML')
     selector = parser.add_mutually_exclusive_group(required=True)
-    selector.add_argument('--pattern', help='完整变量名、通配符或 re: 正则')
+    selector.add_argument('--pattern', action='append',
+                          help='完整变量名、通配符或 re: 正则；可重复指定，取并集并去重')
     selector.add_argument('--regex', help='对完整变量名匹配的 Python 正则')
     parser.add_argument('--out', required=True, help='独立输出目录')
     parser.add_argument('--format', choices=('auto', 'inovance', 'sysmac'), default='auto')
