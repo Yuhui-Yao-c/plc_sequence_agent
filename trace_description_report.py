@@ -134,6 +134,8 @@ def _fact_text(item):
 def action_evidence_text(info, candidate):
     """Resolve each validated clause's references without extending its claims."""
     catalog = {item['id']: item for item in info.get('description_context', {}).get('evidence', ())}
+    catalog.update((c['id'], {'id': c['id'], 'category': 'current_command', 'data': c})
+                   for c in info.get('b_evidence', ()) if c['id'] not in catalog)
     lines = []
     # Early batches have row-level references only.
     for phrase, refs in candidate.get('clause_evidence') or [('', candidate['refs'])]:

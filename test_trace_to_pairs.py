@@ -147,7 +147,7 @@ class SysmacRecordingTests(unittest.TestCase):
         self.assertEqual(stats['source_relations'], {'direct': 1, 'path_candidate': 1})
         direct = evidence['Step[1]=0|||Step[1]=10']
         self.assertEqual(direct['description'], '模式跳转')
-        self.assertEqual(direct['description_context'], {})
+        self.assertEqual(direct['b_evidence'], [])
         self.assertEqual(direct['start_commands'][0]['operation'], '复位')
         skip = evidence['Step[1]=10|||Step[1]=30']
         self.assertEqual([edge['to'] for edge in skip['candidate_path']], [20, 30])

@@ -4,7 +4,7 @@ from __future__ import annotations
 import csv
 import json
 import re
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 from pathlib import Path
 
 from atomic_boundaries import PROVEN, atomic, stable_id
@@ -37,11 +37,6 @@ def _read_csv(path):
     if path.is_file():
         with path.open(encoding='utf-8-sig', newline='') as stream:
             yield from csv.DictReader(stream)
-
-
-def _text_rows(rows):
-    for row in rows:
-        yield {key: str(value) if value is not None else '' for key, value in row.items()}
 
 
 def _state(label):
@@ -107,19 +102,12 @@ class TraceSourceIndex:
         self.bindings = defaultdict(set)
         self.commands = defaultdict(list)
         self.notes = defaultdict(list)
-        self.station_scopes = defaultdict(Counter)
         self.call_evidence = CallEvidence()
         wanted = {name.casefold() for name in variables}
         run = Path(run)
-        path, self.source_format, self.source_fingerprint = self._source_input(run, source)
-        self.control = None
-        self.audit = {}
-        self.events = ()
-        if self.source_format == 'plcopen':
-            from plcopen_trace_control import collect
-            self.control = collect(path, variables)
+        self.control = self._source_control(run, source, variables)
         if self.control is None:
-            self._load_ledger(run, wanted, path)
+            self._load_ledger(run, wanted)
         else:
             for variable, edge in self.control.edges:
                 self._add_edge(variable, edge)
@@ -156,48 +144,27 @@ class TraceSourceIndex:
         return (name if len(self.program_names[name]) == 1 else scope) or variable
 
     @staticmethod
-    def _source_input(run, source):
+    def _source_control(run, source, variables):
         from source_format import detect_source_format
-        from workflow import fingerprint
         manifest_path = run / 'workflow_manifest.json'
         manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
         path = Path(source or manifest.get('source') or '')
         if path.is_file():
-            digest = fingerprint(path)
-            if manifest.get('source_sha256') and manifest['source_sha256'] != digest:
-                raise ValueError('PLC 源码与本轮准备产物不一致，请重建输出目录')
-            return path, detect_source_format(path), digest
-        if manifest.get('source') or (run / 'plcopen_action_trace.csv').is_file():
-            raise ValueError('Trace 描述需要本轮 PLC 源码')
-        return None, '', ''
+            if detect_source_format(path) == 'plcopen':
+                if manifest.get('source_sha256'):
+                    from successor_graph import sha256
+                    if sha256(path) != manifest['source_sha256']:
+                        raise ValueError('PLCopen 源码与本轮准备产物不一致，请重建输出目录')
+                from plcopen_trace_control import collect
+                return collect(path, variables)
+        elif (manifest.get('extraction', {}).get('format') == 'plcopen'
+              or (run / 'plcopen_action_trace.csv').is_file()):
+            raise ValueError('PLCopen Trace 描述需要原始源码，请指定 --source 并重建证据')
+        return None
 
-    def _load_ledger(self, run, wanted, source):
-        model = None
-        if self.source_format == 'omron_iec61131_10':
-            from omron_native import collect_native
-            model = collect_native(source)
-        elif self.source_format == 'smc2':
-            from smc2_controlflow import collect_smc2
-            model = collect_smc2(source)
-
-        if model is not None:
-            from event_graph_v6 import FIELDS, smc2_events
-            transitions = _text_rows({**r, 'path': ';'.join(r['path'])} for r in model['transitions'])
-            stages = _text_rows(model['stage_records'])
-            commands = _text_rows({**r, 'path': ';'.join(r['path'])} for r in model.get('native_commands', ()))
-            events = model.get('native_events')
-            if events is None:
-                events = [*smc2_events(source), *model['stage_events']]
-            self.events = _text_rows(dict(zip(FIELDS, event)) for event in events)
-            self.audit = model.get('native_parse_audit') or model.get('smc2_audit', {})
-        else:
-            transitions = _read_csv(run / 'source_transition_edges.csv')
-            stages = _read_csv(run / 'source_stage_candidates.csv')
-            commands = _read_csv(run / 'native_command_evidence.csv')
-            self.events = _read_csv(run / 'indexed_events.csv')
-
+    def _load_ledger(self, run, wanted):
         edges_by_id = {}
-        for row in transitions:
+        for row in _read_csv(run / 'source_transition_edges.csv'):
             variable = row['variable'].casefold()
             if variable not in wanted or not row['scope']:
                 continue
@@ -214,15 +181,13 @@ class TraceSourceIndex:
             self._add_edge(variable, edge)
             edges_by_id[row['id']] = (variable, edge)
 
-        for row in stages:
+        for row in _read_csv(run / 'source_stage_candidates.csv'):
             start = _state(row.get('开始标签'))
             end = _state(row.get('结束标签'))
             scope = row.get('证据POU', '')
             if start and start[0] in wanted:
-                if scope:
-                    self.station_scopes[start[0]][scope.split('::', 1)[0]] += 1
                 self._note(start, row.get('动作描述', ''), scope, row.get('网络序号', ''),
-                           row.get('证据节点', ''), 'PLC XML' if model is not None else 'source_stage_candidates.csv', 3)
+                           row.get('证据节点', ''), 'source_stage_candidates.csv', 3)
             if not start or not end or start[0] not in wanted or start[0] != end[0] or not scope:
                 continue
             source_id = row.get('证据节点', '')
@@ -242,7 +207,7 @@ class TraceSourceIndex:
                     'grade': row.get('证据等级', ''), 'body': '', 'path': '',
                 })
 
-        for row in commands:
+        for row in _read_csv(run / 'native_command_evidence.csv'):
             self.call_evidence.add(row)
             start = _state(row['start'])
             if start and start[0] in wanted:
@@ -254,43 +219,28 @@ class TraceSourceIndex:
                 record['id'] = stable_id('TE', record)
                 self.commands[start].append(record)
                 self._note(start, row.get('comment', ''), row['scope'], row['network'],
-                           row['node'], 'PLC XML' if model is not None else 'native_command_evidence.csv', 2)
+                           row['node'], 'native_command_evidence.csv', 2)
 
-        if model is not None:
-            self._load_inventory(model['state_observations'], wanted)
-        else:
-            for row in _read_csv(run / 'indexed_candidates.csv'):
-                start = _state(row.get('开始标签', ''))
-                if start and start[0] in wanted and row.get('状态') != 'reset_hypothesis':
-                    self._note(start, row.get('动作描述', ''), row.get('证据POU', ''), '',
-                               row.get('证据节点', ''), 'indexed_candidates.csv', 1)
+        for row in _read_csv(run / 'plcopen_action_trace.csv'):
+            start = _state(f"{row['state_variable']}={row['state_value']}")
+            if start and start[0] in wanted and row['target_type'] == 'coil' and row['target_symbol']:
+                record = {
+                    'scope': row['source_unit'], 'network': '', 'node': row['target_id'],
+                    'source_line': '', 'command': 'coil_connected', 'arguments': row['target_symbol'],
+                    'guard': row['boundary_condition'], 'guard_complete': False,
+                    'role': 'connected_signal', 'kind': '', 'operation': '', 'comment': '',
+                    'issue': row['caveat'], 'path': row['path_ids'], 'start': '',
+                }
+                record['id'] = stable_id('TE', record)
+                self.commands[start].append(record)
 
-    def _load_inventory(self, records, wanted):
-        observations = defaultdict(list)
-        comparison_scopes = defaultdict(set)
-        for row in records:
-            variable = row['variable'].casefold()
-            if variable not in wanted:
-                continue
-            observations[variable, row['value'], row.get('binding_scope', '')].append(row)
-            if (self.source_format == 'omron_iec61131_10' and row['kind'] in ('comparison', 'st_comparison')
-                    and row['operator'] == '=' and row['entry']):
-                comparison_scopes[variable].add(row['entry'].split('::', 1)[0])
-
-        # Native IEC inventory can identify the channel's POU without a local MOVE.
-        for variable, scopes in comparison_scopes.items():
-            if variable not in self.station_scopes and len(scopes) == 1:
-                self.station_scopes[variable].update(scopes)
-
-        for (variable, value, _), rows in observations.items():
-            notes = rows[:1]
-            if self.source_format == 'smc2':
-                comparisons = [r for r in rows if r['kind'] in ('comparison', 'st_comparison')
-                               and r['operator'] == '=']
-                notes = comparisons or [r for r in rows if r['kind'] in ('assignment', 'st_assignment')]
-            for row in notes:
-                self._note((variable, value), row['comment'], row['entry'], str(row['network']),
-                           row['node'], 'PLC XML', 1)
+        # State inventory comments remain useful even when a sampled jump spans
+        # several source transitions or its successor has not been resolved.
+        for row in _read_csv(run / 'indexed_candidates.csv'):
+            start = _state(row.get('开始标签', ''))
+            if start and start[0] in wanted and row.get('状态') != 'reset_hypothesis':
+                self._note(start, row.get('动作描述', ''), row.get('证据POU', ''), '',
+                           row.get('证据节点', ''), 'indexed_candidates.csv', 1)
 
     def _note(self, state, comment, scope, network, source_id, source_file, rank):
         text = _comment_text(comment, state[1])
@@ -339,7 +289,7 @@ class TraceSourceIndex:
 
     def lookup(self, start_label, end_label, step_comment=''):
         start, end = _state(start_label), _state(end_label)
-        direct, path, commands, linked, refs, notes = [], [], [], [], [], []
+        direct, path, commands, linked, eligible, refs, notes = [], [], [], [], [], [], []
         relation, description, description_source = 'unresolved', '', ''
         issues, writes, blockers = [], [], []
         if start and end and start[0] == end[0]:
@@ -382,6 +332,14 @@ class TraceSourceIndex:
                     if c['kind'] and c['guard_complete'] and c['arguments'] and c['network']
                     and len(locations) == 1 and (c['scope'], c['network']) in locations
                 ]
+                main_commands = [c for c in linked if c['role'] == 'actuator_command'] or linked
+                # A single description needs a single distinguishable principal instruction.
+                targets = {(c['command'], c['arguments']) for c in main_commands}
+                if len(targets) == 1:
+                    eligible = [
+                        {**c, 'description_comment': _comment_text(c['comment'], value)}
+                        for c in main_commands
+                    ]
                 comments = [_comment_text(e['comment'], value) for e in proved]
                 if all(comments) and len(set(comments)) == 1:
                     description, description_source = comments[0], 'A档(源码网络注释)'
@@ -417,7 +375,7 @@ class TraceSourceIndex:
             'start_comment': step_comment, 'start_commands': commands, 'linked_commands': linked,
             'start_notes': notes,
             'description': description, 'description_source': description_source,
-            'description_refs': refs,
+            'description_refs': refs, 'b_evidence': eligible,
             'source_issues': issues,
             'start_state_writes': writes, 'source_blockers': blockers,
             'description_context': context,
@@ -426,10 +384,10 @@ class TraceSourceIndex:
 
 
 def read_trace_evidence(run):
-    """Read the row-level source evidence of a Trace run."""
+    """Return None for prediction runs and an empty map for legacy Trace runs."""
     run = Path(run)
     if not (run / 'trace_collection_pairs.csv').is_file():
-        raise ValueError('缺少 trace_collection_pairs.csv')
+        return None
     path = run / EVIDENCE_FILE
     if not path.is_file():
         return {}

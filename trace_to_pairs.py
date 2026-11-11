@@ -23,7 +23,8 @@ Multi-cycle aggregation:
   per user requirement (median is more robust than mean to outlier cycles).
 
 Outputs (in run dir):
-  trace_collection_pairs.csv  — observed pairs and runtime statistics
+  trace_collection_pairs.csv  — main pair table (column-compatible with
+                                prediction_collection_pairs.csv + runtime cols)
   trace_variables.json        — per-variable metadata (reused from analyzer)
   trace_jumps.csv             — all raw jumps (audit)
   trace_segments.csv          — all value segments (audit)
@@ -32,7 +33,9 @@ Outputs (in run dir):
   trace_pairs_review.csv      — unresolved source links or descriptions
   trace_pairs_summary.json    — run-level stats
 
-Evidence comes from the current PLC source and its source documentation.
+Isolation: reads only the trace input + source-derived evidence files in run
+(plcopen_action_trace.csv, step_comments.json, station_identity.json,
+variable_documentation.json). Never opens GT or manual tables.
 """
 from __future__ import annotations
 
@@ -49,8 +52,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from station_identity import build_identity, source_station_displays
-from utils import em_sort_key_prefixed, infer_proc_name, load_station_identity
+from station_identity import source_station_displays
 
 
 # ---- Sysmac trace tables and recording directories ----
@@ -225,7 +227,7 @@ def _scan_part(path, encoding, delimiter):
             last_index, last_time = index, raw_time
             count += 1
     if not count:
-        raise ValueError(f'{path}: 无采样数据')
+        raise ValueError(f'{path}: 无采样数据，请提供采集后导出的 Trace 记录')
     # Round the inferred nominal period to microseconds to avoid extending jitter.
     interval_ns = max(1, round(statistics.median(intervals) / 1000) * 1000) if precise and intervals else None
     settings = tuple(metadata.get(key, '').casefold() for key in CAPTURE_SETTINGS)
@@ -663,13 +665,6 @@ PAIR_FIELDS = [
 ]
 
 
-def _channel_pattern(pattern):
-    if pattern.startswith(('re:', 'regex:')):
-        return re.compile(pattern.split(':', 1)[1], re.I)
-    glob = re.escape(pattern).replace(r'\*', '.*').replace(r'\?', '.')
-    return re.compile(glob, re.I)
-
-
 def generate(trace_path, run, source=None, proc_name=None,
              idle_threshold_ms=5000, *, pattern=None, sample_interval_ms=None):
     """Run the full trace → pairs extraction.
@@ -702,10 +697,22 @@ def generate(trace_path, run, source=None, proc_name=None,
     from trace_jump_analyzer import parse_trace, detect_cycles, _write_csv
     from trace_source_evidence import EVIDENCE_FILE, RELATION_TEXT, TraceSourceIndex
 
+    try:
+        from utils import load_station_identity, infer_proc_name, em_sort_key_prefixed
+    except ModuleNotFoundError as exc:
+        if exc.name != 'utils':
+            raise
+        # Earlier workflow versions keep these helpers in the workstation writer.
+        from gen_workstation_xlsx import load_station_identity, _em_sort_key as em_sort_key_prefixed
+
+        def infer_proc_name(source, run, proc_name):
+            return proc_name or (Path(source).stem if source else Path(run).name)
+
     run = Path(run)
     matches = None
     if pattern:
-        matches = _channel_pattern(pattern).fullmatch
+        from candidate_filter import glob_regex
+        matches = glob_regex(pattern).fullmatch
 
     # ---- 1. Normalize the trace input ----
     if is_omron_trace_input(trace_path):
@@ -713,6 +720,8 @@ def generate(trace_path, run, source=None, proc_name=None,
             trace_path, sample_interval_ms=sample_interval_ms, matches=matches)
     else:
         variables = parse_trace(trace_path)
+        if not any(channel['sample_count'] for channel in variables.values()):
+            raise ValueError(f'{trace_path}: 无采样数据，请提供采集后导出的 Trace 记录')
         if matches is not None:
             variables = {name: vd for name, vd in variables.items() if matches(name)}
         trace_input = {'format': 'twincat_scope_xml'}
@@ -843,10 +852,6 @@ def generate(trace_path, run, source=None, proc_name=None,
     # ---- 6. Index source evidence for the exact observed variable names ----
     source_index = TraceSourceIndex(run, variables, source=source)
     sc_map = {} if source_index.control is not None else _load_step_comments(str(run))
-    identity_file = run / 'station_identity.json'
-    if source_index.source_format and not identity_file.exists():
-        identity_file.write_text(json.dumps(build_identity(run, variables, source_index.station_scopes),
-                                            ensure_ascii=False, indent=1), encoding='utf-8')
     si_map = load_station_identity(str(run))
     var_docs = _load_var_docs(str(run))
     indexed_stations = {name: source_index.station(name) for name in variables
@@ -875,6 +880,11 @@ def generate(trace_path, run, source=None, proc_name=None,
         guards = {e['guard'] for e in linked if e['guard_complete']}
         commands = list(evidence['linked_commands'])
         # A PLCopen EQ-to-coil path is a useful reference, with incomplete gating.
+        if relation == 'direct':
+            commands.extend(
+                c for c in evidence['start_commands']
+                if c['role'] == 'connected_signal' and c['scope'] in scopes
+            )
         action_vars = list(dict.fromkeys(c['arguments'] for c in commands))
 
         # Station name for grouping
@@ -954,8 +964,7 @@ def generate(trace_path, run, source=None, proc_name=None,
                      'indexed_stations': indexed_stations,
                      'pairs_without_local_control': sum('no_local_control' in row['source_issues']
                                                         for row in pair_evidence.values())}
-                    if control is not None else {'policy': 'source_ledger', 'format': source_index.source_format,
-                                                  'parser': source_index.audit})
+                    if control is not None else {'policy': 'source_ledger'})
     (run / EVIDENCE_FILE).write_text(
         json.dumps({'schema': 1, 'source_audit': source_audit, 'pairs': pair_evidence}, ensure_ascii=False, indent=2),
         encoding='utf-8')
@@ -997,3 +1006,66 @@ def generate(trace_path, run, source=None, proc_name=None,
         json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
 
     return summary
+
+
+def analyze_for_workflow(trace_path, run, *, source=None, pattern=None, sample_interval_ms=None):
+    """Return the workbook timing mode and artifacts for the v9.25 workflow."""
+    if is_omron_trace_input(trace_path):
+        stats = generate(trace_path, run, source=source, pattern=pattern,
+                         sample_interval_ms=sample_interval_ms)
+        return 'sysmac', stats
+
+    from trace_jump_analyzer import analyze
+
+    run = Path(run)
+    stats = analyze(str(trace_path), str(run / 'final_prediction_pairs.csv'),
+                    str(run / 'trace_analysis'))
+    return 'legacy', stats
+
+
+def load_trace_timing(run):
+    """Read median durations and the pairs that include estimated timing."""
+    p = Path(run) / 'trace_collection_pairs.csv'
+    durations, estimated = {}, set()
+    if not p.is_file():
+        return durations, estimated
+    with p.open(encoding='utf-8-sig', newline='') as f:
+        for row in csv.DictReader(f):
+            dur = (row.get('中位数时长ms') or '').strip()
+            key = (row.get('开始标签', ''), row.get('结束标签', ''))
+            try:
+                durations[key] = int(dur) if dur else None
+            except ValueError:
+                durations[key] = None
+            estimate_count = (row.get('估算时长次数') or '').strip()
+            if estimate_count.isdecimal() and int(estimate_count) > 0:
+                estimated.add(key)
+    return durations, estimated
+
+
+def load_trace_duration_map(run):
+    """Return {(start_label, end_label): median_duration_ms} for Excel backfill."""
+    return load_trace_timing(run)[0]
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description='trace → step pairs extraction')
+    ap.add_argument('--trace', required=True, help='.trace 文件、Sysmac CSV/TSV/TXT，或同次采集的分卷目录')
+    ap.add_argument('--run', required=True, help='run目录（含源码证据文件）')
+    ap.add_argument('--source', default=None, help='源码XML（控制证据与工序命名，默认取run清单）')
+    ap.add_argument('--proc-name', default=None, help='工序名')
+    ap.add_argument('--idle-threshold', type=int, default=5000,
+                    help='周期检测空闲阈值(ms)，默认5000')
+    ap.add_argument('--pattern', help='完整变量名的 glob 或 re: 模式')
+    ap.add_argument('--sample-interval-ms', type=float,
+                    help='RawTime 精度不足时使用的 Sysmac 采样间隔(ms)')
+    a = ap.parse_args()
+    stats = generate(a.trace, a.run, a.source, a.proc_name,
+                     idle_threshold_ms=a.idle_threshold, pattern=a.pattern,
+                     sample_interval_ms=a.sample_interval_ms)
+    print(json.dumps(stats, ensure_ascii=False, indent=2))
+
+
+if __name__ == '__main__':
+    main()

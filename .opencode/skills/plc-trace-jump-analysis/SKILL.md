@@ -1,12 +1,41 @@
 ---
 name: plc-trace-jump-analysis
-description: 运行 PLC Trace 步序采集并核验观测状态对、停留中位时长、Sysmac 分卷和源码迁移复核。
+description: 识别 TwinCAT Scope 和 Sysmac 采集数据，核对观测跳变、多次采集的停留时长中位数及时间依据。
+compatibility: opencode
 ---
 
-# Trace 步序采集
+# Trace 跳变与时长
 
-- 使用 `AGENTS.md` 的命令和本轮输入。先确认源码是 PLCopen、Sysmac IEC61131-10 或 SMC2 导出，采集是 TwinCAT Scope `.trace` 或 Sysmac 表、目录。
-- Sysmac 同目录可包含多次采集。保留 `YYYYMMDDhhmmss_00001.csv` 这样的原始文件名。同次采集核对分卷、通道、`StartRawTime` 和 `Index`，遇索引缺口切断连续段。采集配置不一致或归组不明时按程序错误排查。
-- 按同变量的相邻观测跳变组成状态对。时长是起始状态的观测停留时间，按完整变量名和起止步值聚合，交付表显示中位数。保留到步 0 的观测。不要合并不同采集的边界、按步号插值或用静态路径补充未观测跳变。
-- `RawTime` 精度不足时，仅在导出信息或明确提供的采样间隔支持时重建。查 `trace_pairs_summary.json` 的采集分组和时间依据，查 `trace_collection_pairs.csv` 的估算时长次数。
-- 核验实际生成的 `trace_collection_pairs.csv`、`trace_pairs_summary.json` 和 `workflow_status.json`。源码直跳、静态路径和未对齐的记录可在 `trace_source_evidence.json` 和 `trace_pairs_review.csv` 查阅。静态路径是复核线索，工位行时长合计仅供表内汇总。
+## 触发
+
+入口四读取实测记录时加载。
+
+## 输入
+
+| 入口 | 输入 | Python 模块 |
+| --- | --- | --- |
+| 四 | 源码和 TwinCAT Scope `.trace`、Sysmac 导出表或采集目录 | `trace_to_pairs.py` |
+
+TwinCAT Scope 文件是 UTF-16 XML，`TraceVariable` 下含 `Values`、`Timestamps`，相对时间单位为毫秒。`StartTime` 提供绝对基准。
+
+Sysmac 输入是 `.csv/.tsv/.txt`，也可用含这类表的目录。采样行含 `Index`、`RawTime` 及带整型后缀的变量列，例如 `Cell.Phase[0]:INT`。采集配置文件无采样行，应先导出现场实测记录。
+
+## 执行
+
+### 入口四的观测状态对
+
+1. 目录顶层保留 `YYYYMMDDhhmmss_00001.csv` 等原名。按前缀识别采集，按卷号读取，核验同次采集的通道、设置、`StartRawTime` 和递增索引。重命名的文件仅在采集归属可以唯一确认时读取。索引缺口切断连续段，重复分卷与冲突按审计处理。
+2. 每组独立识别相邻样本跳变和稳定段。非活动通道保留元数据，长空闲段作为周期边界候选。不同采集与断开的索引段之间不构造跳变。保留返回步 0 的观测对。
+3. `RawTime` 为纳秒。精度不足时用同次采集的精确时间重建，或使用已知的 `--sample-interval-ms`。采样依据、估算次数、采集 ID 和原始 Index 可追溯。
+4. 按完整变量、起始步和结束步统计观测次数，取起始状态停留时长的中位数。源码直跳、静态多步路径、经步 0 和无法解析的关系分别核查。静态路径仅用于解释观测。
+
+## 验收
+
+| 入口 | 核对文件 | 核对内容 |
+| --- | --- | --- |
+| 四 | `trace_collection_pairs.csv`、`trace_pairs_summary.json`、`trace_pairs_review.csv` | 唯一状态对、发生次数、中位数、估算时长次数、采集分组和源码待核 |
+| 四 | 本轮目录下 `trace_variables.json`、`trace_jumps.csv`、`trace_segments.csv`、`trace_cycles.json` | 活跃与未活动变量、采样跳变、连续段和周期候选 |
+
+## 协作
+
+[动作描述](../plc-action-description/SKILL.md) 使用本轮源码证据解释观测对。[采集配置](../plc-trace-setup/SKILL.md) 为前置现场采集提供通道。观测解析只读本轮原始采样。

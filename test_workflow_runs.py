@@ -1,12 +1,14 @@
-import csv
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from action_describe import cmd_validate
 from plc_cli import main
 from workflow import create, lock_run_dir
 
@@ -41,6 +43,97 @@ class WorkflowRunTests(unittest.TestCase):
 
     def result_path(self, input_path):
         return input_path.with_name(input_path.name.replace('.input.json', '.result.json'))
+
+    def shorthand(self, value, marker, *suffix):
+        cli = Path(__file__).resolve().with_name('plc_cli.py')
+        return subprocess.run([sys.executable, '-X', 'utf8', str(cli), str(self.source),
+                               str(value), marker, *suffix], cwd=self.root,
+                              capture_output=True, encoding='utf-8', check=False)
+
+    def test_trace_shorthand_creates_process_runs_under_selected_root(self):
+        source = self.root / 'source' / '包mylar' / 'PLC.xml'
+        source.parent.mkdir(parents=True)
+        self.source.rename(source)
+        self.source = source
+        output_root = self.root / '实测 输出'
+        output_root.mkdir()
+        sentinel = output_root / 'keep.txt'
+        sentinel.write_text('other work', encoding='utf-8')
+        self.out = output_root / '包mylar_trace'
+        first = self.shorthand(self.trace, '-t', '-output', output_root.name)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        status = self.read('workflow_status.json')
+        self.assertEqual(status['mode'], 'trace')
+        self.assertEqual(Path(status['out']), self.out.resolve())
+        self.assertTrue((self.out / 'trace_collection_pairs.csv').is_file())
+
+        repeat = self.shorthand(self.trace, '-t', '-output', output_root.name)
+        self.assertEqual(repeat.returncode, 0, repeat.stderr)
+        second = json.loads((output_root / '包mylar_trace_2' / 'workflow_status.json').read_bytes())
+        self.assertNotEqual(second['run_id'], status['run_id'])
+        self.assertEqual(self.read('workflow_status.json')['run_id'], status['run_id'])
+        self.assertEqual(sentinel.read_text(encoding='utf-8'), 'other work')
+        self.assertFalse((output_root / 'trace_collection_pairs.csv').exists())
+        self.assertFalse((self.root / 'outputs').exists())
+
+        self.cli('trace', '--resume')
+        self.assertTrue(self.read('workflow_status.json')['preparation_reused'])
+        self.assertEqual(self.read('workflow_status.json')['run_id'], status['run_id'])
+
+        other_source = self.root / 'source' / '超声' / 'PLC.xml'
+        other_source.parent.mkdir()
+        other_source.write_bytes(self.source.read_bytes())
+        self.source = other_source
+        other = self.shorthand(self.trace, '-t', '-output', output_root.name)
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertTrue((output_root / '超声_trace' / 'trace_collection_pairs.csv').is_file())
+
+    def test_shorthand_defaults_keep_trace_and_setup_separate(self):
+        occupied = self.root / 'outputs' / '工序_trace'
+        occupied.mkdir(parents=True)
+        sentinel = occupied / 'keep.txt'
+        sentinel.write_text('prior run', encoding='utf-8')
+        trace = self.shorthand(self.trace, '-t')
+        self.assertEqual(trace.returncode, 0, trace.stderr)
+        self.assertTrue((occupied.with_name('工序_trace_2') / 'trace_collection_pairs.csv').is_file())
+        self.assertEqual(sentinel.read_text(encoding='utf-8'), 'prior run')
+
+        source = self.source.read_text(encoding='utf-8').replace(
+            '<project>', '<project><fileHeader productName="InoProShop"/>', 1)
+        self.source.write_text(source, encoding='utf-8')
+        setup = self.shorthand('Cell.Phase[*]', '--trace-setup')
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        self.out = occupied.with_name('工序_trace_setup')
+        self.assertEqual(self.read('workflow_status.json')['mode'], 'trace_setup')
+        variables = (self.out / 'static_variables.txt').read_bytes()
+        self.assertEqual(variables, b'Cell.Phase[4]\n')
+        configuration = (self.out / 'PLC_trace_config.trace').read_bytes()
+
+        custom_root = self.root / '配置 输出'
+        custom_root.mkdir()
+        reserved = custom_root / '工序_trace_setup'
+        reserved.write_text('existing file', encoding='utf-8')
+        custom = self.shorthand('Cell.Phase[*]', '--trace-setup', '-output', custom_root.name)
+        self.assertEqual(custom.returncode, 0, custom.stderr)
+        self.out = custom_root / '工序_trace_setup_2'
+        self.assertEqual(Path(self.read('workflow_status.json')['out']), self.out.resolve())
+        self.assertEqual((self.out / 'static_variables.txt').read_bytes(), variables)
+        self.assertEqual((self.out / 'PLC_trace_config.trace').read_bytes(), configuration)
+        self.assertEqual(reserved.read_text(encoding='utf-8'), 'existing file')
+        self.assertFalse((custom_root / 'static_variables.txt').exists())
+
+    def test_trace_shorthand_requires_one_complete_output_suffix(self):
+        for marker, value in (('-t', self.trace), ('--trace-setup', 'Cell.Phase[*]')):
+            for suffix in (('-output',), ('-output', ''), ('-output', '--force'),
+                           ('-output', 'first', '-output', 'second')):
+                with self.subTest(marker=marker, suffix=suffix):
+                    args = ['plc_cli.py', str(self.source), str(value), marker, *suffix]
+                    with patch('sys.argv', args), redirect_stderr(io.StringIO()) as errors:
+                        with self.assertRaises(SystemExit) as error:
+                            main()
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertIn('-output', errors.getvalue())
+        self.assertFalse(self.out.exists())
 
     def test_trace_rebuild_archives_and_only_resumes_current_results(self):
         self.cli('trace')
@@ -85,106 +178,29 @@ class WorkflowRunTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, '无法续跑'):
                 self.cli('trace', '--resume')
 
-    def test_trace_has_one_entrypoint_and_only_trace_outputs(self):
+    def test_trace_preparation_preserves_full_source_evidence(self):
         self.cli('trace')
-        self.assertEqual(self.read('workflow_manifest.json')['extraction']['format'], 'plcopen')
-        self.assertFalse((self.out / 'batches').exists())
-        self.assertFalse((self.out / 'sequence_candidates.csv').exists())
-        self.assertFalse((self.out / 'source_transition_graph.json').exists())
-        for mode in ('predict', 'finish', 'coverage', 'evaluate'):
-            with self.subTest(mode=mode), self.assertRaises(SystemExit) as error:
-                self.cli(mode)
-            self.assertEqual(error.exception.code, 2)
+        manifest = self.read('workflow_manifest.json')
+        self.assertEqual(manifest['mode'], 'trace')
+        self.assertGreater(manifest['candidate_count'], 0)
+        for name in ('sequence_candidates.csv', 'indexed_candidates.csv', 'indexed_events.csv',
+                     'source_transition_edges.csv', 'source_transition_graph.json',
+                     'source_stage_candidates_filtered.csv', 'plcopen_action_trace.csv',
+                     'prediction_candidate_pairs.csv', 'prediction_collection_pairs.csv',
+                     'RESULT_SCHEMA.md'):
+            with self.subTest(name=name):
+                self.assertTrue((self.out / name).is_file())
+        self.assertTrue(list((self.out / 'batches').glob('*.input.json')))
+        self.assertTrue(list((self.out / 'batches_desc').glob('*.input.json')))
 
-    def test_trace_reads_smc2_source_without_candidate_preparation(self):
-        self.source = self.root / 'PLC.smc2'
-        network = {'CMT': '10：等待进料', 'CLs': [{'__type': 'IST', 'Ix': 1, 'X': 0, 'Y': 0,
-                    'TXT': 'IF Cell.Phase[4]=10 AND Ready THEN Cell.Phase[4]:=20; END_IF;'}]}
-        self.source.write_text(f'<smc2><entry type="json" name="Feed"><![CDATA[{json.dumps(network, ensure_ascii=False)}]]>'
-                               '</entry></smc2>', encoding='utf-8')
-        self.cli('trace')
-        status = self.read('workflow_status.json')
-        self.assertEqual((status['source_format'], status['unique_pairs'], status['a_sourced']), ('smc2', 1, 1))
-        evidence = self.read('trace_source_evidence.json')['pairs']['Cell.Phase[4]=10|||Cell.Phase[4]=20']
-        self.assertEqual((evidence['relation'], evidence['description']), ('direct', '等待进料'))
-        self.assertIn('Ready', evidence['direct'][0]['guard'])
-        self.assertFalse((self.out / 'batches').exists())
-
-    def test_native_comparison_only_channels_keep_their_source_station(self):
-        from openpyxl import load_workbook
-
-        self.source.write_text('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10">'
-                               '<Program name="EM01_上料"><BodyContent><ST>'
-                               'IF State[1]=10 THEN Ready:=TRUE; END_IF; '
-                               'IF Machine.Phase[1]=10 THEN Done:=TRUE; END_IF;'
-                               '</ST></BodyContent></Program>'
-                               '<Program name="EM02_下料"><BodyContent><ST>'
-                               'IF State[2]=10 THEN Ready:=TRUE; END_IF; '
-                               'IF Machine.Phase[2]=10 THEN Done:=TRUE; END_IF;'
-                               '</ST></BodyContent></Program></Project>', encoding='utf-8')
-        self.trace.write_text('TraceType,Continuous\nSampleTimingType,interval\n'
-                              'StartRawTime,1700000000000000000\n'
-                              'Index,RawTime,State[1]:INT,State[2]:INT,Machine.Phase[1]:INT,Machine.Phase[2]:INT\n'
-                              '0,1700000000000000000,10,10,10,10\n1,1700000000012000000,20,20,20,20\n',
-                              encoding='utf-8')
-        self.cli('trace')
-        with (self.out / 'trace_collection_pairs.csv').open(encoding='utf-8-sig', newline='') as stream:
-            pairs = list(csv.DictReader(stream))
-        self.assertEqual({r['控制器']: r['构成要素'] for r in pairs}, {
-            'State[1]': 'EM01_上料', 'Machine.Phase[1]': 'EM01_上料',
-            'State[2]': 'EM02_下料', 'Machine.Phase[2]': 'EM02_下料',
-        })
-        self.assertEqual({r['源码关系'] for r in pairs}, {'unresolved'})
-        status = self.read('workflow_status.json')
-        self.assertEqual(status['workstation_xlsx']['workstation_groups'], 2)
-        with Path(status['workstation_xlsx']['out']).open('rb') as stream:
-            book = load_workbook(stream, read_only=True)
-            self.assertEqual({r[1] for r in book.active.iter_rows(min_row=4, values_only=True) if r[6]}, {
-                'EM01_上料\nMachine.Phase[1]', 'EM01_上料\nState[1]',
-                'EM02_下料\nMachine.Phase[2]', 'EM02_下料\nState[2]',
-            })
-            book.close()
-
-    def test_smc2_uses_annotated_comparison_when_earlier_comparison_has_no_comment(self):
-        self.source = self.root / 'PLC.smc2'
-        networks = []
-        for value, comment in ((10, ''), (10, '等待夹具到位'), (20, '启动定位'), (20, '等待定位完成')):
-            networks.append(json.dumps({'CMT': comment, 'CLs': [{'__type': 'F', 'Name': 'EQ', 'In': [
-                {'__type': 'PRM', 'Arg': 'In1', 'Var': 'Cell.Phase[4]'},
-                {'__type': 'PRM', 'Arg': 'In2', 'Var': str(value)},
-            ]}]}, ensure_ascii=False))
-        self.source.write_text('<smc2><entry type="json" name="Fixture"><![CDATA['
-                               + '\n'.join(networks) + ']]></entry></smc2>', encoding='utf-8')
-        with self.trace.open('a', encoding='utf-8') as stream:
-            stream.write('2,1700000000024000000,30\n')
-        self.cli('trace')
-        pairs = self.read('trace_source_evidence.json')['pairs']
-        evidence = pairs['Cell.Phase[4]=10|||Cell.Phase[4]=20']
-        self.assertEqual((evidence['relation'], evidence['description']), ('unresolved', '等待夹具到位'))
-        self.assertEqual(pairs['Cell.Phase[4]=20|||Cell.Phase[4]=30']['description'], '')
-        self.assertEqual(self.read('workflow_status.json')['a_sourced'], 1)
-
-    def test_existing_trace_workbook_export_flag_is_compatible(self):
-        from gen_workstation_xlsx import main as export
-        from openpyxl import load_workbook
-
-        self.cli('trace')
-        tables = []
-        for flag in ('--pairs', '--prediction'):
-            workbook = self.root / f'{flag[2:]}.xlsx'
-            with patch('sys.argv', ['gen_workstation_xlsx.py', flag, str(self.out / 'trace_collection_pairs.csv'),
-                                    '--out', str(workbook)]), redirect_stdout(io.StringIO()):
-                export()
-            with workbook.open('rb') as stream:
-                book = load_workbook(stream, read_only=True)
-                tables.append(list(book.active.values))
-                book.close()
-        self.assertEqual(*tables)
-        no_duration = self.root / 'pairs_without_duration.csv'
-        no_duration.write_text('开始标签,结束标签\nCell.Phase[4]=10,Cell.Phase[4]=20\n', encoding='utf-8')
-        with patch('sys.argv', ['gen_workstation_xlsx.py', '--prediction', str(no_duration)]):
-            with self.assertRaisesRegex(SystemExit, '中位数时长ms'):
-                export()
+    def test_only_trace_and_capture_setup_are_public_commands(self):
+        for mode in ('predict', 'evaluate', 'finish', 'coverage'):
+            with self.subTest(mode=mode), patch('sys.argv', ['plc_cli.py', mode]):
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        main()
+                self.assertEqual(error.exception.code, 2)
+        self.assertFalse(self.out.exists())
 
     def test_rebuild_protects_inputs_and_refuses_a_concurrent_writer(self):
         self.out.mkdir()
@@ -192,7 +208,7 @@ class WorkflowRunTests(unittest.TestCase):
         nested_source = self.out / 'PLC.xml'
         nested_source.write_bytes(self.source.read_bytes())
         with self.assertRaisesRegex(ValueError, '输入分开'):
-            create(nested_source, self.out, trace=self.trace, force=True)
+            create(nested_source, self.out, force=True)
         self.assertTrue(nested_source.is_file())
         self.assertEqual(list(self.root.glob('out.previous-*')), [])
         with lock_run_dir(self.out), self.assertRaisesRegex(SystemExit, '正在由其他工作流命令使用'):

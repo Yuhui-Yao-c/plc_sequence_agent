@@ -7,7 +7,9 @@
     "external_directory": "ask",
     "skill": {
       "plc-trace-jump-analysis": "allow",
-      "plc-action-description": "allow"
+      "plc-action-description": "allow",
+      "plc-station-identity": "allow",
+      "plc-trace-setup": "allow"
     }
   }
 }

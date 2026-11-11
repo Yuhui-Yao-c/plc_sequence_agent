@@ -9,12 +9,14 @@ This parser does not prove PLC scan timing, library side effects or completion.
 from __future__ import annotations
 from collections import Counter, defaultdict
 from pathlib import Path
-import hashlib, json, re
+import csv, hashlib, json, re
 from lxml import etree
 from boundary_logic import (Expr, TRUE, FALSE, parse, combine, negate, integer,
     symbol, comparisons, compatible, substitute, BoundarySyntaxError, IDENT)
 
 XSI = '{http://www.w3.org/2001/XMLSchema-instance}type'
+CAND_FIELDS = ['构成要素','动作','动作描述','开始标签','结束标签','状态','证据POU','证据节点','原始条件','控制器','分支数']
+EVENT_FIELDS = ['source_format','source_unit','network','guard','command','arguments','feedback','next_state','relation','evidence','comment']
 WAIT = re.compile(r'等待|\bwait(?:ing)?\b|\bawait',re.I)
 HEAD_STEP = re.compile(r'^\s*(?:步\s*)?(\d+)\s*(?:[-—:：>]|步)',re.I)
 COMPARE = re.compile(rf'({IDENT})\s*(=|<>|!=)\s*((?:(?:U?D?INT|LINT|SINT|USINT|ULINT)\s*#\s*)?[-+]?\d+)(?![\w#])',re.I)
@@ -512,3 +514,46 @@ def collect_native(source):
             'Unresolved FB outputs, edge contacts, inline ST and dynamic writers retained with uncertainty.',
             'Comments are descriptive only; no GT or annotation monitor values used as transition evidence.',
             'Port references are scoped per rung; custom extensions outside supported bodies need review.']}
+
+
+def make_recall(model):
+    """Exhaustive observed state exits + connected pairs, no numeric sorting edges."""
+    byvar=defaultdict(lambda: {'compares':set(),'writes':set(),'sources':set(),'comments':{}})
+    for r in model['state_observations']:
+        key=(r['variable'],r.get('binding_scope',''));d=byvar[key]
+        d['compares' if r['kind'] in ('comparison','st_comparison') else 'writes'].add(r['value'])
+        d['sources'].add(r['entry']);d['comments'].setdefault(r['value'],r['comment'])
+    rows=[];controllers={}
+    for (v,bs),d in sorted(byvar.items()):
+        if not d['compares']:continue
+        observed=d['compares']|d['writes'];controllers[v+(' @ '+bs if bs else '')]={'states':sorted(observed),'compared':sorted(d['compares']),'assigned':sorted(d['writes'])}
+        for n in sorted(observed):
+            a=f'{v}={n}'
+            rows.append({'构成要素':v,'动作':'状态退出阶段候选','动作描述':d['comments'].get(n,''),
+                '开始标签':a,'结束标签':f'NOT ({a})','状态':'state_exit','证据POU':';'.join(sorted(d['sources'])),
+                '证据节点':'native_state_inventory','原始条件':'','控制器':v,'分支数':0})
+    for s in model['stage_records']:
+        rows.append({k:s.get(k,'') for k in CAND_FIELDS})
+    return rows,controllers
+
+
+def write_native_outputs(model,out):
+    from boundary_normalizer import write_csv
+    out=Path(out);out.mkdir(parents=True,exist_ok=True)
+    rows,controllers=make_recall(model)
+    write_csv(out/'recall_candidates.csv',rows,CAND_FIELDS)
+    with (out/'event_graph.csv').open('w',encoding='utf-8-sig',newline='') as f:
+        w=csv.writer(f);w.writerow(EVENT_FIELDS);w.writerows(model['native_events'])
+    graph={'events':len(model['native_events']),'command_kinds':len({e[4] for e in model['native_events']}),
+        'caveat':'Native port graph: explicit local guards or separately marked incomplete paths; no physical completion proof.'}
+    (out/'event_graph_audit.json').write_text(json.dumps(graph,ensure_ascii=False,indent=2),encoding='utf-8')
+    report={'source':model['source_name'],'units':model['summary']['bodies'],'controller_count':len(controllers),
+        'candidate_count':len(rows),'controllers':controllers,'warning':'State exits and local transitions are candidates, not confirmed physical actions.'}
+    (out/'recall_evidence.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    (out/'native_parse_audit.json').write_text(json.dumps(model['native_parse_audit'],ensure_ascii=False,indent=2),encoding='utf-8')
+    write_csv(out/'native_rung_inventory.csv',model['native_rung_inventory'])
+    write_csv(out/'native_command_evidence.csv',[{**r,'path':';'.join(r['path'])} for r in model['native_commands']])
+    write_csv(out/'native_unresolved_transitions.csv',[{**r,'possible_sources':';'.join(map(str,r['possible_sources']))} for r in model['native_partial_transitions']])
+    (out/'native_inline_slices.json').write_text(json.dumps(model.get('native_inline_slices',[]),ensure_ascii=False,indent=2),encoding='utf-8')
+    (out/'source_predicate_definitions.json').write_text(json.dumps({'source_sha256':model['source_sha256'],'predicates':model.get('source_predicates',{}),'temporal_dependencies':model.get('temporal_dependencies',[])},ensure_ascii=False,indent=2),encoding='utf-8')
+    return report,graph

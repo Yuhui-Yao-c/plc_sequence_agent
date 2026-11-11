@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import test_trace_to_pairs as fixtures
 from action_describe import cmd_a, cmd_build, cmd_validate
@@ -123,11 +124,33 @@ class TraceDescriptionTests(unittest.TestCase):
                          ['Line\nLine.Flow[2]', 'Line\nLine.Flow[10]', 'Line\nLine.Seq[2]'])
         self.assertEqual([sheet[f'G{r}'].value for r in (4, 5, 8, 11, 13)],
                          ['Line.Flow[2]=10', 'Line.Flow[2]=20', 'Line.Flow[10]=20', 'Line.Seq[2]=50', 'Solo=0'])
+        self.assertTrue(all(sheet.row_dimensions[r].height == 28 for r in (4, 5, 8, 11, 13)))
         self.assertIn('B4:B5', sheet.merged_cells)
         for row in (6, 7, 9, 10):
             self.assertTrue(all(cell.value is None for cell in sheet[row]))
         self.assertEqual((sheet['B12'].value, sheet['C12'].value, sheet['E12'].value), ('Line', '行时长合计', 48))
         self.assertEqual((sheet['B13'].value, sheet['C14'].value, sheet['E14'].value), ('Solo', '行时长合计', 12))
+
+    def test_trace_workbook_links_long_description_without_changing_data_row_height(self):
+        from openpyxl import load_workbook
+
+        self.record(10, 20)
+        self.source_edges(self.run, [(10, 20)])
+        comment = '等待工位确认并记录反馈位置。' * 9
+        self.write_csv(self.run / 'source_stage_candidates.csv', [self.comment(10, 20, comment)])
+        stats, _ = self.prepare()
+        cmd_validate(self.run)
+        result = workbook(stats['outputs']['pairs_csv'], run=str(self.run), sheet='trace步序采集表')
+        book = load_workbook(result['out'])
+        self.addCleanup(book.close)
+        primary, detail = book['trace步序采集表'], book['文本详情']
+        desc = primary['C4']
+        self.assertEqual(desc.value, comment)
+        self.assertEqual(primary.row_dimensions[4].height, 28)
+        self.assertEqual(primary.freeze_panes, 'D4')
+        dest = desc.hyperlink.location.split('!', 1)[1]
+        self.assertEqual(detail[dest].value, comment)
+        self.assertEqual(detail.cell(detail[dest].row, 1).hyperlink.location, "'trace步序采集表'!C4")
 
     def test_workbook_preserves_formula_like_source_comment_as_text(self):
         from openpyxl import load_workbook
@@ -151,29 +174,6 @@ class TraceDescriptionTests(unittest.TestCase):
         self.assertEqual(book.active['D4'].value, '注释')
         self.assertEqual(book.active['E4'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
         self.assertIsNone(book.active['J4'].value)
-
-    def test_trace_rows_share_one_height_and_link_to_full_text(self):
-        from openpyxl import load_workbook
-        from gen_workstation_xlsx import STEP_HEIGHT
-
-        path = self.run / 'trace_collection_pairs.csv'
-        long_note = '\n'.join(f'第{i}条原始条件 Step[1]=10 AND Ready' for i in range(1, 9))
-        self.write_csv(path, [
-            {'开始标签': 'Step[1]=10', '结束标签': 'Step[1]=20', '构成要素': 'Feed',
-             '中位数时长ms': 12, '备注': long_note, '源码关系': 'direct', '动作描述': '转入进料'},
-            {'开始标签': 'Step[1]=20', '结束标签': 'Step[1]=10', '构成要素': 'Feed',
-             '中位数时长ms': 24, '备注': '简短备注', '源码关系': 'direct', '动作描述': '复位'},
-        ])
-        result = workbook(path, run=self.run)
-        book = load_workbook(result['out'])
-        self.addCleanup(book.close)
-        sheet = book.active
-        self.assertEqual([sheet.row_dimensions[r].height for r in (4, 5)], [STEP_HEIGHT, STEP_HEIGHT])
-        self.assertEqual(sheet['I4'].value, long_note)
-        self.assertEqual(sheet['I4'].hyperlink.location, "'文本详情'!E2")
-        self.assertIsNone(sheet['I5'].hyperlink)
-        self.assertEqual(book['文本详情']['E2'].value, long_note)
-        self.assertEqual(book['文本详情']['A2'].hyperlink.location, "'trace步序采集表'!I4")
 
     def test_vague_notes_get_only_their_own_routine_and_control_details(self):
         self.write_part(self.FIRST + '_00001.csv', self.EPOCH,
@@ -496,7 +496,8 @@ class TraceDescriptionTests(unittest.TestCase):
         path = self.run / 'batches_desc/batch_001.result.json'
         path.write_text(json.dumps({'batch_id': 1, 'descs': {'Step[1]=10|||Step[1]=20': result}},
                                    ensure_ascii=False))
-        final = cmd_validate(self.run)
+        with patch('action_describe.load_wb', side_effect=AssertionError('Trace v4 must not load a word list')):
+            final = cmd_validate(self.run)
         row, = self.read_csv(final)
         self.assertEqual(row['动作描述'], '氮化硅靶磁控溅射镀膜指令下发，膜厚设定25.5纳米')
         self.assertEqual(row['描述状态'], 'LLM推断待核验')
