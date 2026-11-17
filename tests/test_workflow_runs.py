@@ -208,6 +208,27 @@ class WorkflowRunTests(unittest.TestCase):
                     self.assertIn('-output', errors.getvalue())
         self.assertFalse(self.out.exists())
 
+    def test_capture_shorthand_selects_task_or_reuses_reference_before_output(self):
+        self.source.write_text('<project><fileHeader productName="InoProShop"/>'
+                               '<pou name="Run"><body><ST>Cell.Phase[4] := 3;</ST></body></pou>'
+                               '<instances><configurations><configuration name="Device"><resource name="App">'
+                               '<task name="Scan A" interval="PT0.003S"/><task name="Scan B"/>'
+                               '</resource></configuration></configurations></instances></project>', encoding='utf-8')
+        root = '配置 输出'
+        first = self.shorthand('Cell.Phase[*]', '--trace-setup', '--task-name', 'Scan A', '--every-n-cycles', '2',
+                               '-output', root)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        report = json.loads(first.stdout)
+        self.assertEqual(report['nominal_sample_interval_ms'], 6)
+        second = self.shorthand('Cell.Phase[*]', '--trace-setup', '--task-from-trace', report['configuration'],
+                                '-output', root)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        replay = json.loads(second.stdout)
+        self.assertEqual((replay['task_name_source'], replay['every_n_cycles']), ('参考 Trace', 2))
+        self.assertEqual(Path(replay['configuration']).read_bytes(), Path(report['configuration']).read_bytes())
+        invalid = self.shorthand(self.trace, '-t', '--task-name', 'Scan A')
+        self.assertEqual(invalid.returncode, 2)
+
     def test_trace_rebuild_archives_and_only_resumes_current_results(self):
         self.cli('trace')
         batch_path, = (self.out / 'batches_desc').glob('*.input.json')

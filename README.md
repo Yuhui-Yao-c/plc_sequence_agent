@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码提取显式变量，生成采集通道配置。
 
-当前简化版为 **10.2.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **10.3.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -18,7 +18,7 @@ opencode
 | 入口 | 输入 |
 | --- | --- |
 | 一　Trace 步序采集 | `源码路径 Trace路径 -t [-output 输出根目录]` |
-| 二　Trace 采集配置 | `源码路径 模式1 [模式2 ...] --trace-setup [-output 输出根目录]` |
+| 二　Trace 采集配置 | `源码路径 模式1 [模式2 ...] --trace-setup [任务选项] [-output 输出根目录]` |
 
 ```text
 "source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "D:\工作成果"
@@ -32,6 +32,19 @@ opencode
 ```powershell
 python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" "re:Line\.Stage[0-9]+" --trace-setup -output "D:\工作成果"
 ```
+
+### 选择汇川 Trace 的采样任务
+
+已有现场样例时，`--task-from-trace` 从样例记录读取 `TaskName` 和 `EveryNCycles`。通道仍取自本次 XML 匹配，输出从零个样本开始。也可以用 `--task-name` 指定工程中的任务，用 `--every-n-cycles N` 指定每几个任务周期采一次。简写和完整 CLI 都支持这三个选项。
+
+```powershell
+python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" --trace-setup --task-from-trace "现场样例.trace" -output "D:\工作成果"
+python plc_cli.py trace-setup --source "source/工程/PLC.xml" --pattern "Cell.Phase[*]" --task-name "ScanTask" --every-n-cycles 2 --out "outputs/本次配置"
+```
+
+入口二从 XML 读取标准资源及厂商扩展中的任务声明，按声明核对任务名。省略任务选项时，单任务工程采用该任务。多任务工程沿用模板中能被源码唯一确认的任务，否则输出 `needs_review` 和候选清单。XML 未导出任务时保留原来的配置能力，并在状态中标明待现场核对。
+
+`workflow_status.json` 的 `declared_tasks` 列出作用域、周期、优先级、对象 ID 和任务直接调度的程序。`task_name_source` 记录选取依据。`nominal_sample_interval_ms` 是有确定周期时的任务周期乘以 `EveryNCycles`。入口一计算观测时长时使用实测时间戳。
 
 ## 命令与续跑
 

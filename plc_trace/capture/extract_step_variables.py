@@ -22,6 +22,9 @@ from plc_trace.paths import PROJECT_ROOT, RESOURCE_ROOT
 
 from plc_trace.analysis.boundary_logic import integer, symbol
 from plc_trace.analysis.candidate_filter import glob_regex
+from plc_trace.capture.plcopen_tasks import (
+    is_task_declaration, record_settings, sampling_task, task_declaration, validated_task_name,
+)
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
 from plc_trace.trace.trace_to_pairs import INTEGER_TYPES
@@ -171,6 +174,7 @@ class _SourceScan:
         self.programs = {}
         self.header = ''
         self.parse_issues = []
+        self.tasks = []
 
     def _read(self, text, unit, line):
         if not text or not text.strip():
@@ -195,6 +199,7 @@ class _SourceScan:
             self.parse_issues = audit.get('parse_issues', [])
             return
         frames = [_Frame('', None, False, False, '')]
+        task_node = None
         with source.open('rb') as stream:
             for event, node in etree.iterparse(stream, events=('start', 'end'), huge_tree=True,
                                                no_network=True, resolve_entities=False):
@@ -209,6 +214,8 @@ class _SourceScan:
                         self.header = ' '.join(node.get(k, '') for k in ('companyName', 'productName')).casefold()
                     if tag == 'program' and name:
                         self.programs[name.casefold()] = unit
+                    if tag == 'task' and task_node is None and self.source_format == 'plcopen' and is_task_declaration(node):
+                        task_node = node
                     continue
                 frame = frames.pop()
                 parent = frames[-1]
@@ -221,6 +228,12 @@ class _SourceScan:
                     self._read(node.tail, parent.unit, node.sourceline)
                 if frame.tag == 'typename' and self.source_format == 'omron_iec61131_10':
                     self._type_name(node, frame)
+                if task_node is not None:
+                    if node is not task_node:
+                        continue
+                    if node.get('name', '').strip():
+                        self.tasks.append(task_declaration(node))
+                    task_node = None
                 node.clear(keep_tail=True)
                 while node.getprevious() is not None:
                     del node.getparent()[0]
@@ -330,11 +343,10 @@ def _sysmac_config(channels, task):
     return stream.getvalue().encode('utf-8-sig')
 
 
-def _inovance_config(channels, task, source_digest):
-    template = RESOURCE_ROOT / 'templates' / 'inovance_trace.xml'
-    root = ET.parse(template).getroot()
+def _inovance_config(root, channels, task, source_digest):
     record = root.find(".//Single[@Name='Record']")
-    record.find("./Single[@Name='TaskName']").text = task
+    record.find("./Single[@Name='TaskName']").text = task['task_name']
+    record.find("./Single[@Name='EveryNCycles']").text = str(task['every_n_cycles'])
     record.find("./Single[@Name='guidPOU']").text = str(uuid5(NAMESPACE_URL, 'plc-trace:' + source_digest))
     variables = record.find("./Single[@Name='VariableList']/List")
     diagrams = record.find("./Single[@Name='Diagrams']/List2")
@@ -377,13 +389,17 @@ def _publish(out, files, force):
             raise
 
 
-def generate(source, out, pattern, *, capture_format='auto', task_name=None, default_type=None,
-             case_sensitive=False, force=False):
+def generate(source, out, pattern, *, capture_format='auto', task_name=None, task_from_trace=None,
+             every_n_cycles=None, default_type=None, case_sensitive=False, force=False):
     source_input = Path(source).absolute()
     source, out = source_input.resolve(), Path(out).resolve()
     if (source_input.is_relative_to(out) or source.is_relative_to(out) or Path.cwd().is_relative_to(out)
             or PROJECT_ROOT.is_relative_to(out)):
         raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
+    if task_from_trace is not None:
+        reference = Path(task_from_trace).absolute()
+        if reference.is_relative_to(out) or reference.resolve().is_relative_to(out):
+            raise ValueError('参考 Trace 须位于输出目录之外')
     matcher = _Selectors(pattern, case_sensitive)
     if capture_format not in ('auto', 'sysmac', 'inovance'):
         raise ValueError('采集格式须为 auto、sysmac 或 inovance')
@@ -439,22 +455,27 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, def
         if not channels:
             raise ValueError('没有可按指定名称导出的采集变量，请核对变量作用域')
         ordered = sorted(channels.values(), key=lambda channel: _sort_key(channel['name']))
-        task = task_name if task_name is not None else ('BaseControl' if capture_format == 'sysmac' else 'MainTask')
-        if not task.strip() or any(ch in task for ch in '\r\n'):
-            raise ValueError('采集任务名称须为非空单行')
+        if capture_format == 'sysmac':
+            if task_from_trace is not None or every_n_cycles is not None:
+                raise ValueError('--task-from-trace 和 --every-n-cycles 适用于汇川 .trace')
+            task = {'task_name': validated_task_name(task_name) if task_name is not None else 'BaseControl',
+                    'task_name_source': '用户指定' if task_name is not None else '模板默认'}
+        else:
+            template = ET.parse(RESOURCE_ROOT / 'templates' / 'inovance_trace.xml').getroot()
+            task = sampling_task(scan.tasks, record_settings(template.find('./TraceConfiguration')),
+                                 task_name=task_name, task_from_trace=task_from_trace, every_n_cycles=every_n_cycles)
         config = None
         files = {'static_variables.txt': ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
-        if not unresolved and not scan.parse_issues:
+        if task['task_name'] and not unresolved and not scan.parse_issues:
             extension = 'csv' if capture_format == 'sysmac' else 'trace'
             config = source.stem + '_trace_config.' + extension
-            files[config] = (_sysmac_config(ordered, task) if capture_format == 'sysmac'
-                             else _inovance_config(ordered, task, digest))
+            files[config] = (_sysmac_config(ordered, task['task_name']) if capture_format == 'sysmac'
+                             else _inovance_config(template, ordered, task, digest))
         report = {
             'version': __version__, 'mode': 'trace_setup', 'status': 'done' if config else 'needs_review',
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,
             'pattern': matcher.single_pattern,
-            'patterns': matcher.patterns, 'capture_format': capture_format, 'task_name': task,
-            'task_name_source': '用户指定' if task_name else '模板默认',
+            'patterns': matcher.patterns, 'capture_format': capture_format, **task,
             'static_variables': len(ordered), 'channels': ordered,
             'dynamic_variables': sorted(scan.dynamic.values(), key=_sort_key),
             'unresolved_types': unresolved, 'parse_issues': scan.parse_issues,
@@ -465,6 +486,13 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, def
         return report
 
 
+def add_task_arguments(parser):
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument('--task-name', help='指定采样任务，汇川按导出的源码任务表核对')
+    selector.add_argument('--task-from-trace', help='复用汇川参考 Trace 的 TaskName 和 EveryNCycles')
+    parser.add_argument('--every-n-cycles', type=int, help='汇川每 N 个任务周期采样一次，覆盖参考或模板值')
+
+
 def add_arguments(parser):
     parser.add_argument('--source', required=True, help='PLCopen、Sysmac IEC61131-10 或 SMC2 XML')
     selector = parser.add_mutually_exclusive_group(required=True)
@@ -473,7 +501,7 @@ def add_arguments(parser):
     selector.add_argument('--regex', help='对完整变量名匹配的 Python 正则')
     parser.add_argument('--out', required=True, help='独立输出目录')
     parser.add_argument('--format', choices=('auto', 'inovance', 'sysmac'), default='auto')
-    parser.add_argument('--task-name', help='在采集客户端使用的 PLC 任务名')
+    add_task_arguments(parser)
     parser.add_argument('--default-type', type=str.upper, choices=sorted(INTEGER_TYPES),
                         help='Sysmac 缺少根变量声明时使用的已核实整数类型')
     parser.add_argument('--case-sensitive', action='store_true', help='按原大小写匹配变量')
@@ -484,7 +512,8 @@ def run(args):
     pattern = args.pattern if args.regex is None else 're:' + args.regex
     try:
         report = generate(args.source, args.out, pattern, capture_format=args.format,
-                          task_name=args.task_name, default_type=args.default_type,
+                          task_name=args.task_name, task_from_trace=args.task_from_trace,
+                          every_n_cycles=args.every_n_cycles, default_type=args.default_type,
                           case_sensitive=args.case_sensitive, force=args.force)
     except (OSError, ValueError, re.error, etree.XMLSyntaxError) as exc:
         raise SystemExit(f'采集配置生成失败：{exc}') from exc

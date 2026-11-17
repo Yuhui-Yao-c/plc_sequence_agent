@@ -172,10 +172,18 @@ def _expand_trace_shorthand(parser, args):
         parser.error('Trace 采集输入一个路径；采集配置输入一个或多个独立匹配模式')
     suffix = args[marker_index + 1:]
     root = Path('outputs')
-    if suffix:
-        if len(suffix) != 2 or suffix[0] != '-output' or not suffix[1].strip() or suffix[1].startswith('-'):
+    if '-output' in suffix:
+        if suffix.index('-output') != len(suffix) - 2 or not suffix[-1].strip() or suffix[-1].startswith('-'):
             parser.error('简写的输出选项须在末尾写成 -output "输出根目录"')
-        root = Path(suffix[1])
+        root = Path(suffix[-1])
+        suffix = suffix[:-2]
+    if suffix:
+        if marker != '--trace-setup':
+            parser.error('Trace 分析简写仅接受末尾的 -output "输出根目录"')
+        from plc_trace.capture.extract_step_variables import add_task_arguments
+        sampling = argparse.ArgumentParser(prog=parser.prog + ' … --trace-setup', add_help=False, allow_abbrev=False)
+        add_task_arguments(sampling)
+        sampling.parse_args(suffix)
 
     from plc_trace.output.utils import infer_proc_name
     proc_name = infer_proc_name(source)
@@ -187,14 +195,14 @@ def _expand_trace_shorthand(parser, args):
         index += 1
 
     mode, option = routes[marker]
-    return [mode, f'--source={source}', *(f'{option}={value}' for value in values), f'--out={out}']
+    return [mode, f'--source={source}', *(f'{option}={value}' for value in values), *suffix, f'--out={out}']
 
 
 def main():
  p=argparse.ArgumentParser(description='PLC Trace 步序采集与采集配置')
  p.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
  p.epilog = ('Trace 简写可用 源码 Trace路径 -t [-output 输出根目录] '
-             '或 源码 模式1 [模式2 ...] --trace-setup [-output 输出根目录]')
+             '或 源码 模式1 [模式2 ...] --trace-setup [任务选项] [-output 输出根目录]')
  sub=p.add_subparsers(dest='mode',required=True)
  x=sub.add_parser('trace',help='trace步序采集模式：trace跳变→状态对→A/B档动作描述→交付表')
  x.add_argument('--source',required=True,help='PLC源码XML路径（用于动作变量映射/步注释/工位身份）')

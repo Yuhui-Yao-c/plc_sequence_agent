@@ -41,7 +41,7 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录"
 
 ### 入口二　Trace 采集配置
 
-**输入**　`源码路径 模式1 [模式2 ...] --trace-setup [-output 输出根目录]`
+**输入**　`源码路径 模式1 [模式2 ...] --trace-setup [任务选项] [-output 输出根目录]`
 
 选择器支持完整变量名、`*`/`?` 通配、`re:` 全匹配正则。每个模式作为独立参数，命中任一即纳入同一清单并按完整变量名去重。可混用不同形式，通配中的方括号按字面匹配。
 
@@ -51,7 +51,9 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录"
 python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "outputs"
 ```
 
-完整 CLI 使用 `trace-setup --source "源码" --pattern "模式1" --pattern "模式2" --out "实际运行子目录"`，也可只传一个模式。可用 `--regex`、`--case-sensitive`、`--format` 和 `--task-name`。`--default-type` 仅用于已核实的 Sysmac 缺失根声明类型。
+完整 CLI 使用 `trace-setup --source "源码" --pattern "模式1" --pattern "模式2" --out "实际运行子目录"`，也可只传一个模式。可用 `--regex`、`--case-sensitive` 和 `--format`。`--default-type` 仅用于已核实的 Sysmac 缺失根声明类型。
+
+用户提供样例以复用汇川采样设置时，在 `--trace-setup` 后传 `--task-from-trace "样例路径"`。用户指定任务名时传 `--task-name "任务名"`。二者任选其一。汇川采样分频用 `--every-n-cycles N`，可覆盖样例值。完整 CLI 也接受这些选项。
 
 **执行**
 
@@ -59,7 +61,7 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-s
 
 **验收**
 
-检查 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。`needs_review` 提供清单及具体原因。配置采样数为 0，现场导出的实测记录可进入入口一。
+检查 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。汇川配置报告任务名、选择依据、源码核对结果和每 N 个周期采样一次的设置。`needs_review` 提供清单及具体原因。配置采样数为 0，现场导出的实测记录可进入入口一。
 
 ## 输出与续跑
 
