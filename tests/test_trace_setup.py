@@ -24,7 +24,8 @@ class TraceSetupTests(unittest.TestCase):
         self.out = self.root / 'setup'
 
     def plcopen(self, body, *, header='<fileHeader productName="InoProShop"/>', encoding='utf-8'):
-        self.source.write_text(f'<project>{header}<pou name="Run"><body>{body}</body></pou></project>',
+        self.source.write_text(f'<project>{header}<pou name="Run"><body>{body}</body></pou>'
+                               '<resource><task name="CaptureTask"><pouInstance name="Run"/></task></resource></project>',
                                encoding=encoding)
 
     def sysmac(self, body):
@@ -100,10 +101,9 @@ class TraceSetupTests(unittest.TestCase):
                             ['Cell.Phase[-1,2]', 'Feed.Phase', 'Cell.Phase[-1,2]'])
         self.assertEqual(multiple['channels'], report['channels'])
         self.assertEqual(Path(multiple['configuration']).read_bytes(), config.read_bytes())
-        for options in ({'every_n_cycles': 3}, {'task_from_trace': self.root / 'other.trace'}):
-            with self.subTest(options=options), self.assertRaisesRegex(ValueError, '汇川'):
-                generate(self.source, self.root / 'invalid', 'Feed.Phase', **options)
-            self.assertFalse((self.root / 'invalid').exists())
+        with self.assertRaisesRegex(ValueError, '汇川'):
+            generate(self.source, self.root / 'invalid', 'Feed.Phase', every_n_cycles=3)
+        self.assertFalse((self.root / 'invalid').exists())
 
     def test_multiple_patterns_union_deduplicates_and_preserves_configuration(self):
         self.plcopen('<ST>Cell.Phase[2] := 10; Cell.Phase[10] := 20; Flow.Stage := 1; '

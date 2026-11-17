@@ -141,7 +141,8 @@ class WorkflowRunTests(unittest.TestCase):
         self.assertEqual(sentinel.read_text(encoding='utf-8'), 'prior run')
 
         source = self.source.read_text(encoding='utf-8').replace(
-            '<project>', '<project><fileHeader productName="InoProShop"/>', 1)
+            '<project>', '<project><fileHeader productName="InoProShop"/>'
+            '<resource><task name="Capture"><pouInstance name="Demo"/></task></resource>', 1)
         self.source.write_text(source, encoding='utf-8')
         setup = self.shorthand('Cell.Phase[*]', '--trace-setup')
         self.assertEqual(setup.returncode, 0, setup.stderr)
@@ -167,7 +168,7 @@ class WorkflowRunTests(unittest.TestCase):
     def test_capture_multiple_patterns_in_shorthand_and_repeated_cli_options(self):
         self.source.write_text('<project><fileHeader productName="InoProShop"/>'
                                '<pou name="Run"><body><ST>Cell.Phase[4] := 10; Aux.Stage := 1;'
-                               '</ST></body></pou></project>', encoding='utf-8')
+                               '</ST></body></pou><resource><task name="Clock"/></resource></project>', encoding='utf-8')
         cli = Path(__file__).resolve().parents[1] / 'plc_cli.py'
         patterns = ['Cell.Phase[*]', r're:Aux\.Stage', 'Cell.Phase[4]']
         selected_root = self.root / '采集 输出'
@@ -208,11 +209,11 @@ class WorkflowRunTests(unittest.TestCase):
                     self.assertIn('-output', errors.getvalue())
         self.assertFalse(self.out.exists())
 
-    def test_capture_shorthand_selects_task_or_reuses_reference_before_output(self):
+    def test_capture_shorthand_uses_xml_and_allows_an_explicit_clock(self):
         self.source.write_text('<project><fileHeader productName="InoProShop"/>'
                                '<pou name="Run"><body><ST>Cell.Phase[4] := 3;</ST></body></pou>'
                                '<instances><configurations><configuration name="Device"><resource name="App">'
-                               '<task name="Scan A" interval="PT0.003S"/><task name="Scan B"/>'
+                               '<task name="Scan A" interval="PT0.003S"><pouInstance name="Run"/></task><task name="Scan B"/>'
                                '</resource></configuration></configurations></instances></project>', encoding='utf-8')
         root = '配置 输出'
         first = self.shorthand('Cell.Phase[*]', '--trace-setup', '--task-name', 'Scan A', '--every-n-cycles', '2',
@@ -220,12 +221,13 @@ class WorkflowRunTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         report = json.loads(first.stdout)
         self.assertEqual(report['nominal_sample_interval_ms'], 6)
-        second = self.shorthand('Cell.Phase[*]', '--trace-setup', '--task-from-trace', report['configuration'],
-                                '-output', root)
+        second = self.shorthand('Cell.Phase[*]', '--trace-setup', '-output', root)
         self.assertEqual(second.returncode, 0, second.stderr)
-        replay = json.loads(second.stdout)
-        self.assertEqual((replay['task_name_source'], replay['every_n_cycles']), ('参考 Trace', 2))
-        self.assertEqual(Path(replay['configuration']).read_bytes(), Path(report['configuration']).read_bytes())
+        auto = json.loads(second.stdout)
+        self.assertEqual((auto['task_name'], auto['nominal_sample_interval_ms'], auto['buffer_entries']),
+                         ('Scan A', 3, 668))
+        obsolete = self.shorthand('Cell.Phase[*]', '--trace-setup', '--task-from-trace', 'unused.trace')
+        self.assertEqual(obsolete.returncode, 2)
         invalid = self.shorthand(self.trace, '-t', '--task-name', 'Scan A')
         self.assertEqual(invalid.returncode, 2)
 

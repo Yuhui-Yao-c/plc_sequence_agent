@@ -53,7 +53,7 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-s
 
 完整 CLI 使用 `trace-setup --source "源码" --pattern "模式1" --pattern "模式2" --out "实际运行子目录"`，也可只传一个模式。可用 `--regex`、`--case-sensitive` 和 `--format`。`--default-type` 仅用于已核实的 Sysmac 缺失根声明类型。
 
-用户提供样例以复用汇川采样设置时，在 `--trace-setup` 后传 `--task-from-trace "样例路径"`。用户指定任务名时传 `--task-name "任务名"`。二者任选其一。汇川采样分频用 `--every-n-cycles N`，可覆盖样例值。完整 CLI 也接受这些选项。
+汇川配置从本次 XML 自动选择采样任务。按普通简写执行。用户明确指定采样时钟或分频时，才传 `--task-name "任务名"` 或 `--every-n-cycles N`。
 
 **执行**
 
@@ -61,7 +61,7 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-s
 
 **验收**
 
-检查 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。汇川配置报告任务名、选择依据、源码核对结果和每 N 个周期采样一次的设置。`needs_review` 提供清单及具体原因。配置采样数为 0，现场导出的实测记录可进入入口一。
+检查 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。汇川配置报告任务名、写入覆盖数、名义采样间隔和缓冲点数。若多个任务写入不同通道，说明整份记录使用哪个任务的节拍。`needs_review` 提供清单及具体原因。配置采样数为 0，现场导出的实测记录可进入入口一。
 
 ## 输出与续跑
 

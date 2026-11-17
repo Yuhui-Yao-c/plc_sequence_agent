@@ -23,7 +23,7 @@ from plc_trace.paths import PROJECT_ROOT, RESOURCE_ROOT
 from plc_trace.analysis.boundary_logic import integer, symbol
 from plc_trace.analysis.candidate_filter import glob_regex
 from plc_trace.capture.plcopen_tasks import (
-    is_task_declaration, record_settings, sampling_task, task_declaration, validated_task_name,
+    ProgramWrites, Routine, is_task_declaration, sampling_task, task_declaration, validated_task_name,
 )
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
@@ -45,6 +45,9 @@ _IGNORED = re.compile(
 _COMMENT_EDGE = re.compile(r'\(\*|\*\)')
 _XML_COMMENTS = {'comment', 'comments', 'documentation', 'networkcomment', 'description'}
 _EXPRESSION_ATTRIBUTES = {'identifier', 'expression', 'variable', 'var', 'reference'}
+_CALL = re.compile(rf'(?P<qualified>\.\s*)?(?<![\w#])(?P<name>{_NAME})\s*\(')
+_ST_OPERATOR = re.compile(r'\(|\)|:=|=>')
+_OUTPUT_END = re.compile(r'\s*[,)]')
 
 
 def _executable_text(text):
@@ -90,26 +93,59 @@ def _reference_end(text, end):
     return end, not _CONTINUATION.match(text, end)
 
 
-def _channels(text):
-    for part in _executable_text(text):
-        position = 0
-        while match := _ROOT.search(part, position):
-            position, complete = _reference_end(part, match.end())
-            if not complete:
-                continue
-            name = symbol(part[match.start():position])
-            indexes = _SUBSCRIPT.findall(name)
-            # An inner bracket denotes an expression, even when its own index is constant.
-            if name.count('[') != len(indexes):
-                yield name, name, True
-                continue
-            values = [tuple(_constant(value) for value in index.split(',')) for index in indexes]
-            if any(None in index for index in values):
-                yield name, name, True
-                continue
-            groups = iter(values)
-            canonical = _SUBSCRIPT.sub(lambda _: '[' + ','.join(map(str, next(groups))) + ']', name)
-            yield name, canonical, False
+def _channels(part):
+    position = 0
+    while match := _ROOT.search(part, position):
+        position, complete = _reference_end(part, match.end())
+        if not complete:
+            continue
+        name = symbol(part[match.start():position])
+        indexes = _SUBSCRIPT.findall(name)
+        # An inner bracket denotes an expression, even when its own index is constant.
+        if name.count('[') != len(indexes):
+            yield name, name, True, match.start(), position
+            continue
+        values = [tuple(_constant(value) for value in index.split(',')) for index in indexes]
+        if any(None in index for index in values):
+            yield name, name, True, match.start(), position
+            continue
+        groups = iter(values)
+        canonical = _SUBSCRIPT.sub(lambda _: '[' + ','.join(map(str, next(groups))) + ']', name)
+        yield name, canonical, False, match.start(), position
+
+
+
+def _st_targets(code):
+    """Find assignment ends and FB output argument starts outside strings and comments."""
+    assigned, outputs = set(), set()
+    depth = 0
+    for marker in _ST_OPERATOR.finditer(code):
+        op = marker[0]
+        if op == '(':
+            depth += 1
+        elif op == ')':
+            depth -= 1
+        elif op == ':=' and depth == 0:
+            end = marker.start()
+            while end and code[end - 1].isspace():
+                end -= 1
+            assigned.add(end)
+        elif op == '=>' and depth > 0:
+            start = marker.end()
+            while start < len(code) and code[start].isspace():
+                start += 1
+            outputs.add(start)
+    return assigned, outputs
+
+
+def _xml_output(node, tag, parent):
+    if (tag, parent) in {('expression', 'outvariable'), ('variable', 'coil')}:
+        return True
+    if (tag, parent) != ('expression', 'connectionpointout'):
+        return False
+    pin = node.getparent().getparent()
+    return (pin is not None and _local_name(pin.tag) == 'variable' and pin.getparent() is not None
+            and _local_name(pin.getparent().tag) == 'outputvariables')
 
 
 def _local_name(tag):
@@ -175,20 +211,37 @@ class _SourceScan:
         self.header = ''
         self.parse_issues = []
         self.tasks = []
+        self.program_writes = ProgramWrites()
 
-    def _read(self, text, unit, line):
+    def _read(self, text, unit, line, routine=None, *, st=False, output=False):
         if not text or not text.strip():
             return
-        for raw, name, dynamic in _channels(text):
-            names = (name, raw)
-            if unit and unit[0] == 'program':
-                names += (f'{unit[1]}.{name}', f'{unit[1]}.{raw}')
-            if any(self.matcher.fullmatch(value) for value in names):
+        parts = _executable_text(text)
+        if routine is not None and st:
+            # A call or assignment can span comments, strings and multiple physical lines.
+            code = ' '.join(parts)
+            routine.calls.update(m['name'].casefold() for m in _CALL.finditer(code) if not m['qualified'])
+            assigned, outputs = _st_targets(code)
+            parts = (code,)
+        for part in parts:
+            for raw, name, dynamic, start, end in _channels(part):
+                names = (name, raw)
+                if unit and unit[0] == 'program':
+                    names += (f'{unit[1]}.{name}', f'{unit[1]}.{raw}')
+                if not any(self.matcher.fullmatch(value) for value in names):
+                    continue
                 key = name if self.case_sensitive else name.casefold()
                 if dynamic:
                     self.dynamic.setdefault(key, name)
-                else:
-                    self.references.setdefault((key, unit), (name, raw, line))
+                    continue
+                self.references.setdefault((key, unit), (name, raw, line))
+                if routine is None:
+                    continue
+                is_target = output and raw == symbol(text)
+                if st:
+                    is_target = end in assigned or (start in outputs and _OUTPUT_END.match(part, end))
+                if is_target:
+                    routine.writes.setdefault(name.casefold(), line)
 
     def read(self, source):
         if self.source_format == 'smc2':
@@ -200,6 +253,8 @@ class _SourceScan:
             return
         frames = [_Frame('', None, False, False, '')]
         task_node = None
+        routines = []
+        plcopen = self.source_format == 'plcopen'
         with source.open('rb') as stream:
             for event, node in etree.iterparse(stream, events=('start', 'end'), huge_tree=True,
                                                no_network=True, resolve_entities=False):
@@ -214,18 +269,40 @@ class _SourceScan:
                         self.header = ' '.join(node.get(k, '') for k in ('companyName', 'productName')).casefold()
                     if tag == 'program' and name:
                         self.programs[name.casefold()] = unit
-                    if tag == 'task' and task_node is None and self.source_format == 'plcopen' and is_task_declaration(node):
+                    if plcopen and name and not parent.body and tag in {'pou', 'action', 'method'}:
+                        owner = next((r.program for _, r in reversed(routines) if r.program), '')
+                        routines.append((node, Routine.definition(tag, name, node.get('pouType', ''), owner)))
+                    if tag == 'task' and task_node is None and plcopen and is_task_declaration(node):
                         task_node = node
                     continue
                 frame = frames.pop()
                 parent = frames[-1]
                 if frame.body and not frame.comment:
-                    self._read(node.text, frame.unit, node.sourceline)
+                    routine = routines[-1][1] if routines else None
+                    st = (frame.tag in ('st', 'stcode') or
+                          (frame.tag == 'xhtml' and parent.tag in ('st', 'stcode')))
+                    self._read(node.text, frame.unit, node.sourceline, routine, st=st,
+                               output=routine is not None and _xml_output(node, frame.tag, parent.tag))
+                    if routine is not None:
+                        if frame.tag == 'block' and not node.get('instanceName') and node.get('typeName'):
+                            routine.calls.add(node.get('typeName').casefold())
+                        elif frame.tag == 'reference' and parent.tag == 'action' and node.get('name'):
+                            routine.calls.add(node.get('name').casefold())
                     for attribute, value in node.attrib.items():
                         if _local_name(attribute) in _EXPRESSION_ATTRIBUTES:
                             self._read(value, frame.unit, node.sourceline)
                 if parent.body and not parent.comment:
                     self._read(node.tail, parent.unit, node.sourceline)
+                if routines:
+                    definition, routine = routines[-1]
+                    if (frame.tag == 'variable' and not frame.body and parent.tag.endswith('vars')
+                            and parent.tag != 'externalvars' and node.get('name')):
+                        routine.variables.add(node.get('name').casefold())
+                    if frame.tag == 'pathstructure' and node.get('name') == routine.name:
+                        routine.bind_path(node, definition)
+                    if node is definition:
+                        self.program_writes.add(routine)
+                        routines.pop()
                 if frame.tag == 'typename' and self.source_format == 'omron_iec61131_10':
                     self._type_name(node, frame)
                 if task_node is not None:
@@ -347,6 +424,7 @@ def _inovance_config(root, channels, task, source_digest):
     record = root.find(".//Single[@Name='Record']")
     record.find("./Single[@Name='TaskName']").text = task['task_name']
     record.find("./Single[@Name='EveryNCycles']").text = str(task['every_n_cycles'])
+    record.find("./Single[@Name='BufferEntries']").text = str(task['buffer_entries'])
     record.find("./Single[@Name='guidPOU']").text = str(uuid5(NAMESPACE_URL, 'plc-trace:' + source_digest))
     variables = record.find("./Single[@Name='VariableList']/List")
     diagrams = record.find("./Single[@Name='Diagrams']/List2")
@@ -389,17 +467,13 @@ def _publish(out, files, force):
             raise
 
 
-def generate(source, out, pattern, *, capture_format='auto', task_name=None, task_from_trace=None,
+def generate(source, out, pattern, *, capture_format='auto', task_name=None,
              every_n_cycles=None, default_type=None, case_sensitive=False, force=False):
     source_input = Path(source).absolute()
     source, out = source_input.resolve(), Path(out).resolve()
     if (source_input.is_relative_to(out) or source.is_relative_to(out) or Path.cwd().is_relative_to(out)
             or PROJECT_ROOT.is_relative_to(out)):
         raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
-    if task_from_trace is not None:
-        reference = Path(task_from_trace).absolute()
-        if reference.is_relative_to(out) or reference.resolve().is_relative_to(out):
-            raise ValueError('参考 Trace 须位于输出目录之外')
     matcher = _Selectors(pattern, case_sensitive)
     if capture_format not in ('auto', 'sysmac', 'inovance'):
         raise ValueError('采集格式须为 auto、sysmac 或 inovance')
@@ -456,14 +530,14 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, tas
             raise ValueError('没有可按指定名称导出的采集变量，请核对变量作用域')
         ordered = sorted(channels.values(), key=lambda channel: _sort_key(channel['name']))
         if capture_format == 'sysmac':
-            if task_from_trace is not None or every_n_cycles is not None:
-                raise ValueError('--task-from-trace 和 --every-n-cycles 适用于汇川 .trace')
+            if every_n_cycles is not None:
+                raise ValueError('--every-n-cycles 适用于汇川 .trace')
             task = {'task_name': validated_task_name(task_name) if task_name is not None else 'BaseControl',
                     'task_name_source': '用户指定' if task_name is not None else '模板默认'}
         else:
             template = ET.parse(RESOURCE_ROOT / 'templates' / 'inovance_trace.xml').getroot()
-            task = sampling_task(scan.tasks, record_settings(template.find('./TraceConfiguration')),
-                                 task_name=task_name, task_from_trace=task_from_trace, every_n_cycles=every_n_cycles)
+            task = sampling_task(scan.tasks, scan.program_writes, channels, template.find('./TraceConfiguration'),
+                                 task_name=task_name, every_n_cycles=every_n_cycles)
         config = None
         files = {'static_variables.txt': ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
         if task['task_name'] and not unresolved and not scan.parse_issues:
@@ -487,10 +561,8 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None, tas
 
 
 def add_task_arguments(parser):
-    selector = parser.add_mutually_exclusive_group()
-    selector.add_argument('--task-name', help='指定采样任务，汇川按导出的源码任务表核对')
-    selector.add_argument('--task-from-trace', help='复用汇川参考 Trace 的 TaskName 和 EveryNCycles')
-    parser.add_argument('--every-n-cycles', type=int, help='汇川每 N 个任务周期采样一次，覆盖参考或模板值')
+    parser.add_argument('--task-name', help='指定采样任务，汇川按导出的源码任务表核对')
+    parser.add_argument('--every-n-cycles', type=int, help='汇川每 N 个任务周期采样一次，默认 1')
 
 
 def add_arguments(parser):
@@ -512,7 +584,7 @@ def run(args):
     pattern = args.pattern if args.regex is None else 're:' + args.regex
     try:
         report = generate(args.source, args.out, pattern, capture_format=args.format,
-                          task_name=args.task_name, task_from_trace=args.task_from_trace,
+                          task_name=args.task_name,
                           every_n_cycles=args.every_n_cycles, default_type=args.default_type,
                           case_sensitive=args.case_sensitive, force=args.force)
     except (OSError, ValueError, re.error, etree.XMLSyntaxError) as exc:

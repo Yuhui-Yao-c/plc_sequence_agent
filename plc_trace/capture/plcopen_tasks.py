@@ -1,7 +1,8 @@
 """Read project schedules and resolve the single sampling task of a CODESYS Trace record."""
 import math
 import re
-from pathlib import Path
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 
 from lxml import etree
 
@@ -10,7 +11,9 @@ _NUMBER = r'[0-9]+(?:\.[0-9]+)?'
 _ISO_TIME = re.compile(rf'P(?:({_NUMBER})D)?(?:T(?:({_NUMBER})H)?(?:({_NUMBER})M)?(?:({_NUMBER})S)?)?', re.I)
 _TIME_UNIT_MS = {'d': 86400000, 'h': 3600000, 'm': 60000, 's': 1000, 'ms': 1, 'us': .001, 'ns': .000001}
 _IEC_PART = re.compile(rf'({_NUMBER})(ms|us|ns|d|h|m|s)')
-_TASK_DATA = 'http://www.3s-software.com/plcopenxml/task'
+_UINT32_MAX = 2**32 - 1
+_BUFFER_WINDOW_MS = 2000
+_VENDOR_DATA = 'http://www.3s-software.com/plcopenxml/'
 
 
 def _milliseconds(value, unit=''):
@@ -34,7 +37,7 @@ def is_task_declaration(node):
     if parent is None:
         return False
     tag = etree.QName(parent).localname
-    return tag == 'resource' or (tag == 'data' and parent.get('name') == _TASK_DATA)
+    return tag == 'resource' or (tag == 'data' and parent.get('name') == _VENDOR_DATA + 'task')
 
 
 def task_declaration(node):
@@ -76,36 +79,106 @@ def validated_task_name(value):
 def _stride(value):
     # EveryNCycles is serialized as System.UInt32.
     digits = str(value).strip().lstrip('0')
-    if not re.fullmatch(r'[0-9]{1,10}', digits) or int(digits) > 4294967295:
+    if not re.fullmatch(r'[0-9]{1,10}', digits) or int(digits) > _UINT32_MAX:
         raise ValueError('EveryNCycles / --every-n-cycles 须为 1 至 4294967295 的整数')
     return int(digits)
 
 
-def record_settings(configuration):
-    records = configuration.findall("./{*}Single/{*}Single[@Name='Record']")
-    lists = configuration.findall("./{*}Single/*[@Name='RecordList']")
-    if len(records) != 1 or any(len(item) for item in lists):
-        raise ValueError('参考 Trace 须包含一个可明确定位的 Record')
-    names = records[0].findall("./{*}Single[@Name='TaskName']")
-    strides = records[0].findall("./{*}Single[@Name='EveryNCycles']")
-    if len(names) != 1 or len(strides) != 1:
-        raise ValueError('Trace 记录需要唯一的 TaskName 和 EveryNCycles')
-    return validated_task_name((names[0].text or '').strip()), _stride(strides[0].text)
+@dataclass(eq=False)
+class Routine:
+    name: str
+    program: str
+    is_root: bool
+    is_program: bool
+    calls: set = field(default_factory=set)
+    writes: dict = field(default_factory=dict)
+    path_owners: set = field(default_factory=set)
+    variables: set = field(default_factory=set)
+
+    @classmethod
+    def definition(cls, tag, name, pou_type, owner):
+        is_root = tag == 'pou'
+        return cls(name, name if is_root else owner, is_root,
+                   is_root and pou_type.casefold() in ('program', ''))
+
+    def bind_path(self, leaf, definition):
+        """Detached actions carry their POU in their own vendor project-tree path."""
+        if self.is_root or self.program:
+            return
+        parent = leaf.getparent()
+        owner = None
+        while parent is not None and etree.QName(parent).localname == 'pathStructure':
+            if owner is None and parent.get('isFolder', '').casefold() != 'true':
+                owner = parent.get('name')
+            parent = parent.getparent()
+        if (owner and parent is not None and parent.get('name') == _VENDOR_DATA + 'pathstructure'
+                and parent.getparent() is not None and parent.getparent().getparent() is definition):
+            self.path_owners.add(owner)
 
 
-def reference_settings(path):
-    """Stop at the configuration boundary, before captured values and timestamps."""
-    with Path(path).open('rb') as stream:
-        for event, node in etree.iterparse(stream, events=('start', 'end'), no_network=True, resolve_entities=False):
-            tag = etree.QName(node).localname
-            if node.getparent() is None and tag != 'Trace':
-                break
-            if node.getparent() is not None and node.getparent().getparent() is None:
-                if tag == 'TraceConfiguration' and event == 'end':
-                    return record_settings(node)
-                if tag == 'TraceData':
-                    break
-    raise ValueError('参考文件缺少汇川 TraceConfiguration 配置段')
+class ProgramWrites:
+    """Index executable definitions. Resolve calls only to unambiguous XML definitions."""
+
+    def __init__(self):
+        self.roots = defaultdict(list)
+        self.actions = defaultdict(list)
+
+    def add(self, routine):
+        if routine.is_root:
+            if routine.is_program:
+                self.roots[routine.program.casefold()].append(routine)
+            return
+        owners = {routine.program} if routine.program else routine.path_owners
+        if len(owners) == 1:
+            owner, = owners
+            self.actions[owner.casefold(), routine.name.casefold()].append(routine)
+
+    def reachable(self, program):
+        root = self.roots.get(program.casefold(), ())
+        if len(root) != 1:
+            return {}
+        queue = deque([(root[0], program.casefold(), [root[0].name])])
+        visited, writes = set(), {}
+        while queue:
+            routine, owner, path = queue.popleft()
+            if routine in visited:
+                continue
+            visited.add(routine)
+            locals_ = routine.variables | self.roots[owner][0].variables
+            for variable, line in routine.writes.items():
+                root_name = re.split(r'[.\[]', variable, maxsplit=1)[0]
+                if root_name not in locals_:
+                    writes.setdefault(variable, {'call_path': path, 'xml_line': line})
+            for called in sorted(routine.calls - locals_):
+                definitions = self.actions.get((owner, called))
+                next_owner = owner
+                if definitions is None:
+                    definitions = self.roots.get(called, ())
+                    next_owner = called
+                if len(definitions) == 1:
+                    callee, = definitions
+                    queue.append((callee, next_owner, path + [callee.name]))
+        return writes
+
+    def bind(self, tasks, channels):
+        """Attach a witness per distinct configured channel to its declaring task."""
+        by_name, coverage, cached = defaultdict(list), defaultdict(set), {}
+        all_writes = set()
+        for task in tasks:
+            key = task['name'].casefold()
+            by_name[key].append(task)
+            evidence = {}
+            for instance in task['pou_instances']:
+                program = (instance['type_name'] or instance['name']).strip()
+                if program not in cached:
+                    cached[program] = self.reachable(program)
+                for channel, witness in cached[program].items():
+                    if channel in channels:
+                        evidence.setdefault(channels[channel]['name'], witness)
+            task['channel_writes'] = evidence
+            coverage[key].update(evidence)
+            all_writes.update(evidence)
+        return by_name, coverage, all_writes
 
 
 def _one_declaration(matches):
@@ -124,47 +197,77 @@ def _one_declaration(matches):
     return first
 
 
-def sampling_task(tasks, defaults, *, task_name, task_from_trace, every_n_cycles):
-    """Prefer the requested sampler. Program scheduling alone cannot identify an earlier recording's choice."""
-    name, cycles = defaults
-    origin, cycle_origin = '模板默认', '模板默认'
-    reference = None
-    if task_from_trace is not None:
-        if task_name is not None:
-            raise ValueError('--task-name 和 --task-from-trace 只能指定其一')
-        reference = str(Path(task_from_trace).resolve())
-        name, cycles = reference_settings(reference)
-        origin = cycle_origin = '参考 Trace'
-    elif task_name is not None:
-        name, origin = validated_task_name(task_name).strip(), '用户指定'
-    elif len({t['name'].casefold() for t in tasks}) == 1:
-        name, origin = tasks[0]['name'], '源码唯一任务'
-    if every_n_cycles is not None:
-        cycles, cycle_origin = _stride(every_n_cycles), '用户指定'
+def _runtime_buffer(configuration, record, interval):
+    buffer = int(record.findtext("./Single[@Name='BufferEntries']"))
+    override = configuration.findtext("./Single/Single[@Name='TraceSettings']/Single[@Name='OverrideRTSBufferSize']")
+    buffer_origin = '模板设置'
+    # A two-second runtime buffer at the configured cadence, including both endpoints.
+    if interval and override == 'False' and _BUFFER_WINDOW_MS / interval <= _UINT32_MAX - 1:
+        buffer = max(10, math.ceil(_BUFFER_WINDOW_MS / interval) + 1)
+        buffer_origin = '按名义采样间隔计算'
+    return buffer, buffer_origin
 
-    matches = [t for t in tasks if t['name'].casefold() == name.casefold()]
-    selected = _one_declaration(matches)
-    note = ''
-    if selected:
-        name = selected['name']
-        if origin == '模板默认':
-            origin = '模板默认（源码已核对）'
+
+def sampling_task(tasks, program_writes, channels, configuration, *, task_name, every_n_cycles):
+    """Select one sampler for the record using distinct, explicitly written channels."""
+    record = configuration.find("./Single/Single[@Name='Record']")
+    default_cycles = record.findtext("./Single[@Name='EveryNCycles']")
+    cycles = _stride(every_n_cycles if every_n_cycles is not None else default_cycles)
+    by_name, coverage, all_writes = program_writes.bind(tasks, channels)
+
+    name, origin, note = None, '待选择', ''
+    if task_name is not None:
+        name, origin = validated_task_name(task_name).strip(), '用户指定'
+    elif len(by_name) == 1:
+        name, origin = tasks[0]['name'], '源码唯一任务'
     elif tasks:
-        names = '、'.join(dict.fromkeys(t['name'] for t in tasks))
-        if len(matches) > 1:
-            note = f'源码中有多个同名任务 {name}，需核对目标应用或资源的导出范围'
+        highest = max(map(len, coverage.values()))
+        leaders = [key for key, matched in coverage.items() if len(matched) == highest]
+        resolved = (_one_declaration(group) for group in by_name.values())
+        scopes = {tuple(task['scope']) for task in resolved if task and task['channel_writes'] and task['scope']}
+        if highest and len(leaders) == 1 and len(scopes) <= 1:
+            name, origin = by_name[leaders[0]][0]['name'], '源码写入通道覆盖'
         else:
-            note = f'源码中未找到任务 {name}，可用 --task-name 选择已声明任务：{names}'
-        if task_name is not None or reference is not None:
-            raise ValueError(note)
-        name, origin = None, '待选择'
-    else:
-        note = 'XML 未提供任务声明，任务名须在采集客户端核对'
+            counts = '、'.join(f"{group[0]['name']}（{len(coverage[key])}）" for key, group in by_name.items())
+            if not highest:
+                reason = '未找到已调度程序对所选通道的明确写入'
+            elif len(scopes) > 1:
+                reason = '写入证据分属多个应用或资源'
+            else:
+                reason = '最高写入覆盖数并列'
+            note = f'{reason}。各任务覆盖通道数：{counts}'
+
+    selected = None
+    if name and tasks:
+        matches = by_name.get(name.casefold(), ())
+        selected = _one_declaration(matches)
+        if selected:
+            name = selected['name']
+            covered = len(selected['channel_writes'])
+            if covered < len(channels):
+                note = f'所选任务有 {covered}/{len(channels)} 个通道的静态写入证据。'
+            if any(matched for key, matched in coverage.items() if key != name.casefold()):
+                note += '有通道由其他任务写入。此记录的全部通道均按所选任务的节拍采样。'
+        else:
+            note = (f'源码中有多个同名任务 {name}，需核对目标应用或资源' if matches else
+                    f"源码中未找到任务 {name}。已声明：{'、'.join(t['name'] for t in tasks)}")
+            if task_name is not None:
+                raise ValueError(note)
+            name, origin = None, '待选择'
+    elif not tasks:
+        note = ('XML 未提供任务声明，指定的任务名须在采集客户端核对' if name else
+                'XML 未提供任务声明，请导出含任务的工程，或以 --task-name 指定已核实的采样任务')
 
     period = selected['period_ms'] if selected else None
+    interval = period * cycles if period is not None else None
+    if interval is not None and not math.isfinite(interval):
+        interval = None
+    buffer, buffer_origin = _runtime_buffer(configuration, record, interval)
     return {
         'task_name': name, 'task_name_source': origin, 'every_n_cycles': cycles,
-        'every_n_cycles_source': cycle_origin, 'task_verified_in_xml': selected is not None,
-        'nominal_sample_interval_ms': period * cycles if period is not None else None,
-        'task_from_trace': reference, 'task_note': note, 'declared_tasks': tasks,
+        'every_n_cycles_source': '用户指定' if every_n_cycles is not None else '模板默认',
+        'task_verified_in_xml': selected is not None, 'nominal_sample_interval_ms': interval,
+        'buffer_entries': buffer, 'buffer_entries_source': buffer_origin,
+        'task_note': note, 'declared_tasks': tasks,
+        'channels_without_task_write': [item['name'] for item in channels.values() if item['name'] not in all_writes],
     }

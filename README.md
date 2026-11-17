@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码提取显式变量，生成采集通道配置。
 
-当前简化版为 **10.3.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **11.0.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -33,18 +33,26 @@ opencode
 python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" "re:Line\.Stage[0-9]+" --trace-setup -output "D:\工作成果"
 ```
 
-### 选择汇川 Trace 的采样任务
+### 汇川采样任务如何产生
 
-已有现场样例时，`--task-from-trace` 从样例记录读取 `TaskName` 和 `EveryNCycles`。通道仍取自本次 XML 匹配，输出从零个样本开始。也可以用 `--task-name` 指定工程中的任务，用 `--every-n-cycles N` 指定每几个任务周期采一次。简写和完整 CLI 都支持这三个选项。
+入口二只需本次工程 XML 和变量匹配模式。生成器读取 XML 的任务名、任务类型、周期和 `pouInstance`，把已调度的程序、可定位的例程调用与所选通道的明确写入关联起来。
+
+| XML 情况 | 默认结果 |
+| --- | --- |
+| 唯一任务声明 | 使用该任务的工程名称 |
+| 同一资源有多个任务 | 对每个任务所写的不同通道计数，选择有写入证据且覆盖数唯一最高的任务。所有已选通道进入同一条采集记录 |
+| 没有任务声明、同名任务不能区分、覆盖并列或写入任务跨资源 | 保留变量清单，在 `workflow_status.json` 说明 `needs_review` 的原因。可补充完整工程导出，或使用已核实的 `--task-name` |
+
+`.trace` 的 `Record.TaskName` 指定一个采样任务。默认 `EveryNCycles=1`。已知周期时，名义采样间隔为任务周期乘以分频。自动缓冲按本工作流的 2 秒窗口计算，点数为 `max(10, ceil(2000 / 名义间隔毫秒) + 1)`。事件任务、周期缺失或冲突、无法编码点数时保留模板缓冲值，并记录其来源。分频与缓冲窗口属于采集配置策略。历史采样任务、触发设置和时间戳精度可能由工程师在客户端单独选择。
+
+`declared_tasks[].channel_writes` 给出每个任务覆盖的通道、程序调用路径及写入所在 XML 元素的行号。`channels_without_task_write` 列出缺少已调度写入证据的通道。这些通道仍保留在变量清单中。任务的工程对象 ID 和优先级保存在状态文件，客户端从当前应用提供可选任务列表。
+
+需要使用另一个采样时钟时，可在简写或完整 CLI 中指定工程内的任务名和分频。
 
 ```powershell
-python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" --trace-setup --task-from-trace "现场样例.trace" -output "D:\工作成果"
-python plc_cli.py trace-setup --source "source/工程/PLC.xml" --pattern "Cell.Phase[*]" --task-name "ScanTask" --every-n-cycles 2 --out "outputs/本次配置"
+python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" --trace-setup
+python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" --trace-setup --task-name "ScanTask" --every-n-cycles 2
 ```
-
-入口二从 XML 读取标准资源及厂商扩展中的任务声明，按声明核对任务名。省略任务选项时，单任务工程采用该任务。多任务工程沿用模板中能被源码唯一确认的任务，否则输出 `needs_review` 和候选清单。XML 未导出任务时保留原来的配置能力，并在状态中标明待现场核对。
-
-`workflow_status.json` 的 `declared_tasks` 列出作用域、周期、优先级、对象 ID 和任务直接调度的程序。`task_name_source` 记录选取依据。`nominal_sample_interval_ms` 是有确定周期时的任务周期乘以 `EveryNCycles`。入口一计算观测时长时使用实测时间戳。
 
 ## 命令与续跑
 
