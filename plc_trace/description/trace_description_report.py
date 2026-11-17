@@ -156,3 +156,96 @@ def action_evidence_text(info, candidate):
             ordered[ref] = item
         lines.extend(text for item in ordered.values() if (text := _fact_text(item)))
     return '\n'.join(lines)
+
+
+def annotation_evidence_text(info):
+    """Resolve only the references actually selected for the starting annotation."""
+    references = info.get('description_refs', ())
+    records = {e.get('source_id'): e for e in info.get('direct', ())}
+    records.update((n.get('id'), n) for n in info.get('start_notes', ()))
+    lines = []
+    for ref in references:
+        record = records.get(ref, {})
+        text = info['description']  # A multi-step source note can contain other branches.
+        lines.append(f'起始步原注「{text}」' + _location(record, ref))
+    return '\n'.join(dict.fromkeys(lines))
+
+
+def _comment_wait(text, start):
+    # A complete state label denotes its role. A mention inside a command,
+    # alarm, alternative or target position carries no such assertion.
+    text = normalize('NFKC', text).strip()
+    prefix = re.match(r'^(?:步\s*)?([+-]?\d+)(?:\s*[:—-]\s*|\s+)', text)
+    if prefix:
+        if prefix[1] != start.rpartition('=')[2].strip():
+            return ''
+        text = text[prefix.end():].strip()
+    text = text.strip('= \t。')
+    role = re.fullmatch(r'(待料|堵料)(?:步|状态)?', text)
+    if role:
+        return role[1]
+    if text in ('等待来料', '等待上游供料'):
+        return '待料'
+    if text == '等待下游接料':
+        return '堵料'
+    if re.fullmatch(r'等待(?!位|时间|步|状态)[^，,;；。\n！？?]+', text):
+        return '等待'
+    return ''
+
+
+def _material_gate(fact, clause, start):
+    """Accept a single positive release signal whose own declaration identifies material flow."""
+    data = fact['data']
+    symbol = clause.get('subject_symbol', '').casefold()
+    choices = [x for x in fact.get('subjects', ()) if x['symbol'].casefold() == symbol]
+    if len(choices) != 1 or not choices[0].get('label'):
+        return '', ''
+    guard = data.get('guard', '').casefold()
+    terms = [re.sub(r'[()\s]', '', part) for part in re.split(r'\band\b', guard)]
+    state = re.sub(r'\s', '', start.casefold())
+    if sorted(terms) not in (sorted([state, symbol]), sorted([state, symbol + '=true'])):
+        return '', ''
+    # The agent interprets the declaration. Validate its two literal citations
+    # against this exact signal instead of maintaining equipment or phrase lists.
+    flow = clause.get('material_flow')
+    if not isinstance(flow, dict) or flow.get('side') not in ('upstream', 'downstream'):
+        return '', ''
+    label = choices[0]['label']
+    peer, transfer = flow.get('peer_quote'), flow.get('handoff_quote')
+    if not all(isinstance(q, str) and len(q.strip()) >= 2 and q in label for q in (peer, transfer)):
+        return '', ''
+    if peer in transfer or transfer in peer:
+        return '', ''
+    role = '待料' if flow['side'] == 'upstream' else '堵料'
+    return role, (f'LLM 判读待核：本步放行条件 {data["guard"]}〔{fact["id"]}〕，'
+                  f'变量原注 {choices[0]["symbol"]}「{label}」，交接方「{peer}」，物料交接「{transfer}」')
+
+
+def waiting_role(info, start, candidate=None, result=None):
+    """Return a documented waiting role and its row-local reference."""
+    if info.get('relation') == 'ambiguous_scope' or 'conflicting_comments' in info.get('source_issues', ()):
+        return '', ''
+    if info.get('description'):
+        refs = info.get('description_refs', ())
+        role = _comment_wait(info['description'], start) if refs else ''
+        return (role, '起始步原注 ' + '、'.join(refs)) if role else ('', '')
+    if not candidate or not candidate.get('clause_evidence'):
+        return '', ''
+    # Only accepted v4 wait clauses about the observed branch qualify.
+    # A typed condition check, parallel action or alternate branch is different.
+    catalog = {e['id']: e for e in info.get('description_context', {}).get('evidence', ())}
+    actions = (result or {}).get('actions') or []
+    wait_refs, material = [], []
+    for action in actions:
+        ref = action.get('source_ref')
+        fact = catalog.get(ref, {})
+        data = fact.get('data', {})
+        if (action.get('condition_use') != 'wait' or not fact.get('local') or
+                fact.get('category') != 'step_condition' or not data.get('guard_complete') or
+                info.get('relation') != 'direct' or len(info.get('direct', ())) != 1):
+            return '', ''
+        wait_refs.append(ref)
+        material.append(_material_gate(fact, action, start))
+    if material and len(set(material)) == 1 and material[0][0]:
+        return material[0]
+    return ('等待', '已校验的本步等待条件 ' + '、'.join(dict.fromkeys(wait_refs))) if wait_refs else ('', '')

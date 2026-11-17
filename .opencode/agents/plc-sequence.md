@@ -37,7 +37,7 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录"
 
 检查 `workflow_status.json`、`trace_collection_pairs.csv`、`action_desc_final.csv` 和 `<工序名>_trace步序采集表.xlsx`。`prepared_b_tier_pending` 仍需处理当前批次，`done_with_review` 已出表且有复核，`done` 为完成。`failed`、`xlsx_failed` 按实际阶段诊断。
 
-`trace_pairs_review.csv` 保存源码迁移复核，`action_desc_review.csv` 保存描述复核。工作簿按工位和完整步序变量分块，行高 28 pt，长文本在「文本详情」展开。A 档来源标「注释」，B 档标红色「LLM」，保留分句证据。
+`trace_pairs_review.csv` 保存源码迁移复核，`action_desc_review.csv` 保存描述复核。工作簿按工位和完整步序变量分块，主表「时序拆解」保留模板列与等高数据行，长文本在「文本详情」展开。核验每个观测对的证据链及中位数时长。A 档来源标「注释」，B 档标红色「LLM」。待料、堵料着色依据见动作描述协议。
 
 ### 入口二　Trace 采集配置
 

@@ -16,7 +16,9 @@ import pandas as pd
 from plc_trace.paths import RESOURCE_ROOT
 from plc_trace.output.gen_workstation_xlsx import load_action_map, var_of, load_var_docs
 from plc_trace.trace.trace_source_evidence import RELATION_TEXT, read_trace_evidence
-from plc_trace.description.trace_description_report import action_evidence_text, annotation_supplement
+from plc_trace.description.trace_description_report import (
+    action_evidence_text, annotation_evidence_text, annotation_supplement, waiting_role,
+)
 from plc_trace.description.trace_description_context import (
     LEGACY_CLAUSE_SCHEMA, SCHEMA as TRACE_CONTEXT_SCHEMA, validate_context_result,
 )
@@ -471,7 +473,7 @@ def _build_trace_batches(df, outdir, evidence, batch_size, run_id):
                 '有目标时填写target，引用实参时用target_parameter写出同一调用中的形参名。'
                 '工艺词和kind按当前工程表达。命名类比只用于识别对象，不能当动作依据。'
                 '步号不匹配的注释仅作上下文。区分指令、反馈与完成，区分超时监控和正常等待。'
-                '保留basis、kind及reasoning。缺证据时提交ok=false和明确的reason。交付描述由通过的分句合成。'
+                '明确为物料交接等待时，可在wait分句附material_flow：side为upstream（待料）或downstream（堵料），peer_quote及handoff_quote分别原样引用所选subject的label中的交接方与物料交接。缺少任一依据就省略。保留basis、kind及reasoning。缺证据时提交ok=false和明确的reason。交付描述由通过的分句合成。'
             ),
         }
         if run_id:
@@ -593,6 +595,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
             reason = ('缺少可用于描述的本网络证据' if relation == 'direct'
                       else RELATION_TEXT.get(relation, '缺少Trace源码证据，需重跑'))
             counts['unresolved_rows'] += 1
+        wait, wait_ref = waiting_role(info, row['开始标签'], candidate, results.get(key))
         record = {k: row[k] for k in ('行号', '开始标签', '结束标签', '动作变量')}
         rows.append({
             **record, '动作描述': desc, '行性质': kind, '描述来源': source,
@@ -600,13 +603,14 @@ def _validate_trace(run, a, evidence, allowed, stats):
             '推断依据': candidate.get('reasoning', '') if status == 'LLM推断待核验' else '',
             '证据等级': candidate.get('evidence_level', '') if status == 'LLM推断待核验' else '源码注释' if desc else '',
             '注释补充': annotation_supplement(info) if status == '源码注释' else '',
-            '证据': action_evidence_text(info, candidate) if candidate else '',
+            '证据': action_evidence_text(info, candidate) if candidate else annotation_evidence_text(info),
+            '等待判定': wait, '等待依据': wait_ref, '待核原因': reason,
         })
         if reason:
             review.append({**record, '描述状态': status, '原因': reason})
     fields = ['行号', '开始标签', '结束标签', '动作变量']
     out = run / 'action_desc_final.csv'
-    columns = fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用', '推断依据', '证据等级', '注释补充', '证据']
+    columns = fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用', '推断依据', '证据等级', '注释补充', '证据', '等待判定', '等待依据', '待核原因']
     pd.DataFrame(rows, columns=columns).to_csv(out, index=False, encoding='utf-8-sig')
     pd.DataFrame(review, columns=fields + ['描述状态', '原因']).to_csv(
         run / 'action_desc_review.csv', index=False, encoding='utf-8-sig')

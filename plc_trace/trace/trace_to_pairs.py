@@ -662,6 +662,7 @@ PAIR_FIELDS = [
     # Runtime columns (trace-specific):
     '动作变量', '发生次数', '中位数时长ms', '最小时长ms', '最大时长ms',
     '首次时间ms', '末次时间ms', '所属周期数', '备注', '估算时长次数', '源码关系',
+    '样例跳变索引', '样例采集ID',
 ]
 
 
@@ -722,9 +723,16 @@ def generate(trace_path, run, source=None, proc_name=None,
         variables = parse_trace(trace_path)
         if not any(channel['sample_count'] for channel in variables.values()):
             raise ValueError(f'{trace_path}: 无采样数据，请提供采集后导出的 Trace 记录')
+        unit = next(iter(variables.values()))['timestamp_unit']
         if matches is not None:
             variables = {name: vd for name, vd in variables.items() if matches(name)}
-        trace_input = {'format': 'twincat_scope_xml'}
+        trace_input = {'format': 'twincat_scope_xml', 'timestamp_unit': unit}
+    # Native microsecond clocks retain sub-ms samples and half-tick medians.
+    fine_clock = trace_input.get('timestamp_unit') == 'us'
+
+    def report_ms(value):
+        return round(value, 4) if fine_clock else int(value)
+
     run.mkdir(parents=True, exist_ok=True)
     active_count = sum(1 for v in variables.values() if not v['inactive'])
     inactive_count = sum(1 for v in variables.values() if v['inactive'])
@@ -737,7 +745,7 @@ def generate(trace_path, run, source=None, proc_name=None,
     for name, vd in variables.items():
         var_meta[name] = {
             'sample_count': vd['sample_count'],
-            'time_range_ms': [int(vd['time_range'][0]), int(vd['time_range'][1])],
+            'time_range_ms': [report_ms(vd['time_range'][0]), report_ms(vd['time_range'][1])],
             'inactive': vd['inactive'],
             'jump_count': len(vd['jumps']),
             'unique_values': [_val_to_int(x) for x in vd['unique_values']],
@@ -756,7 +764,7 @@ def generate(trace_path, run, source=None, proc_name=None,
                 '变量': name,
                 'from值': _val_to_int(from_v),
                 'to值': _val_to_int(to_v),
-                '时间戳ms': int(ts),
+                '时间戳ms': report_ms(ts),
                 '样本索引': idx,
             }
             if captures:
@@ -775,9 +783,9 @@ def generate(trace_path, run, source=None, proc_name=None,
             row = {
                 '变量': name,
                 '值': _val_to_int(value),
-                '起始ms': int(s_ts),
-                '结束ms': int(e_ts),
-                '时长ms': int(dur),
+                '起始ms': report_ms(s_ts),
+                '结束ms': report_ms(e_ts),
+                '时长ms': report_ms(dur),
             }
             if captures:
                 row['采集ID'] = captures[bisect_right(time_starts, s_ts) - 1]['recording_id']
@@ -786,14 +794,14 @@ def generate(trace_path, run, source=None, proc_name=None,
 
     # ---- 4. Detect cycles ----
     cycles = detect_cycles(variables, idle_threshold_ms=idle_threshold_ms)
-    cycle_data = [{'boundary_ts': int(ts), 'var': name} for ts, name in cycles]
+    cycle_data = [{'boundary_ts': report_ms(ts), 'var': name} for ts, name in cycles]
     if captures:
         active_channels = [set(r['active_channels']) for r in captures]
         cycle_data = []
         for ts, name in cycles:
             index = bisect_right(time_starts, ts) - 1
             if name in active_channels[index]:
-                cycle_data.append({'boundary_ts': int(ts), 'var': name,
+                cycle_data.append({'boundary_ts': report_ms(ts), 'var': name,
                                    'recording_id': captures[index]['recording_id']})
     (run / 'trace_cycles.json').write_text(
         json.dumps(cycle_data, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -808,6 +816,7 @@ def generate(trace_path, run, source=None, proc_name=None,
     # pair_key = (var_name, from_val, to_val) -> list of duration_ms
     pair_durations = defaultdict(list)
     pair_first_ts = {}
+    pair_example = {}
     pair_last_ts = {}
     pair_cycles = defaultdict(set)
     pair_estimated = defaultdict(int)
@@ -821,7 +830,7 @@ def generate(trace_path, run, source=None, proc_name=None,
         # (A prior range(1,...) loop silently dropped jumps[0]; when a variable
         # only ran one cycle, its first transition was lost forever — e.g.
         # ST06.AutoStep[2] 50->60, ST07.AutoStep[1] 45->50.)
-        first_sample_ts = int(vd['time_range'][0])
+        first_sample_ts = report_ms(vd['time_range'][0])
         dwell_starts = vd.get('dwell_starts')
         estimated_dwells = vd.get('estimated_dwells', ())
         for k in range(len(jumps)):
@@ -841,12 +850,14 @@ def generate(trace_path, run, source=None, proc_name=None,
                 prev_ts = first_sample_ts if k == 0 else jumps[k - 1][3]
             dur = ts - prev_ts
             key = (name, from_v, to_v)
-            pair_durations[key].append(int(dur))
+            pair_durations[key].append(report_ms(dur))
             if idx in estimated_dwells:
                 pair_estimated[key] += 1
             if key not in pair_first_ts:
-                pair_first_ts[key] = int(prev_ts)
-            pair_last_ts[key] = int(ts)
+                pair_first_ts[key] = report_ms(prev_ts)
+                capture = captures[bisect_right(index_starts, idx) - 1] if captures else {}
+                pair_example[key] = (idx - capture.get('index_offset', 0), capture.get('recording_id', ''))
+            pair_last_ts[key] = report_ms(ts)
             pair_cycles[key].add(bisect_right(boundaries, ts))
 
     # ---- 6. Index source evidence for the exact observed variable names ----
@@ -890,9 +901,10 @@ def generate(trace_path, run, source=None, proc_name=None,
         # Station name for grouping
         ws_name = indexed_stations.get(var_name) or _station_name(var_name, si_map, var_docs)
 
-        median_dur = int(round(statistics.median(durs)))
-        min_dur = int(min(durs))
-        max_dur = int(max(durs))
+        median = statistics.median(durs)
+        median_dur = report_ms(median) if fine_clock else round(median)
+        min_dur = report_ms(min(durs))
+        max_dur = report_ms(max(durs))
         n_cycles = len(pair_cycles[key])
 
         remark = [RELATION_TEXT[relation]]
@@ -937,6 +949,8 @@ def generate(trace_path, run, source=None, proc_name=None,
             '所属周期数': n_cycles,
             '备注': ' | '.join(remark),
             '估算时长次数': estimated_count,
+            '样例跳变索引': pair_example[key][0],
+            '样例采集ID': pair_example[key][1],
             '源码关系': relation,
         })
 
@@ -1034,7 +1048,7 @@ def load_trace_timing(run):
             dur = (row.get('中位数时长ms') or '').strip()
             key = (row.get('开始标签', ''), row.get('结束标签', ''))
             try:
-                durations[key] = int(dur) if dur else None
+                durations[key] = _val_to_int(float(dur)) if dur else None
             except ValueError:
                 durations[key] = None
             estimate_count = (row.get('估算时长次数') or '').strip()

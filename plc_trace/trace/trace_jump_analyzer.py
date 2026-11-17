@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+from xml.etree import ElementTree
 from pathlib import Path
 from collections import defaultdict
 
@@ -27,8 +28,18 @@ def parse_trace(trace_path):
         'inactive': bool, 'unique_values': [float,...]
     }
     """
-    with open(trace_path, 'r', encoding='utf-16') as f:
-        txt = f.read()
+    with open(trace_path, 'rb') as stream:
+        raw = stream.read()
+    encoding = 'utf-16' if raw.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
+    txt = raw.decode(encoding)
+    config = re.search(r'<TraceConfiguration\b[^>]*>.*?</TraceConfiguration>', txt, re.S)
+    microseconds = False
+    if config:
+        flags = {(node.text or '').strip().lower() for node in
+                 ElementTree.fromstring(config[0]).iter('Single') if node.get('Name') == 'MicroSeconds'}
+        if flags - {'true', 'false', '1', '0'} or len({v in ('true', '1') for v in flags}) > 1:
+            raise ValueError('Trace 配置的 MicroSeconds 取值无效或冲突')
+        microseconds = bool(flags & {'true', '1'})
 
     # Locate each <TraceVariable>...</TraceVariable> block.
     starts = [m.start() for m in re.finditer(r'<TraceVariable\b', txt)]
@@ -50,6 +61,8 @@ def parse_trace(trace_path):
         try:
             values = [float(v) for v in vals_m.group(1).split(',') if v.strip()]
             timestamps = [float(t) for t in ts_m.group(1).split(',') if t.strip()]
+            if microseconds:
+                timestamps = [t / 1000 for t in timestamps]
         except ValueError as e:
             print(f'trace 变量 {name} 数值解析失败: {e}', file=sys.stderr)
             continue
@@ -75,6 +88,7 @@ def parse_trace(trace_path):
         unique_vals = sorted(set(values))
         inactive = (len(jumps) == 0)
         variables[name] = {
+            'timestamp_unit': 'us' if microseconds else 'ms',
             'values': values,
             'timestamps': timestamps,
             'jumps': jumps,

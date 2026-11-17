@@ -16,7 +16,7 @@ compatibility: opencode
 | --- | --- | --- |
 | 一 | 源码和 TwinCAT Scope `.trace`、Sysmac 导出表或采集目录 | `plc_trace.trace.trace_to_pairs` |
 
-TwinCAT Scope 文件是 UTF-16 XML，`TraceVariable` 下含 `Values`、`Timestamps`，相对时间单位为毫秒。`StartTime` 提供绝对基准。
+原生 Trace XML 的 `TraceVariable` 包含 `Values`、`Timestamps`。配置声明 `MicroSeconds=True` 时按微秒读取并换算为毫秒，未声明时按毫秒读取。`StartTime` 提供绝对基准。
 
 Sysmac 输入是 `.csv/.tsv/.txt`，也可用含这类表的目录。采样行含 `Index`、`RawTime` 及带整型后缀的变量列，例如 `Cell.Phase[0]:INT`。采集配置文件无采样行，应先导出现场实测记录。
 

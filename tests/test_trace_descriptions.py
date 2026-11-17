@@ -89,10 +89,10 @@ class TraceDescriptionTests(unittest.TestCase):
         book = load_workbook(result['out'])
         self.addCleanup(book.close)
         sheet = book.active
-        self.assertEqual((sheet['B4'].value, sheet['B6'].value), ('Load', 'Unload'))
-        self.assertEqual(sheet.max_row, 7)
-        self.assertIn('B4:B5', sheet.merged_cells)
-        self.assertIn('B6:B7', sheet.merged_cells)
+        self.assertEqual((sheet['A3'].value, sheet['A5'].value), ('Load', 'Unload'))
+        self.assertEqual(sheet.max_row, 6)
+        self.assertIn('A3:A4', sheet.merged_cells)
+        self.assertIn('A5:A6', sheet.merged_cells)
 
     def test_trace_workstation_splits_full_channels_and_keeps_one_total(self):
         from openpyxl import load_workbook
@@ -120,16 +120,16 @@ class TraceDescriptionTests(unittest.TestCase):
         sheet = book.active
         self.assertEqual(result['rows'], 5)
         self.assertEqual(result['workstation_groups'], 2)
-        self.assertEqual([sheet[f'B{r}'].value for r in (4, 8, 11)],
+        self.assertEqual([sheet[f'A{r}'].value for r in (3, 7, 10)],
                          ['Line\nLine.Flow[2]', 'Line\nLine.Flow[10]', 'Line\nLine.Seq[2]'])
-        self.assertEqual([sheet[f'G{r}'].value for r in (4, 5, 8, 11, 13)],
+        self.assertEqual([sheet[f'H{r}'].value for r in (3, 4, 7, 10, 12)],
                          ['Line.Flow[2]=10', 'Line.Flow[2]=20', 'Line.Flow[10]=20', 'Line.Seq[2]=50', 'Solo=0'])
-        self.assertTrue(all(sheet.row_dimensions[r].height == 28 for r in (4, 5, 8, 11, 13)))
-        self.assertIn('B4:B5', sheet.merged_cells)
-        for row in (6, 7, 9, 10):
+        self.assertTrue(all(sheet.row_dimensions[r].height == 13.2 for r in (3, 4, 7, 10, 12)))
+        self.assertIn('A3:A4', sheet.merged_cells)
+        for row in (5, 6, 8, 9):
             self.assertTrue(all(cell.value is None for cell in sheet[row]))
-        self.assertEqual((sheet['B12'].value, sheet['C12'].value, sheet['E12'].value), ('Line', '行时长合计', 48))
-        self.assertEqual((sheet['B13'].value, sheet['C14'].value, sheet['E14'].value), ('Solo', '行时长合计', 12))
+        self.assertEqual((sheet['A11'].value, sheet['D11'].value, sheet['F11'].value), ('Line', '总时长', 48))
+        self.assertEqual((sheet['A12'].value, sheet['D13'].value, sheet['F13'].value), ('Solo', '总时长', 12))
 
     def test_trace_workbook_links_long_description_without_changing_data_row_height(self):
         from openpyxl import load_workbook
@@ -143,14 +143,14 @@ class TraceDescriptionTests(unittest.TestCase):
         result = workbook(stats['outputs']['pairs_csv'], run=str(self.run), sheet='trace步序采集表')
         book = load_workbook(result['out'])
         self.addCleanup(book.close)
-        primary, detail = book['trace步序采集表'], book['文本详情']
-        desc = primary['C4']
+        primary, detail = book['时序拆解'], book['文本详情']
+        desc = primary['D3']
         self.assertEqual(desc.value, comment)
-        self.assertEqual(primary.row_dimensions[4].height, 28)
-        self.assertEqual(primary.freeze_panes, 'D4')
+        self.assertEqual(primary.row_dimensions[3].height, 13.2)
+        self.assertEqual(primary.freeze_panes, 'A3')
         dest = desc.hyperlink.location.split('!', 1)[1]
         self.assertEqual(detail[dest].value, comment)
-        self.assertEqual(detail.cell(detail[dest].row, 1).hyperlink.location, "'trace步序采集表'!C4")
+        self.assertEqual(detail.cell(detail[dest].row, 1).hyperlink.location, "'时序拆解'!D3")
 
     def test_workbook_preserves_formula_like_source_comment_as_text(self):
         from openpyxl import load_workbook
@@ -170,10 +170,11 @@ class TraceDescriptionTests(unittest.TestCase):
         result = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
         book = load_workbook(result['out'], read_only=True, data_only=True)
         self.addCleanup(book.close)
-        self.assertEqual(book.active['C4'].value, comment)
-        self.assertEqual(book.active['D4'].value, '注释')
-        self.assertEqual(book.active['E4'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
-        self.assertIsNone(book.active['J4'].value)
+        self.assertEqual(book.active['D3'].value, comment)
+        self.assertEqual(book.active['E3'].value, '注释')
+        self.assertEqual(book.active['F3'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
+        self.assertIn('起始步原注「====判断步====」', book.active['O3'].value)
+        self.assertIn('XML行', book.active['O3'].value)
 
     def test_vague_notes_get_only_their_own_routine_and_control_details(self):
         self.write_part(self.FIRST + '_00001.csv', self.EPOCH,
@@ -215,11 +216,11 @@ class TraceDescriptionTests(unittest.TestCase):
         rendered = workbook(pairs, run=str(self.run), sheet='trace步序采集表')
         with open(rendered['out'], 'rb') as stream:
             book = load_workbook(stream, read_only=True)
-            sheet_rows = {r[6]: r for r in book.active.iter_rows(min_row=4, values_only=True) if r[6]}
+            sheet_rows = {r[7]: r for r in book.active.iter_rows(min_row=3, values_only=True) if r[7]}
             book.close()
-        self.assertIn(first, sheet_rows['Step[1]=0'][8])
-        self.assertIn(second, sheet_rows['Step[2]=20'][8])
-        self.assertIsNone(sheet_rows['Step[2]=20'][9])
+        self.assertIn(first, sheet_rows['Step[1]=0'][13])
+        self.assertIn(second, sheet_rows['Step[2]=20'][13])
+        self.assertIn('极片厚度测量', sheet_rows['Step[2]=20'][14])
 
     def test_source_station_name_is_used_for_csv_and_existing_workbook_export(self):
         from openpyxl import load_workbook
@@ -247,8 +248,8 @@ class TraceDescriptionTests(unittest.TestCase):
         result = workbook(str(legacy), run=str(self.run), sheet='trace步序采集表')
         book = load_workbook(result['out'], read_only=True, data_only=True)
         self.addCleanup(book.close)
-        self.assertEqual(book.active['B4'].value, name)
-        self.assertEqual(book.active['G4'].value, f'{controller}=0')
+        self.assertEqual(book.active['A3'].value, name)
+        self.assertEqual(book.active['H3'].value, f'{controller}=0')
 
     def test_same_documented_name_does_not_merge_station_groups(self):
         doc = 'Dock_进料单元'
@@ -333,10 +334,11 @@ class TraceDescriptionTests(unittest.TestCase):
         from openpyxl import load_workbook
         book = load_workbook(ws['out'], read_only=True)
         sheet = book.active
-        self.assertEqual(sheet['D4'].value, 'LLM')
-        self.assertEqual(sheet['D4'].font.color.rgb[-6:], 'FF0000')
-        self.assertEqual(sheet['J4'].value, result_row['证据'])
-        remarks = [str(row[0]) for row in sheet.iter_rows(min_col=9, max_col=9, values_only=True)]
+        self.assertEqual(sheet['E3'].value, 'LLM')
+        self.assertEqual(sheet['E3'].font.color.rgb[-6:], 'FF0000')
+        self.assertIn(result_row['证据'], sheet['O3'].value)
+        self.assertIn('trace_jumps.csv', sheet['O3'].value)
+        remarks = [str(row[0]) for row in sheet.iter_rows(min_col=14, max_col=14, values_only=True)]
         book.close()
         self.assertTrue(any('同类命名推断' in text and '方向未知' in text for text in remarks))
         result['actions'][0].update(action='伸出', source_ref=analogies[0]['id'])
