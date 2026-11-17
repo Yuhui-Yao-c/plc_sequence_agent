@@ -218,9 +218,11 @@ class TraceDescriptionTests(unittest.TestCase):
             book = load_workbook(stream, read_only=True)
             sheet_rows = {r[7]: r for r in book.active.iter_rows(min_row=3, values_only=True) if r[7]}
             book.close()
-        self.assertIn(first, sheet_rows['Step[1]=0'][13])
-        self.assertIn(second, sheet_rows['Step[2]=20'][13])
-        self.assertIn('极片厚度测量', sheet_rows['Step[2]=20'][14])
+        self.assertEqual(sheet_rows['Step[1]=0'][13], '这条注释指「托盘高度测量」流程。两次采样间可能经过步 10。')
+        self.assertEqual(sheet_rows['Step[2]=20'][13], '这条注释指「极片厚度测量」流程。')
+        self.assertIn(first, sheet_rows['Step[1]=0'][14])
+        self.assertIn(second, sheet_rows['Step[2]=20'][14])
+        self.assertIsNone(sheet_rows['Step[3]=20'][13])
 
     def test_source_station_name_is_used_for_csv_and_existing_workbook_export(self):
         from openpyxl import load_workbook
@@ -338,9 +340,10 @@ class TraceDescriptionTests(unittest.TestCase):
         self.assertEqual(sheet['E3'].font.color.rgb[-6:], 'FF0000')
         self.assertIn(result_row['证据'], sheet['O3'].value)
         self.assertIn('trace_jumps.csv', sheet['O3'].value)
-        remarks = [str(row[0]) for row in sheet.iter_rows(min_col=14, max_col=14, values_only=True)]
+        self.assertIn('同类命名推断', sheet['O3'].value)
+        self.assertIn('方向未知', sheet['O3'].value)
+        self.assertNotIn('同类命名推断', sheet['N3'].value or '')
         book.close()
-        self.assertTrue(any('同类命名推断' in text and '方向未知' in text for text in remarks))
         result['actions'][0].update(action='伸出', source_ref=analogies[0]['id'])
         (self.run / 'batches_desc/batch_001.result.json').write_text(json.dumps(data, ensure_ascii=False))
         cmd_validate(self.run, stats=stats)

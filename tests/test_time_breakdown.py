@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,10 +9,66 @@ from openpyxl import load_workbook
 from plc_trace.description.action_describe import cmd_a, cmd_validate
 from plc_trace.description.trace_description_report import waiting_role
 from plc_trace.output.gen_workstation_xlsx import generate as workbook
+from plc_trace.output.time_breakdown import _row_owners
 from plc_trace.trace.trace_to_pairs import generate, load_trace_timing
 
 
 class TimeBreakdownTests(unittest.TestCase):
+    def test_owner_is_the_writer_in_its_calling_routine(self):
+        program = 'Line::Dock4_取件'
+        caller = program + '::PickUpper'
+        write = {'program': program, 'scope': caller + '::Unit@40',
+                 'instance_path': [{'scope': caller}], 'source_id': 'write'}
+        other = {'program': 'IO', 'scope': 'IO::Status'}
+        info = {'direct': [write], 'description_refs': ['own'], 'start_commands': [other],
+                'start_notes': [{'id': 'own', 'scope': write['scope']}, {'id': 'elsewhere', **other}]}
+        self.assertEqual(_row_owners(info, False), ((program, 'PickUpper'), (program, 'PickUpper')))
+        info['description_refs'] = ['elsewhere']
+        self.assertEqual(_row_owners(info, False), ((program, 'PickUpper'), ('IO', 'Status')))
+        info['direct'].append(other)
+        self.assertIsNone(_row_owners(info, False)[0])
+        info['relation'] = 'ambiguous_scope'
+        self.assertEqual(_row_owners(info, False), (None, None))
+        section = {'direct': [{'scope': 'Sorter::Dispatch'}]}
+        self.assertEqual(_row_owners(section, True)[0], ('Sorter', 'Dispatch'))
+        self.assertIsNone(_row_owners(section, False)[0])
+
+    def test_component_blocks_share_channels_and_split_at_a_change_of_routine(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            rows, evidence = [], {}
+            program = 'Line::Zone_EM07_2_分拣'
+            for channel, start, routine in [('Line.Phase[1]', 0, 'Pick'), ('Line.Phase[1]', 10, 'Drop'),
+                                            ('Line.Phase[1]', 20, ''), ('Line.Phase[2]', 0, 'Pick')]:
+                a, b = f'{channel}={start}', f'{channel}={start + 10}'
+                rows.append({'构成要素': '分拣', '开始标签': a, '结束标签': b, '控制器': channel,
+                             '源码关系': 'direct' if routine else 'unresolved', '中位数时长ms': '12',
+                             '估算时长次数': '1' if start == 20 else '0'})
+                if routine:
+                    evidence[a + '|||' + b] = {'direct': [{'program': program, 'scope': program + '::' + routine}]}
+            path = run / 'trace_collection_pairs.csv'
+            with path.open('w', encoding='utf-8-sig', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            (run / 'trace_source_evidence.json').write_text(json.dumps({'pairs': evidence}), encoding='utf-8')
+            result = workbook(str(path), run=str(run), group_by='构成要素')
+            with open(result['out'], 'rb') as stream:
+                book = load_workbook(stream)
+            self.addCleanup(book.close)
+            sheet = book.active
+            blocks = [r for r in sheet.iter_rows(min_row=3) if r[7].value]
+            self.assertEqual([r[7].value for r in blocks], [p['开始标签'] for p in rows])
+            self.assertEqual([r[0].value for r in blocks[:2]], ['Zone_EM07_2-Pick\nLine.Phase[1]', 'Zone_EM07_2-Drop'])
+            self.assertIn('Line.Phase[1]', blocks[2][0].value)
+            self.assertNotIn('Pick', blocks[2][0].value)
+            self.assertEqual(blocks[3][0].value, 'Zone_EM07_2-Pick\nLine.Phase[2]')
+            self.assertIn(program + '::Drop', blocks[1][0].comment.text)
+            self.assertIn('1 次停留时长为估算值', blocks[2][13].value)
+            self.assertIn('源码迁移未对齐', blocks[2][14].value)
+            self.assertEqual(blocks[3][0].row - blocks[2][0].row, 3)
+            self.assertEqual([r[5].value for r in sheet if r[3].value == '总时长'], [48])
+
     def test_template_and_row_evidence_from_xml_and_real_trace_format(self):
         comments = ('待料', '堵料', '等待夹具到位', '检查是否堵料', '气缸前往等待位', '堵料报警复位', '备料',
                     '清除待料状态', '待料或堵料', '等待上游供料', '等待下游接料', '')

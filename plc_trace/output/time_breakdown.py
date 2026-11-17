@@ -1,7 +1,9 @@
 """Render the entry-one time breakdown. All row facts are keyed by both Trace labels."""
+import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from copy import copy
+from itertools import groupby
 from math import ceil
 from pathlib import Path
 from unicodedata import east_asian_width
@@ -12,8 +14,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.hyperlink import Hyperlink
 
-from plc_trace.description.trace_description_report import annotation_evidence_text, waiting_role
-from plc_trace.trace.trace_source_evidence import EVIDENCE_FILE, RELATION_TEXT, read_trace_evidence
+from plc_trace.description.trace_description_report import annotation_evidence_text, annotation_supplement, waiting_role
+from plc_trace.trace.trace_source_evidence import EVIDENCE_FILE, RELATION_TEXT
 
 
 # Widths, palette, freeze and data height follow the BIFF template.
@@ -110,18 +112,21 @@ def _header(ws, proc, digest):
     ws.merge_cells('H1:I1')
     ws.row_dimensions[1].height = ws.row_dimensions[2].height = STEP_HEIGHT
     notes = {'A1': f'{proc}。输入状态对 SHA256 前16位 {digest}。按工位和完整步序变量分块。',
+             'A2': '工位标识-源码例程原名。每个完整步序变量独立分块。批注中可查通道和所属源码位置。',
              'B2': '模板的独立动作时间。本表记录观测停留时长，见时长（ms）。',
              'C2': '多次采集按状态对归并，无法给出单次执行的累计完成时间。',
              'F2': '同一完整起止标签在各次观测中的起始状态停留时长中位数。单位为毫秒。',
              'G2': '目标节拍需要独立的工程定额。',
              'M2': '1 表示有依据的等待步。黄色表示待料，灰色表示堵料，表示源码定义的步职责。'
                    '普通等待无色，无法判定时留空。颜色不计量真实缺料或拥堵损失。',
+             'N2': '只说明本行需要理解或核对的事，例如简短注释指哪个流程、可能的中间步或时长估算。'
+                   '空白表示没有额外说明。详细依据见右侧证据链。',
              'O2': '按起止标签追溯 Trace 跳变、源码迁移和描述依据。单击有下划线的单元格阅读完整文本。'}
     for coord, note in notes.items():
         ws[coord].comment = Comment(note, 'PLC Trace')
 
 
-def _evidence(pair, desc, audits):
+def _evidence(pair, desc, info, audits):
     start, end = pair['开始标签'], pair['结束标签']
     obs = f'Trace 观测 {start} → {end}'
     if count := pair.get('发生次数'):
@@ -143,6 +148,9 @@ def _evidence(pair, desc, audits):
         parts.append('本轮源码证据索引缺失')
     if guard := pair.get('原始条件'):
         parts.append('源码门控 ' + guard)
+    if path := info.get('candidate_path'):
+        steps = [path[0]['from'], *(edge['to'] for edge in path)]
+        parts.append('源码候选路径（中间步未经本次采样确认） ' + ' → '.join(map(str, steps)))
     if variables := desc.get('动作变量') or pair.get('动作变量'):
         parts.append('源码动作变量（引用） ' + variables)
     detail = desc.get('证据')
@@ -152,6 +160,15 @@ def _evidence(pair, desc, audits):
         parts.append('描述依据 ' + (desc.get('证据引用') or '定位信息未提供，待核'))
     else:
         parts.append('动作描述待核：' + (desc.get('待核原因') or desc.get('描述状态') or '缺少已确认的描述依据'))
+    if reasoning := desc.get('推断依据'):
+        parts.append((desc.get('证据等级') or '描述推断依据') + '：' + reasoning)
+    if supplement := desc.get('注释补充'):
+        parts.append('原注补充依据：' + supplement)
+    if status := desc.get('描述状态'):
+        parts.append('描述状态：' + status)
+    annotations = [item for item in pair.get('备注', '').split(' | ') if item and item != relation]
+    if annotations:
+        parts.append('状态对记录：' + '；'.join(annotations))
     if role := desc.get('等待判定'):
         parts.append(f'{role}依据：{desc["等待依据"]}')
     return '\n'.join(parts)
@@ -161,9 +178,133 @@ def _channel_sort(name):
     return tuple(int(p) if i % 2 else p for i, p in enumerate(re.split(r'([+-]?\d+)', name.casefold()))), name
 
 
-def restore_annotation_details(run, descriptions):
+def _scope_owner(record, native):
+    """Use the outer call site's program/action, or a Sysmac program/section pair."""
+    scope = record.get('scope', '')
+    if calls := record.get('instance_path'):
+        scope = calls[0].get('scope', '')
+    program = record.get('program', '')
+    if program:
+        if scope == program:
+            return program, ''
+        if scope.startswith(program + '::'):
+            return program, scope[len(program) + 2:].split('::', 1)[0]
+        return None
+    if record.get('source_file') == 'indexed_candidates.csv' and ';' in scope:
+        return None  # This inventory can aggregate several source locations.
+    if native and scope and '<anonymous>' not in scope:
+        # The Sysmac ledger constructs this path from Program and BodyContent
+        # ancestors. Other exporters can use the same separator for folders.
+        parts = scope.split('::')
+        if all(parts):
+            return parts[0], '::'.join(parts[1:])
+    return None
+
+
+def _row_owners(info, native_source):
+    """Return the starting step's owner and, independently, its selected annotation's owner."""
+    if info.get('relation') == 'ambiguous_scope':
+        return None, None
+    refs = set(info.get('description_refs', ()))
+    direct = info.get('direct', ())
+    annotations = [n for n in info.get('start_notes', ()) if n.get('id') in refs]
+    annotations.extend(e for e in direct if e.get('source_id') in refs)
+    # A program that only reads the state must not displace its writer. If
+    # competing writers are found at the same level, keep the owner unresolved.
+    tiers = (direct or info.get('candidate_path', ())[:1], info.get('start_state_writes', ()),
+             info.get('start_commands', ()), annotations)
+    records = [record for tier in tiers for record in tier]
+    native = native_source or any(r.get('grade', '').startswith('omron_native_') or
+                                  r.get('source_file') == 'native_command_evidence.csv' for r in records)
+    owners_by_scope = defaultdict(set)
+    for record in records:
+        if owner := _scope_owner(record, native):
+            owners_by_scope[record['scope']].add(owner)
+
+    def unique(tier):
+        choices = [owners_by_scope[record.get('scope', '')] for record in tier]
+        if choices and all(choices):
+            owners = set.union(*choices)
+            if len(owners) == 1:
+                return owners.pop()
+        return None
+
+    return unique(next((tier for tier in tiers if tier), ())), unique(annotations)
+
+
+def _component_blocks(groups, row_owners):
+    """Split only at a channel or ownership change; retain the existing order of observed pairs."""
+    station_blocks = []
+    components = {}
+    for station, rows in groups:
+        blocks = []
+        channels = sorted(rows.groupby('_步序变量', sort=False), key=lambda group: _channel_sort(group[0]))
+        for channel, records in channels:
+            pairs = records.fillna('').to_dict('records')
+            for owner, batch in groupby(pairs, key=lambda p: row_owners.get((p['开始标签'], p['结束标签']))):
+                blocks.append((channel, owner, list(batch)))
+        station_blocks.append((station, blocks))
+        for channel, owner, _ in blocks:
+            label = station if len(blocks) == 1 else f'{station}\n{channel}'
+            scope = ''
+            if owner:
+                program, routine = owner
+                scope = program
+                if routine:
+                    scope += '::' + routine
+                    name = program.rsplit('::', 1)[-1]
+                    # Keep namespace and numeric substation segments in the code.
+                    code = re.match(r'^((?:[A-Za-z][A-Za-z0-9]*_)*[A-Za-z]+\d+(?:_\d+)*)(?=$|[_ -])', name)
+                    label = f'{code[1] if code else name}-{routine}'
+            components[station, channel, owner] = (label, scope)
+    counts = Counter(label for label, _ in components.values())
+    channel_counts = Counter((label, channel) for (_, channel, _), (label, _) in components.items())
+    for key, (label, scope) in components.items():
+        station, channel, _ = key
+        if counts[label] > 1:
+            identifier = (scope or station) if channel_counts[label, channel] > 1 else label
+            components[key] = (f'{identifier}\n{channel}', scope)
+    return station_blocks, components
+
+
+def _remark(pair, desc, info, owner, role):
+    notes = []
+    if supplement := desc.get('注释补充'):
+        if owner and supplement != '例程归属待核':
+            program, routine = owner
+            notes.append(f'这条注释指「{routine or program.rsplit("::", 1)[-1]}」流程。')
+        else:
+            notes.append('这条注释所属的流程仍待确认。')
+    relation = pair.get('源码关系')
+    if relation in ('path_candidate', 'path_via_zero_candidate'):
+        via = [str(edge['to']) for edge in info.get('candidate_path', ())[:-1]]
+        if via:
+            steps = '步 ' + '、'.join(via) if len(via) <= 3 else f'{len(via)} 个中间步'
+            notes.append(f'两次采样间可能经过{steps}。')
+        else:
+            notes.append('两次采样间可能经过其他步。')
+    elif relation == 'direct_unverified':
+        notes.append('进入结束步的条件尚未核实。')
+    elif relation == 'ambiguous_scope':
+        notes.append('多个源码位置都可能控制本步，需确认归属。')
+    elif relation == 'unresolved':
+        notes.append('源码中尚未找到与这次跳变对应的路径。')
+    if not desc.get('动作描述'):
+        status = desc.get('描述状态')
+        notes.append({'B档待处理': '动作描述待补写。', 'B档待修订': '动作描述需重新核对。'}.get(
+            status, '动作描述缺少可核对的依据。'))
+    if role in ('待料', '堵料'):
+        direction = '上游供料' if role == '待料' else '下游接料'
+        notes.append(f'等待{direction}。' if not desc.get('描述来源', '').startswith('B档')
+                     else f'推断为等待{direction}，请核对。')
+    if pair.get('估算时长次数') not in (None, '', 0, '0'):
+        notes.append(f'有 {pair["估算时长次数"]} 次停留时长为估算值。')
+    return ''.join(notes) or None
+
+
+def restore_annotation_details(evidence, descriptions):
     """Re-render a saved A-only or older run from its own selected annotations."""
-    for key, info in (read_trace_evidence(run) or {}).items():
+    for key, info in evidence.items():
         text = info.get('description')
         if not text or not info.get('description_source', '').startswith('A档'):
             continue
@@ -173,30 +314,40 @@ def restore_annotation_details(run, descriptions):
             continue
         role, basis = waiting_role(info, start)
         row.update({'动作描述': text, '描述来源': info['description_source'], '描述状态': '源码注释',
-                    '证据': annotation_evidence_text(info), '等待判定': role, '等待依据': basis})
+                    '证据': annotation_evidence_text(info), '注释补充': annotation_supplement(info),
+                    '等待判定': role, '等待依据': basis})
 
 
-def write_breakdown(groups, descriptions, out, proc, digest, run):
+def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
     book = Workbook()
     sheet = book.active
     _header(sheet, proc, digest)
     audits = {name for name in ('trace_jumps.csv', 'trace_segments.csv', EVIDENCE_FILE) if (Path(run) / name).is_file()}
+    manifest = Path(run) / 'workflow_manifest.json'
+    native_source = False
+    if evidence and manifest.is_file():
+        with manifest.open(encoding='utf-8-sig') as stream:
+            native_source = json.load(stream).get('extraction', {}).get('format') == 'omron_iec61131_10'
+    owners, annotation_owners = {}, {}
+    for key, info in evidence.items():
+        pair_key = tuple(key.split('|||', 1))
+        owners[pair_key], annotation_owners[pair_key] = _row_owners(info, native_source)
+    station_blocks, components = _component_blocks(groups, owners)
     review_rows = b_rows = measured = 0
     waits = Counter()
     r = 3
-    for station, rows in groups:
-        channels = list(rows.groupby('_步序变量', sort=False))
-        channels.sort(key=lambda group: _channel_sort(group[0]))
+    for station, blocks in station_blocks:
         total = None
-        for idx, (channel, records) in enumerate(channels):
-            if idx:
+        for idx, (channel, owner, records) in enumerate(blocks):
+            if idx and channel != blocks[idx - 1][0]:
                 for gap in (r, r + 1):
                     sheet.row_dimensions[gap].height = 10
                 r += 2
             first = r
-            for pair in records.fillna('').to_dict('records'):
+            for pair in records:
                 start, end = pair['开始标签'], pair['结束标签']
                 desc = descriptions.get((start, end), {})
+                info = evidence.get(f'{start}|||{end}', {})
                 text = desc.get('动作描述', '')
                 status, source = desc.get('描述状态', ''), desc.get('描述来源', '')
                 origin = ''
@@ -210,23 +361,15 @@ def write_breakdown(groups, descriptions, out, proc, digest, run):
                     waits[role] += 1
                 review = pair.get('源码关系') != 'direct' or status != '源码注释'
                 review_rows += int(review)
-                notes = [p for p in pair.get('备注', '').split(' | ')
-                         if p and p != '无步注释，等待LLM综合上下文描述']
-                if reasoning := desc.get('推断依据'):
-                    notes.append(f'{desc.get("证据等级", "")}：{reasoning}')
-                if supplement := desc.get('注释补充'):
-                    notes.append(supplement)
-                if role:
-                    notes.append(f'{role}（{desc["等待依据"]}）')
-                if review:
-                    notes.append('【' + (status or '描述待核验') + '】')
                 duration = pair.get('中位数时长ms', '')
                 ms = float(duration) if duration != '' else None
                 if ms is not None:
                     total = (total or 0) + ms
                     measured += 1
                 values = {4: text or None, 5: origin or None, 6: ms, 8: start, 9: end,
-                          13: 1 if role else None, 14: ' | '.join(notes) or None, 15: _evidence(pair, desc, audits)}
+                          13: 1 if role else None,
+                          14: _remark(pair, desc, info, annotation_owners.get((start, end)), role),
+                          15: _evidence(pair, desc, info, audits)}
                 for col, (heading, width) in enumerate(COLUMNS, 1):
                     value = values.get(col)
                     cell = _cell(sheet, r, col, value)
@@ -236,20 +379,24 @@ def write_breakdown(groups, descriptions, out, proc, digest, run):
                         cell.number_format = '0.00##'
                     if col in (4, 14, 15):
                         cell.alignment = LEFT
-                    if (col == 5 and origin == 'LLM') or (col == 14 and review):
+                    if col == 5 and origin == 'LLM':
                         cell.font = RED
                     if isinstance(value, str) and ('\n' in value or _width(value) > width - 1):
                         _details(book, cell, start, end, heading, value)
                 sheet.row_dimensions[r].height = STEP_HEIGHT
                 r += 1
             # For an unsplit station the template's merged group includes its total.
-            last = r if len(channels) == 1 else r - 1
-            label = _cell(sheet, first, 1, station if len(channels) == 1 else f'{station}\n{channel}')
+            last = r if len(blocks) == 1 else r - 1
+            name, scope = components[station, channel, owner]
+            label = _cell(sheet, first, 1, name)
             label.fill, label.font, label.alignment = FILLS['构成要素'], BOLD, GROUP
+            basis = f'源码位置：{scope}' if scope else '这些步序的源码例程尚未确定，保留工位分组。'
+            label.comment = Comment(f'工位：{station}\n完整通道：{channel}\n{basis}', 'PLC Trace')
             if last > first:
                 sheet.merge_cells(start_row=first, end_row=last, start_column=1, end_column=1)
-            if len(channels) > 1 and last - first < 2:
-                _details(book, label, records.iloc[0]['开始标签'], records.iloc[0]['结束标签'], '构成要素', label.value)
+            needed = sum(max(1, ceil(_width(line) / (COLUMNS[0][1] - 1))) for line in name.splitlines())
+            if needed > last - first + 1:
+                _details(book, label, records[0]['开始标签'], records[0]['结束标签'], '构成要素', label.value)
         for col in range(2, len(COLUMNS) + 1):
             cell = _cell(sheet, r, col, {4: '总时长', 6: round(total, 4) if total is not None else None,
                                         14: '本工位各行停留中位数之和，不能作为单次循环时间。'}.get(col))
@@ -258,7 +405,7 @@ def write_breakdown(groups, descriptions, out, proc, digest, run):
                 cell.number_format = '0.00##'
             if col in (4, 14):
                 cell.alignment = LEFT
-        if len(channels) > 1:
+        if len(blocks) > 1:
             label = _cell(sheet, r, 1, station)
             label.fill, label.font = FILLS['构成要素'], BOLD
         sheet.row_dimensions[r].height = 13.8

@@ -22,6 +22,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from plc_trace.output.time_breakdown import restore_annotation_details, write_breakdown
+from plc_trace.trace.trace_source_evidence import read_trace_evidence
 from plc_trace.output.station_identity import source_station_displays
 from plc_trace.output.utils import load_station_identity, infer_proc_name
 
@@ -456,10 +457,11 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             sha16.update(block)
     sha16 = sha16.hexdigest()[:16]
     if is_trace:
+        evidence = read_trace_evidence(run) or {}
         if needs_annotation_details:
-            restore_annotation_details(run, desc_map)
+            restore_annotation_details(evidence, desc_map)
             desc_stats = pd.Series([d.get('描述来源', '') for d in desc_map.values()], dtype=str).value_counts().to_dict()
-        rendered = write_breakdown(workstations, desc_map, out, proc_name, sha16, run)
+        rendered = write_breakdown(workstations, desc_map, out, proc_name, sha16, run, evidence)
         return {'proc_name': proc_name, 'rows': len(df), 'action_variable_rows': hits,
                 'workstation_groups': workstations.ngroups, 'group_by': group_by,
                 'desc_sources': desc_stats, 'source_sha16': sha16, 'amap_keys': 0, 'out': out,
