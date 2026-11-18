@@ -445,7 +445,8 @@ class Site:
 class ControlIndex:
     policy = 'plcopen_control'
 
-    def __init__(self, wanted, templates, types):
+    def __init__(self, wanted, templates, types, recover_st=None):
+        self.recover_st = recover_st
         self.wanted = wanted
         self.templates = templates
         self.types = types
@@ -540,17 +541,24 @@ class ControlIndex:
         if not candidates:
             return set()
         parser = STParser(code, condition_parser=source_condition, strict=False, retain_source=True)
+        grade = 'plcopen_structured_st'
         try:
             parser.seq()
+            statements = parser.statements
         except ERRORS as exc:
             self._issue('unsupported_st', candidates, site, str(exc))
-            return set()
+            if self.recover_st is None:
+                return set()
+            statements = self.recover_st(code, parser, exc)
+            if not statements:
+                return set()
+            grade = 'plcopen_partial_st_body'
 
         entries = []
         states = set()
         previous = defaultdict(list)
         fragment = (site.body, site.node)
-        for lhs, rhs, condition, offset, note in parser.statements:
+        for lhs, rhs, condition, offset, note in statements:
             write = target(lhs)
             if not write:
                 continue
@@ -577,7 +585,7 @@ class ControlIndex:
                                            for prior in previous[variable]):
                         destination = None
                     if value.casefold() != variable and self._state_write(
-                            state, destination, value, located, gate, 'plcopen_structured_st',
+                            state, destination, value, located, gate, grade,
                             (fragment, condition)):
                         states.add(state)
                 previous[variable].append(gate)
@@ -746,9 +754,14 @@ def _bodies(unit):
 
 def collect(source, variables):
     """Index observed variables from PLCopen source and explicitly bound FBs."""
-    wanted = {symbol(name).casefold() for name in variables if re.fullmatch(IDENT, name)}
     root = etree.parse(str(source), etree.XMLParser(
         huge_tree=True, resolve_entities=False, no_network=True)).getroot()
+    return collect_root(root, variables)
+
+
+def collect_root(root, variables, *, recover_st=None):
+    """Index controls on an already parsed project, including concrete FB actuals."""
+    wanted = {symbol(name).casefold() for name in variables if re.fullmatch(IDENT, name)}
     templates = defaultdict(list)
     units = []
     for unit in root.iter('{*}pou', '{*}action', '{*}method'):
@@ -756,7 +769,7 @@ def collect(source, variables):
             templates[unit.get('name', '').casefold()].append((unit, interface(unit)))
         elif not any(a.get('pouType', '').casefold() == 'functionblock' for a in unit.iterancestors()):
             units.append(unit)
-    result = ControlIndex(wanted, templates, StateTypes(root, root.iter('{*}pou')))
+    result = ControlIndex(wanted, templates, StateTypes(root, root.iter('{*}pou')), recover_st)
     if not wanted:
         return result
     roots = '|'.join(re.escape(value) for value in sorted({_root(v) for v in wanted}))

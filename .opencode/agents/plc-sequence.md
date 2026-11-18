@@ -9,7 +9,7 @@ mode: primary
 
 从项目根目录调用 `python plc_cli.py`。先识别入口、核验输入角色，再按加载表读取技能。原生 `skill` 不可用时读取对应 `SKILL.md`，报告加载异常。路径和模式作为独立参数传递，含空格时按实际 shell 引用。
 
-源码准备和采集记录均属于本轮证据。仅处理 `batches_desc/*.input.json` 对应的动作描述任务。每批回传 `run_id`、`batch_id`，每行保留当前 `basis`。
+源码准备和采集记录均属于本轮证据。入口一仅处理 `batches_desc/*.input.json` 对应的动作描述任务。每批回传 `run_id`、`batch_id`，每行保留当前 `basis`。
 
 ## 两个入口
 
@@ -41,14 +41,14 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "source/包mylar/采集记录"
 
 ### 入口二　Trace 采集配置
 
-**输入**　`源码路径 模式1 [模式2 ...] --trace-setup [任务选项] [-output 输出根目录]`
+**输入**　`源码路径 [模式1 模式2 ...] --trace-setup [任务选项] [-output 输出根目录]`
 
-选择器支持完整变量名、`*`/`?` 通配、`re:` 全匹配正则。每个模式作为独立参数，命中任一即纳入同一清单并按完整变量名去重。可混用不同形式，通配中的方括号按字面匹配。
+省略模式时自动从本工程发现并判定通道用途。显式选择器支持完整变量名、`*`/`?` 通配、`re:` 全匹配正则。每个模式作为独立参数，命中任一即纳入同一清单并按完整变量名去重。可混用不同形式，通配中的方括号按字面匹配。
 
 **命令**
 
 ```powershell
-python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "outputs"
+python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 ```
 
 完整 CLI 使用 `trace-setup --source "源码" --pattern "模式1" --pattern "模式2" --out "实际运行子目录"`，也可只传一个模式。可用 `--regex`、`--case-sensitive` 和 `--format`。`--default-type` 仅用于已核实的 Sysmac 缺失根声明类型。
@@ -57,7 +57,7 @@ python plc_cli.py "source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-s
 
 **执行**
 
-读取控制体的显式变量引用，保留完整路径和固定下标，核对类型与作用域，记录动态下标及解析问题。生成配置后交付客户端导入，检查任务、触发、采样设置和通道容量。
+免填模式收到 `scope_review_pending` 后，按 [采集配置](../skills/plc-trace-setup/SKILL.md) 逐候选判读，在同一运行目录用 `--scope-results` 合并。显式模式按规则提取完整路径和固定下标。核对类型、作用域及解析问题。生成配置后交付客户端导入，检查任务、触发、采样设置和通道容量。
 
 **验收**
 

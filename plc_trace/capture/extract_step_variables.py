@@ -204,6 +204,9 @@ class _SourceScan:
         self.case_sensitive = case_sensitive
         self.references = {}
         self.dynamic = {}
+        self.units = defaultdict(set)
+        self.ambiguous_units = set()
+        self.directions = defaultdict(set)
         self.declarations = defaultdict(set)
         self.members = defaultdict(set)
         self.aliases = defaultdict(set)
@@ -228,7 +231,7 @@ class _SourceScan:
                 names = (name, raw)
                 if unit and unit[0] == 'program':
                     names += (f'{unit[1]}.{name}', f'{unit[1]}.{raw}')
-                if not any(self.matcher.fullmatch(value) for value in names):
+                if self.matcher is not None and not any(self.matcher.fullmatch(value) for value in names):
                     continue
                 key = name if self.case_sensitive else name.casefold()
                 if dynamic:
@@ -267,6 +270,10 @@ class _SourceScan:
                                          name if tag == 'datatypedecl' else parent.type_name))
                     if tag == 'fileheader':
                         self.header = ' '.join(node.get(k, '') for k in ('companyName', 'productName')).casefold()
+                    if self.matcher is None and tag in {'program', 'function', 'functionblock'} and name:
+                        if unit in self.units[name.casefold()]:
+                            self.ambiguous_units.add(name.casefold())
+                        self.units[name.casefold()].add(unit)
                     if tag == 'program' and name:
                         self.programs[name.casefold()] = unit
                     if plcopen and name and not parent.body and tag in {'pou', 'action', 'method'}:
@@ -336,6 +343,8 @@ class _SourceScan:
             self.declarations[None, key].add(value)
         elif tag == 'variable' and frame.unit and group_tag != 'externalvars':
             self.declarations[frame.unit, key].add(value)
+            if self.matcher is None:
+                self.directions[frame.unit, key].add(group_tag)
 
     def _peel_type(self, values, part):
         """Consume exactly the array dimensions addressed by one member."""
@@ -467,14 +476,19 @@ def _publish(out, files, force):
             raise
 
 
-def generate(source, out, pattern, *, capture_format='auto', task_name=None,
+def generate(source, out, pattern=None, *, capture_format='auto', task_name=None, scope_results=None,
              every_n_cycles=None, default_type=None, case_sensitive=False, force=False):
     source_input = Path(source).absolute()
     source, out = source_input.resolve(), Path(out).resolve()
     if (source_input.is_relative_to(out) or source.is_relative_to(out) or Path.cwd().is_relative_to(out)
             or PROJECT_ROOT.is_relative_to(out)):
         raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
-    matcher = _Selectors(pattern, case_sensitive)
+    automatic = pattern is None
+    matcher = None if automatic else _Selectors(pattern, case_sensitive)
+    if scope_results is not None and not automatic:
+        raise ValueError('用途判断仅用于免填模式')
+    if automatic and default_type:
+        raise ValueError('自动发现需要源码声明的类型')
     if capture_format not in ('auto', 'sysmac', 'inovance'):
         raise ValueError('采集格式须为 auto、sysmac 或 inovance')
     if default_type and default_type not in INTEGER_TYPES:
@@ -483,12 +497,15 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None,
         if out.exists() and not out.is_dir():
             raise ValueError('输出路径须为目录')
         if out.exists() and any(out.iterdir()):
-            if not force:
-                raise ValueError('请使用空输出目录，或以 --force 归档已有的采集配置')
             marker = out / 'workflow_status.json'
             status = json.loads(marker.read_bytes()) if marker.is_file() else None
+            resume_scope = (scope_results is not None and isinstance(status, dict) and status.get('status') == 'scope_review_pending'
+                            and status.get('source') == str(source) and status.get('selection_mode') == 'automatic')
+            if not force and not resume_scope:
+                raise ValueError('请使用空输出目录，或以 --force 归档已有的采集配置')
             if not isinstance(status, dict) or status.get('mode') != 'trace_setup':
                 raise ValueError('输出目录属于其他任务，请使用空目录')
+            force = force or resume_scope
         source_format = detect_source_format(source)
         before = source.stat()
         digest = fingerprint(source)
@@ -506,28 +523,65 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None,
                 raise ValueError('源码头部未识别采集平台，请指定 --format inovance 或 --format sysmac')
         if default_type and capture_format != 'sysmac':
             raise ValueError('--default-type 仅用于 Sysmac 采集配置')
-        if not scan.references:
+        if not automatic and not scan.references:
             raise ValueError(f'未找到可采集的显式变量。符号或表达式下标 {len(scan.dynamic)} 个，请核对匹配规则')
         channels, unresolved = {}, {}
-        for (_, unit), (source_name, raw, line) in scan.references.items():
-            if capture_format == 'sysmac':
-                name, kind, reason, can_default = scan.sysmac_channel(source_name, unit)
-                if not any(matcher.fullmatch(value) for value in (name, source_name, raw)):
-                    continue
-                origin = '声明'
-                if not kind and can_default and default_type:
-                    kind, origin = default_type, '用户指定'
-                item = {'name': name, 'type': kind, 'type_source': origin if kind else '', 'source_line': line}
-                if not kind:
-                    unresolved[name] = reason
+        inventory, discovery_status = None, None
+        if automatic:
+            from plc_trace.capture.step_discovery import Discovery, replay_selectors, scope_index, scope_selection
+            if source_format == 'plcopen':
+                from plc_trace.capture.plcopen_discovery import discover
             else:
-                name = source_name
-                if not (matcher.fullmatch(name) or matcher.fullmatch(raw)):
-                    continue
-                item = {'name': name, 'source_line': line}
-            channels.setdefault(name.casefold(), item)
-        if not channels:
-            raise ValueError('没有可按指定名称导出的采集变量，请核对变量作用域')
+                from plc_trace.capture.sysmac_discovery import discover
+            if scan.references:
+                discovered = discover(source, scan)
+            else:
+                discovered = Discovery()
+                discovered.issues['reason'] = 'no_static_executable_references'
+            discovered.add_unproven_siblings(scan)
+            inventory = discovered.inventory(digest, source_format)
+            decisions = json.loads(Path(scope_results).read_bytes()) if scope_results is not None else None
+            if scope_results is not None and decisions is None:
+                raise ValueError('用途判断 JSON 为空')
+            chosen, roles = scope_selection(inventory, decisions)
+            inventory['decisions'] = roles
+            inventory['reference_sites'] = discovered.reference_sites
+            inventory['selector_replay'] = replay_selectors([r['name'] for r in chosen.values()],
+                                                           discovered.visible | set(discovered.candidates),
+                                                           (n for n, _, _ in scan.references.values()))
+            eligible = sum(r['eligibility'] == 'scope_required' for r in inventory['candidates'])
+            if decisions is None and eligible:
+                discovery_status = 'scope_review_pending'
+            for key, record in chosen.items():
+                row = discovered.candidates[key]
+                name = row.name
+                channels[key] = {'name': name, 'source_line': record['transitions'][0]['source_line']}
+                if capture_format == 'sysmac':
+                    channels[key].update(type=row.declared, type_source='声明' if row.declared else '')
+                if row.type_issue:
+                    unresolved[name] = row.type_issue
+            if not channels and not discovery_status:
+                discovery_status = 'needs_review'
+        else:
+            for (_, unit), (source_name, raw, line) in scan.references.items():
+                if capture_format == 'sysmac':
+                    name, kind, reason, can_default = scan.sysmac_channel(source_name, unit)
+                    if not any(matcher.fullmatch(value) for value in (name, source_name, raw)):
+                        continue
+                    origin = '声明'
+                    if not kind and can_default and default_type:
+                        kind, origin = default_type, '用户指定'
+                    item = {'name': name, 'type': kind, 'type_source': origin if kind else '', 'source_line': line}
+                    if not kind:
+                        unresolved[name] = reason
+                else:
+                    name = source_name
+                    if not (matcher.fullmatch(name) or matcher.fullmatch(raw)):
+                        continue
+                    item = {'name': name, 'source_line': line}
+                channels.setdefault(name.casefold(), item)
+            if not channels:
+                raise ValueError('没有可按指定名称导出的采集变量，请核对变量作用域')
         ordered = sorted(channels.values(), key=lambda channel: _sort_key(channel['name']))
         if capture_format == 'sysmac':
             if every_n_cycles is not None:
@@ -540,21 +594,36 @@ def generate(source, out, pattern, *, capture_format='auto', task_name=None,
                                  task_name=task_name, every_n_cycles=every_n_cycles)
         config = None
         files = {'static_variables.txt': ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
-        if task['task_name'] and not unresolved and not scan.parse_issues:
+        if not discovery_status and task['task_name'] and not unresolved and not scan.parse_issues:
             extension = 'csv' if capture_format == 'sysmac' else 'trace'
             config = source.stem + '_trace_config.' + extension
             files[config] = (_sysmac_config(ordered, task['task_name']) if capture_format == 'sysmac'
                              else _inovance_config(template, ordered, task, digest))
         report = {
-            'version': __version__, 'mode': 'trace_setup', 'status': 'done' if config else 'needs_review',
+            'version': __version__, 'mode': 'trace_setup', 'status': discovery_status or ('done' if config else 'needs_review'),
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,
-            'pattern': matcher.single_pattern,
-            'patterns': matcher.patterns, 'capture_format': capture_format, **task,
+            'pattern': matcher.single_pattern if matcher else None,
+            'patterns': matcher.patterns if matcher else [], 'capture_format': capture_format, **task,
             'static_variables': len(ordered), 'channels': ordered,
             'dynamic_variables': sorted(scan.dynamic.values(), key=_sort_key),
             'unresolved_types': unresolved, 'parse_issues': scan.parse_issues,
             'sample_count': 0, 'out': str(out), 'configuration': str(out / config) if config else None,
         }
+        if automatic:
+            report.update(selection_mode='automatic', discovery='step_variable_discovery.json',
+                          scope_candidates=eligible, inventory_sha256=inventory['inventory_sha256'],
+                          scope_uncertain=sum(r['role'] == 'uncertain' for r in roles))
+            report['unproven_candidates'] = len(inventory['candidates']) - eligible
+            if (report['scope_uncertain'] or report['unproven_candidates']) and config:
+                report['status'] = 'done_with_review'
+            files['scope_candidates.jsonl'] = ''.join(json.dumps(r, ensure_ascii=False) + '\n'
+                                                       for r in scope_index(inventory)).encode('utf-8')
+            if decisions is not None:
+                files['scope_results.json'] = json.dumps({'inventory_sha256': inventory['inventory_sha256'],
+                    'decisions': roles}, ensure_ascii=False, indent=1).encode('utf-8')
+            files['step_variable_discovery.json'] = json.dumps(inventory, ensure_ascii=False, indent=1).encode('utf-8')
+            if fingerprint(source) != digest:
+                raise ValueError('发现期间源码发生变化，请重新执行')
         files['workflow_status.json'] = json.dumps(report, ensure_ascii=False, indent=2).encode('utf-8')
         _publish(out, files, force)
         return report
@@ -567,10 +636,11 @@ def add_task_arguments(parser):
 
 def add_arguments(parser):
     parser.add_argument('--source', required=True, help='PLCopen、Sysmac IEC61131-10 或 SMC2 XML')
-    selector = parser.add_mutually_exclusive_group(required=True)
+    selector = parser.add_mutually_exclusive_group()
     selector.add_argument('--pattern', action='append',
                           help='完整变量名、通配符或 re: 正则；可重复指定，取并集并去重')
     selector.add_argument('--regex', help='对完整变量名匹配的 Python 正则')
+    parser.add_argument('--scope-results', help='自动发现后由 Agent 按本轮源码证据生成的用途判断 JSON')
     parser.add_argument('--out', required=True, help='独立输出目录')
     parser.add_argument('--format', choices=('auto', 'inovance', 'sysmac'), default='auto')
     add_task_arguments(parser)
@@ -586,7 +656,7 @@ def run(args):
         report = generate(args.source, args.out, pattern, capture_format=args.format,
                           task_name=args.task_name,
                           every_n_cycles=args.every_n_cycles, default_type=args.default_type,
-                          case_sensitive=args.case_sensitive, force=args.force)
+                          case_sensitive=args.case_sensitive, force=args.force, scope_results=args.scope_results)
     except (OSError, ValueError, re.error, etree.XMLSyntaxError) as exc:
         raise SystemExit(f'采集配置生成失败：{exc}') from exc
     print(json.dumps(report, ensure_ascii=False, indent=2))

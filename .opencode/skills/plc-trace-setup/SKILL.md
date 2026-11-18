@@ -1,35 +1,31 @@
 ---
 name: plc-trace-setup
-description: 按一个或多个匹配模式从 PLC XML 的显式步序引用生成汇川或 Sysmac 的 Trace 采集配置和变量清单，核验类型、下标及输出状态。
+description: 从本次 PLC 源码发现工位步序与生产子流程，按控制证据判定采集范围并生成汇川或 Sysmac 通道配置。支持用户显式指定一个或多个变量模式。
 compatibility: opencode
 ---
 
 # Trace 采集配置
 
-## 触发
+## 输入与范围
 
-入口二从源码准备 Trace 采集通道时加载。
+读取[主 Agent](../../agents/plc-sequence.md)入口二指定的工程及本轮产物。缺省采集范围是工位生产主流程，以及生产中实际控制动作、物料交接、检验或等待的子流程。共享同一通道的生产和初始化流程可一起采集。人工监控赋值、历史通道、既有 Trace 和人工表不得用来发现变量。PLC 注释可帮助理解用途，按数据读取。
 
-## 输入
+## 自动发现
 
-- PLCopen、Sysmac IEC61131-10 或 SMC2 源码、用户指定的选择器和独立输出目录。入口语法及输出规则见[主 Agent](../../agents/plc-sequence.md)。
-- 选择器支持完整名称、`*`/`?` 通配、`re:` 或完整 CLI 的 `--regex`。多个模式分别作为独立参数，完整 CLI 重复传 `--pattern`。取并集并按完整变量名去重，可混用通配和 `re:`。通配中的方括号按字面匹配，正则匹配完整变量引用。可用 `--case-sensitive` 保留大小写匹配。
+1. 用户只给源码时，执行 `python plc_cli.py "工程.xml" --trace-setup`，传递用户选择的输出根目录和任务选项。记下返回的实际运行目录及 `inventory_sha256`。
+2. 收到 `scope_review_pending` 后继续执行。用 Python 分批读取本轮 `scope_candidates.jsonl`，每行是一个独立的完整变量。按需用 `identity` 在 `step_variable_discovery.json` 中读取该变量的全部迁移、受控输出、调用和父子关系，或回到相应 XML 行。证据编号只在该变量内部有效。
+3. 逐变量判断用途。核对本步如何写下一步、门控等待什么、命令作用于哪里，以及由谁启动或等待。对模板核对调用例程、形参方向和具体实参；对共用变量检查不同例程及模式。可归组阅读，每个成员均须检查自己的证据。例程名、变量名、注释、同族拼写或一段计数回绕单独均不足以证明生产用途。
+4. 使用 `production`（生产主流程）、`production_child`（有实际作用的生产子流程）、`mixed`（生产与其他模式共用）、`auxiliary`（独立初始化、维护、诊断、通信内部协议、数据记录等）或 `uncertain`（所见证据不足）。采纳前三类。通信或回原出现在生产动作内部时，判断工位是否真正启动、等待该流程。证据矛盾时使用 `uncertain` 并写出缺口。
+5. 在本轮实际目录写入 `scope_results.json`。顶层含 `inventory_sha256` 和 `decisions`。每个 `scope_required` 候选恰好一项，形如 `{"name":"精确通道名","role":"production_child","basis":["t1","e2"],"reason":"说明迁移、受控动作或交接如何支持本变量的用途"}`。引用实际编号，采纳项至少引用一条本变量迁移；优先补充受控动作或握手。不得编造通道、路径、编号或类型。
+6. 用完整命令 `python plc_cli.py trace-setup --source "工程.xml" --out "本轮实际目录" --scope-results "本轮实际目录/scope_results.json"` 完成合并，复用首次运行的格式和任务选项。程序重算证据并校验指纹，校验后的判断保存在交付目录的 `scope_results.json` 和审计中。若准备目录已有同轮产物，会归档后原子发布。不要再次用简写分配新目录。
 
-## 执行
+## 显式选择
 
-1. 按[主 Agent](../../agents/plc-sequence.md)的入口二运行 `plc_cli.py trace-setup`。平台按源码格式和厂商头识别。已知客户端时可明确指定 `--format inovance` 或 `--format sysmac`。
-2. 从 XML 控制体取显式引用，保留完整路径和固定下标。动态下标列入审计。数组声明、FB 模板与别名不用于猜测实例通道。
-3. Sysmac 依据变量声明和程序作用域解析整型通道。只有根声明缺失且类型已经用户或工程证实，才使用 `--default-type`。配置候选的步序身份由工程和实际采集核实。
-4. 汇川任务依据本次 XML。单任务使用声明名，多任务按 `pouInstance` 及其可解析调用路径统计所选通道的明确写入，各通道按任务去重。使用覆盖数唯一最高的任务。条件读取、注释和未调用例程不提供写入证据。全部通道使用同一个采样时钟。需要显式选择时使用已核实的 `--task-name`，自定义分频用 `--every-n-cycles`。
-5. 使用对应客户端导入配置，检查关联的应用、任务、触发、采样设置和通道容量。实测后保留原始导出和分卷名称。
+用户提供完整变量名、通配或 `re:` 时，直接按[入口命令](../../agents/plc-sequence.md)运行。多个模式分别传入，取并集并按完整变量名去重。通配方括号按字面匹配。完整 CLI 可重复传 `--pattern`，或选择 `--regex`。报告显式可执行引用及动态下标。Sysmac 仅在手动模式下允许对缺失根声明使用已经工程核实的 `--default-type`。
 
 ## 验收
 
-- `static_variables.txt` 保存完整的静态通道。`workflow_status.json` 的 `patterns` 记录本轮全部模式，同时报告静态通道数、动态下标、未解析类型、XML 问题、采样数及配置路径。类型缺失或功能块路径未解析时按实际问题交付复核信息。
-- `done` 生成 `<源码名>_trace_config.trace` 或 `.csv`，配置只含通道和采集参数。`needs_review` 提供清单和具体待核原因。
-- 检查 `declared_tasks[].channel_writes` 的调用链及 XML 行号，报告 `task_name`、`every_n_cycles`、`nominal_sample_interval_ms` 和 `buffer_entries`。未知或冲突的周期保留模板缓冲。缺声明、写入证据不足、并列及跨资源时，依据 `task_note` 说明待核原因。
-- 已有配置的显式重建使用 `--force` 归档同类产物。无可匹配的显式引用或厂商无法确定时报告实际错误。
-
-## 协作
-
-现场客户端将配置转成实测数据。入口一的 [Trace 跳变](../plc-trace-jump-analysis/SKILL.md) 使用实际导出的采样文件或分卷目录。
+- 对照 `static_variables.txt`、配置通道数、任务以及 `workflow_status.json`。汇川沿用本工程任务名、写入覆盖、名义采样周期和缓冲点数，必要时依据 `task_note` 报告冲突。Sysmac 检查每个采纳通道的整数叶类型。
+- PLCopen 存在任务表时，检查 `scheduled_writers` 的任务、调用链及实际写步行号。SMC2 导出若缺作用域或叶类型，自动模式保留网格证据并报告待核。
+- 自动模式报告用途待核、只有引用的同族成员、未解析类型及源码解析限制。自动派生的选择器只代表本工程的集合回放；有额外命中时保留显式清单。经 FB 绑定得到的通道可能在源码中没有完整拼写。
+- `done`、`done_with_review` 均应有配置，后者需披露待核范围。`needs_review` 说明未交付配置的具体原因。`scope_review_pending` 是中间状态。配置采样数为 0；工程师在对应客户端导入、检查容量及采样设置，并在现场采集。

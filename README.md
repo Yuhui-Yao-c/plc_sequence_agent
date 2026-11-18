@@ -1,8 +1,8 @@
 # PLC Trace 工作流
 
-本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码提取显式变量，生成采集通道配置。
+本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。
 
-当前简化版为 **13.0.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **13.1.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -18,16 +18,18 @@ opencode
 | 入口 | 输入 |
 | --- | --- |
 | 一　Trace 步序采集 | `源码路径 Trace路径 -t [-output 输出根目录]` |
-| 二　Trace 采集配置 | `源码路径 模式1 [模式2 ...] --trace-setup [任务选项] [-output 输出根目录]` |
+| 二　Trace 采集配置 | `源码路径 [模式1 模式2 ...] --trace-setup [任务选项] [-output 输出根目录]` |
 
 ```text
 "source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "D:\工作成果"
-"source/包mylar/PLC程序.xml" "m_nNextAutoStep[*]" --trace-setup -output "D:\工作成果"
+"source/包mylar/PLC程序.xml" --trace-setup -output "D:\工作成果"
 ```
 
 两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。已有产物时自动选用带 `_2`、`_3` 等后缀的新子目录。
 
-入口二可连续输入多个独立模式，每个模式用引号包住。命中任一模式的变量进入同一清单，完整变量名去重后自然排序。可混用完整名称、通配符和 `re:` 正则；单模式写法继续有效。
+入口二省略模式时，根据源码中的状态分支、写回和功能块实参发现具体通道。OpenCode 随后判断工位生产用途并核对类型、任务和配置。单独使用 CLI 时，首次返回 `scope_review_pending`，需提供本轮用途判断才能完成选择。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
+
+也可连续输入多个独立模式，每个模式用引号包住。命中任一模式的变量进入同一清单，完整变量名去重后自然排序。可混用完整名称、通配符和 `re:` 正则；单模式写法继续有效。
 
 ```powershell
 python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" "re:Line\.Stage[0-9]+" --trace-setup -output "D:\工作成果"
@@ -35,7 +37,7 @@ python plc_cli.py "source/工程/PLC.xml" "Cell.Phase[*]" "re:Line\.Stage[0-9]+"
 
 ### 汇川采样任务如何产生
 
-入口二只需本次工程 XML 和变量匹配模式。生成器读取 XML 的任务名、任务类型、周期和 `pouInstance`，把已调度的程序、可定位的例程调用与所选通道的明确写入关联起来。
+入口二以本次工程 XML 为输入。生成器读取 XML 的任务名、任务类型、周期和 `pouInstance`，把已调度的程序、可定位的例程调用与所选通道的明确写入关联起来。
 
 | XML 情况 | 默认结果 |
 | --- | --- |
@@ -100,6 +102,8 @@ Trace 分析支持 TwinCAT Scope `.trace` 和 Sysmac 导出表、分卷目录，
 明确的待料步用黄底，堵料步用灰底。其它有依据的等待步只在「等待位标识」填 1。动作时间、完成时间、目标时长和三种编号缺少独立依据，均留白。缺少完整停留观测的行保留跳变次数，时长留空。工位小计只加有时长的行，有缺项时标明行数。
 
 采样连续而步值不动的时段按实测保留。遇到缺口，每个通道从恢复后的首个样本重新跟踪。缺口两端的值供审计，不能据此补出中间路径。工作簿「采样缺口」和 `trace_sampling_gaps.json` 给出采集内时间、上下文端点和通道范围。每行证据链区分观测发生次数与有效计时次数。
+
+自动发现的控制证据及用途结论见 `step_variable_discovery.json`，按通道阅读的摘要见 `scope_candidates.jsonl`。
 
 入口二交付 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。
 

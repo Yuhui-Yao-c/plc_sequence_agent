@@ -165,9 +165,9 @@ def _expand_trace_shorthand(parser, args):
         return args
 
     routes = {'-t': ('trace', '--trace'), '--trace-setup': ('trace-setup', '--pattern')}
-    marker_index = next((i for i in range(2, len(args)) if args[i] in routes), None)
+    marker_index = next((i for i in range(1, len(args)) if args[i] in routes), None)
     if marker_index is None:
-        parser.error('Trace 简写须为 源码 Trace路径 -t 或 源码 模式1 [模式2 ...] --trace-setup')
+        parser.error('Trace 简写须为 源码 Trace路径 -t 或 源码 [模式1 模式2 ...] --trace-setup')
     source, values, marker = args[0], args[1:marker_index], args[marker_index]
     if ((marker == '-t' and marker_index != 2)
             or any(not value.strip() or value.startswith('-') for value in values)):
@@ -204,7 +204,7 @@ def main():
  p=argparse.ArgumentParser(description='PLC Trace 步序采集与采集配置')
  p.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
  p.epilog = ('Trace 简写可用 源码 Trace路径 -t [-output 输出根目录] '
-             '或 源码 模式1 [模式2 ...] --trace-setup [任务选项] [-output 输出根目录]')
+             '或 源码 [模式1 模式2 ...] --trace-setup [任务选项] [-output 输出根目录]')
  sub=p.add_subparsers(dest='mode',required=True)
  x=sub.add_parser('trace',help='trace步序采集模式：trace跳变→状态对→A/B档动作描述→交付表')
  x.add_argument('--source',required=True,help='PLC源码XML路径（用于动作变量映射/步注释/工位身份）')
