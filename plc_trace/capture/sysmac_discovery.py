@@ -7,6 +7,7 @@ from plc_trace.analysis.boundary_logic import IDENT, combine, comparisons, integ
 from plc_trace.analysis.successor_graph import STParser, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import _executable_text
 from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops
+from plc_trace.capture.station_scope import required_cursors
 from plc_trace.source.omron_native import collect_native
 from plc_trace.source.plcopen_trace_control import ERRORS, _conditions, _states
 from plc_trace.source.smc2_controlflow import collect_smc2
@@ -151,13 +152,24 @@ def discover(source, scan):
             result.visible.add(f'{unit[1]}.{name}')
     limits = Counter()
 
-    def records(var, scope, site):
+    def records(var, scope, site, co_names=()):
         paths = ([(f'{scope}::{var}', None, 'SMC2 中缺少可核实的作用域及整数声明', [])] if grid
                  else binding.paths(var, binding.unit(scope)))
         for name, kind, issue, chain in paths:
             row = result.candidate(name)
             row.declared, row.type_issue = kind, issue
-            yield row, {**site, 'scope': scope, **({'binding': chain} if chain else {})}
+            bound = {**site, 'scope': scope, **({'binding': chain} if chain else {})}
+            host = binding.unit(chain[0]['scope'] if chain else scope)
+            if host and host[0] == 'program':
+                bound['program'] = host[1]
+            if not grid and co_names:
+                peers = set()
+                for peer in co_names - {var.casefold()}:
+                    for address, _, _, calls in binding.paths(peer, binding.unit(scope)):
+                        if calls == chain and address.casefold() != name.casefold():
+                            peers.add(address.casefold())
+                bound['co_cursors'] = sorted(peers)
+            yield row, bound
 
     # Native weak connectivity can be enough for an audit but never proves an
     # input state when another arm bypasses its comparison.
@@ -174,7 +186,7 @@ def discover(source, scan):
         line = re.search(r'(?:^|;)line:(\d+)', rel['body'])
         site = {'source_line': int(line[1]) if line else 0, 'guard': rel['guard'],
                 'guard_complete': rel.get('guard_complete', False), 'kind': rel['evidence']}
-        for row, bound in records(var, scope, site):
+        for row, bound in records(var, scope, site, required_cursors(condition)):
             row.edge(rel['from'], rel['to'], bound)
 
     # Retain locations and non-monitor instructions in the same executable ST
@@ -217,7 +229,7 @@ def discover(source, scan):
             current = [(v, a) for v, a in src if v == lhs.casefold() and number is not None and a != number]
             for key, step in current:
                 states[key].add(step)
-                for row, bound in records(lhs, block['scope'], site):
+                for row, bound in records(lhs, block['scope'], site, required_cursors(gate)):
                     row.edge(step, number, bound)
             if number is not None and (unit := binding.unit(block['scope'])) and unit[0] == 'program':
                 target = scan.sysmac_channel(lhs, unit)[0]
@@ -254,5 +266,8 @@ def discover(source, scan):
             row.effect(step, {**site, 'target': item['arguments']})
     result.issues = {'unsupported': dict(limits), 'binding': dict(binding.limits),
                      'adapter_counts': model.get('native_parse_audit', {}).get('counts', model['summary'])}
+    if not grid:
+        for row in result.candidates.values():
+            row.declarations = scan.channel_declarations(row.name)
     binding.paths.cache_clear()
     return result

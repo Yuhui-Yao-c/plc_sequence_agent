@@ -10,6 +10,7 @@ from plc_trace.analysis.fb_transport import bindings, interface
 from plc_trace.analysis.successor_graph import STParser, WireBody, pins, tag, text
 from plc_trace.capture.extract_step_variables import _executable_text
 from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops
+from plc_trace.capture.station_scope import at_path, declaration, required_cursors
 from plc_trace.source.source_expressions import source_condition
 from plc_trace.source.plcopen_trace_control import ERRORS, _bodies, _scope, collect_root
 
@@ -88,36 +89,40 @@ def _site(item):
     return site
 
 
-def _channel_type(types, variable, program):
+def _channel_declaration(types, variable, program):
     """Validate every static subscript against the declared dimensions."""
+    facts = []
     parts = variable.split('.')
     root = re.split(r'\[', parts[0], 1)[0]
     nodes = types.locals.get(program, {}).get(root, types.globals.get(root, ()))
     for pos, part in enumerate(parts):
+        if len(nodes) == 1:
+            variable_node = nodes[0].getparent().getparent()
+            facts.extend(at_path(declaration(variable_node), parts, pos))
         typ = types._unaliased(nodes)
         for indexes in re.findall(r'\[([^]]*)\]', part):
             if typ is None or tag(typ) != 'array':
-                return None
+                return None, facts
             dims = typ.findall('{*}dimension')
             if len(dims) != len(indexes.split(',')):
-                return None
+                return None, facts
             for dim, ix in zip(dims, indexes.split(',')):
                 try:
                     if not int(dim.get('lower')) <= int(ix) <= int(dim.get('upper')):
-                        return None
+                        return None, facts
                 except (TypeError, ValueError):
-                    return None
+                    return None, facts
             base = typ.find('{*}baseType')
             typ = types._unaliased(list(base) if base is not None else ())
         if typ is None:
-            return None
+            return None, facts
         if pos == len(parts) - 1:
-            return tag(typ).upper() if types.bounds(variable, program) else None
+            return (tag(typ).upper() if types.bounds(variable, program) else None), facts
         if tag(typ) != 'struct':
-            return None
+            return None, facts
         field = parts[pos + 1].split('[')[0]
         nodes = types._declarations(typ).get(field, ())
-    return None
+    return None, facts
 
 
 def _recover_st(code, parser, error):
@@ -160,7 +165,7 @@ def discover(source, scan):
 
     @lru_cache(maxsize=None)
     def declared_type(key, program):
-        return _channel_type(ci.types, key, program)
+        return _channel_declaration(ci.types, key, program)
 
     def resolve(key, item, *, writer=False):
         program = item['program']
@@ -173,7 +178,7 @@ def discover(source, scan):
         candidate = result.candidate(name)
         if local and (unit is None or unit.get('pouType', '').casefold() != 'program'):
             candidate.reasons.add('local_without_program_instance')
-        candidate.declared = declared_type(key, program)
+        candidate.declared, candidate.declarations = declared_type(key, program)
         if not candidate.declared:
             candidate.type_issue = '缺少唯一且受支持的整数叶类型或数组声明'
         if writer:
@@ -184,7 +189,11 @@ def discover(source, scan):
 
     for key, item in ci.edges:
         candidate = resolve(key, item, writer=True)
-        site = {**_site(item), 'kind': item['grade']}
+        site = {**_site(item), 'program': item['program'], 'kind': item['grade']}
+        others = (names.keys() & {n.casefold() for n in item['numeric_conditions']}) - {key}
+        if others:
+            required = required_cursors(source_condition(item['guard'])) & others
+            site['co_cursors'] = sorted({resolve(peer, item).name.casefold() for peer in required})
         candidate.edge(item['from'], item['to'], site)
         for other, conditions in item['numeric_conditions'].items():
             if other.casefold() not in names or other.casefold() == key:

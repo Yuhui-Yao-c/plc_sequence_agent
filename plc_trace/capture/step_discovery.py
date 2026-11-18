@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from plc_trace.analysis.boundary_logic import IDENT, symbol
 from plc_trace.analysis.candidate_filter import glob_regex
 from plc_trace.analysis.successor_graph import _st_tokens_with_spans
+from plc_trace.capture.station_scope import dependent_writes, family, same_station_array, writer_context
 
 
 def digest(value):
@@ -70,6 +71,7 @@ class Candidate:
     reasons: set = field(default_factory=set)
     owners: set = field(default_factory=set)
     scheduled: dict = field(default_factory=dict)
+    declarations: list = field(default_factory=list)
     declared: str = ''
     type_issue: str = ''
 
@@ -79,7 +81,7 @@ class Candidate:
         self.edges.add((a, b))
         # Keep distinct routines, instance bindings and branches available for scope review.
         site = {**site, 'from': a, 'to': b}
-        key = site['scope'], a, b, site.get('guard', '')
+        key = writer_context(site), a, b, site.get('guard', '')
         old = self.sites.get(key)
         if old is None or (site.get('st_line') and not old.get('st_line')):
             self.sites[key] = site
@@ -114,6 +116,8 @@ class Candidate:
             site['id'] = f'e{n}'
         links = [{**self.links[key], 'id': f'l{n}'} for n, key in enumerate(sorted(self.links), 1)]
         return {'name': self.name, 'identity': self.name.casefold(), 'type': self.declared or None,
+                'family': family(self.name),
+                'declarations': [{**d, 'id': f'd{i}'} for i, d in enumerate(self.declarations, 1)],
                 'type_issue': self.type_issue, 'eligibility': 'review' if self.reasons else 'scope_required',
                 'reasons': sorted(self.reasons), 'edges': len(self.edges), 'scopes': sorted({s['scope'] for s in sites}),
                 'transitions': sites, 'effects': effects, 'control_links': links,
@@ -152,16 +156,14 @@ class Discovery:
 
     def add_unproven_siblings(self, scan):
         # Show observed lookalikes separately (e.g. a sibling that is only cleared).
-        def shape(name):
-            return re.sub(r'\d+', '#', name.casefold())
-        families = {shape(row.name) for row in self.candidates.values() if row.edges}
+        families = {family(row.name) for row in self.candidates.values() if row.edges}
         for (_, unit), (name, raw, line) in scan.references.items():
             if not any(c.isdigit() for c in name):
                 continue
             if scan.source_format == 'omron_iec61131_10':
                 name = scan.sysmac_channel(name, unit)[0]
             self.visible.add(name)
-            if shape(name) in families:
+            if family(name) in families:
                 key = name.casefold()
                 if key not in self.candidates:
                     self.candidate(name).reasons.add('reference_only')
@@ -171,48 +173,117 @@ class Discovery:
     def inventory(self, source_sha, adapter):
         self.resolve_links()
         records = [self.candidates[k].record() for k in sorted(self.candidates)]
-        data = {'schema': 'plc.step_discovery.v1', 'source_sha256': source_sha, 'adapter': adapter,
+        controllers = {r['identity'] for r in records if r['eligibility'] == 'scope_required'}
+        for row in records:
+            for site in row['transitions']:
+                if 'co_cursors' in site:
+                    site['co_cursors'] = sorted(controllers.intersection(site['co_cursors']) - {row['identity']})
+        data = {'schema': 'plc.step_discovery.v2', 'scope_policy': 'station_automatic_steps', 'source_sha256': source_sha, 'adapter': adapter,
                 'candidates': records, 'parse_limits': self.issues}
         data['inventory_sha256'] = digest(data)
         return data
 
 
-_CAPTURE_ROLES = {'production', 'production_child', 'mixed'}
-_ROLES = _CAPTURE_ROLES | {'auxiliary', 'uncertain'}
+_ROLES = {'station_auto', 'station_slot', 'component_sequence', 'auxiliary', 'uncertain'}
+
+
+def _station_evidence(candidate, row, citations):
+    scope = row.get('owner_scope')
+    own = [s for s in candidate['transitions'] if s['scope'] == scope and s['id'] in citations]
+    if not own:
+        raise ValueError(f'工位采纳项须引用该生产例程内本通道的迁移：{candidate["name"]}')
+    declarations = candidate['declarations']
+    writers = {writer_context(site) for site in own}
+    if any(d['id'] not in citations for d in declarations):
+        raise ValueError(f'工位采纳项须核对该实例、成员和下标的声明：{candidate["name"]}')
+    corroborated = (any(d.get('text') for d in declarations) or any(s.get('binding') for s in own)
+                    or any(writer_context(e) in writers and e['id'] in citations for e in candidate['effects'])
+                    or len({s['from'] for s in own}) > 1)
+    if not corroborated:
+        raise ValueError(f'工位归属缺独立佐证，请补充本例程证据或标为待核：{candidate["name"]}')
 
 
 def scope_selection(inventory, decisions):
-    """Admit only proven, scoped names. A reviewer cannot add names, types or transitions."""
+    """Require a project-local station interface and individual, scoped source proof."""
     eligible = {r['identity']: r for r in inventory['candidates'] if r['eligibility'] == 'scope_required'}
     if decisions is None:
         return {}, []
     if not isinstance(decisions, dict) or decisions.get('inventory_sha256') != inventory['inventory_sha256']:
-        raise ValueError('用途判断与本轮源码证据指纹不一致')
-    rows = decisions.get('decisions')
-    if not isinstance(rows, list):
-        raise ValueError('用途判断须包含 decisions 数组')
-    chosen, seen = {}, set()
+        raise ValueError('用途判断与本轮源码证据指纹不一致，请重新判断工位自动步范围')
+    rows, examples = decisions.get('decisions'), decisions.get('station_families')
+    if not isinstance(rows, list) or not isinstance(examples, list):
+        raise ValueError('工位范围判断须包含 station_families 与 decisions 数组')
+    families = {}
+    for example in examples:
+        if not isinstance(example, dict) or not isinstance(example.get('example'), str):
+            raise ValueError('工位变量族缺少本轮可核对的代表实例')
+        key = example['example'].casefold()
+        if key not in eligible or not isinstance(example.get('boundary'), str) or not example['boundary'].strip():
+            raise ValueError('工位变量族须给出真实实例和独立周期的归属依据')
+        group = eligible[key]['family']
+        if group in families:
+            raise ValueError(f'重复声明工位变量族：{group}')
+        families[group] = key
+    selected, reviewed = {}, {}
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get('name'), str):
             raise ValueError('用途判断缺少变量名')
-        name = row['name'].casefold()
-        if name not in eligible or name in seen:
-            raise ValueError(f'重复或无独立迁移证据的变量：{name}')
-        seen.add(name)
-        candidate = eligible[name]
-        refs = {s['id'] for s in (*candidate['transitions'], *candidate['effects'], *candidate['control_links'])}
+        key = row['name'].casefold()
+        if key not in eligible or key in reviewed:
+            raise ValueError(f'重复或无独立迁移证据的变量：{key}')
+        candidate = eligible[key]
+        refs = {site['id'] for field in ('transitions', 'effects', 'control_links', 'declarations')
+                for site in candidate[field]}
         citations = row.get('basis')
-        if (not isinstance(row.get('role'), str) or row['role'] not in _ROLES or not isinstance(row.get('reason'), str) or not row['reason'].strip()
+        if (not isinstance(row.get('role'), str) or row['role'] not in _ROLES
+                or not isinstance(row.get('reason'), str) or not row['reason'].strip()
                 or not isinstance(citations, list) or not citations
                 or not all(isinstance(i, str) and i in refs for i in citations)):
-            raise ValueError(f'用途、理由或本变量源码证据引用无效：{name}')
-        if row['role'] in _CAPTURE_ROLES:
-            if not any(i.startswith('t') for i in citations):
-                raise ValueError(f'采纳变量须引用其本身的迁移：{name}')
-            chosen[name] = candidate
-    if seen != eligible.keys():
-        raise ValueError(f'本轮仍有 {len(eligible.keys() - seen)} 个候选缺用途判断')
-    return chosen, sorted(rows, key=lambda r: r['name'].casefold())
+            raise ValueError(f'用途、理由或本变量源码证据引用无效：{key}')
+        # Recompute the output disposition even if the user replays a previous result.
+        item = {k: row[k] for k in ('name', 'role', 'basis', 'reason')}
+        item['admission'] = 'review' if row['role'] == 'uncertain' else 'excluded'
+        if row['role'] in {'station_auto', 'station_slot'}:
+            if candidate['family'] not in families:
+                raise ValueError(f'该通道尚未证明所属工位自动步接口：{key}')
+            _station_evidence(candidate, row, set(citations))
+            selected[key] = candidate
+            item.update(owner_scope=row['owner_scope'], admission='captured')
+            if row['role'] == 'station_slot':
+                peer = row.get('interface_peer')
+                if not isinstance(peer, str) or peer.casefold() == key:
+                    raise ValueError(f'工位槽位须指向同一接口的另一已核实实例：{key}')
+                item['interface_peer'] = peer
+        reviewed[key] = item
+    if reviewed.keys() != eligible.keys():
+        raise ValueError(f'本轮仍有 {len(eligible.keys() - reviewed.keys())} 个候选缺用途判断')
+    if any(reviewed[key]['role'] != 'station_auto' for key in families.values()):
+        raise ValueError('工位变量族的代表实例也须有逐通道生产例程证据')
+    for key, row in selected.items():
+        decision = reviewed[key]
+        if decision['role'] != 'station_slot':
+            continue
+        peer = decision['interface_peer'].casefold()
+        if (peer not in selected or reviewed[peer]['role'] != 'station_auto'
+                or not same_station_array(row, decision, selected[peer], reviewed[peer])):
+            raise ValueError(f'无法证明该槽位与工位主实例的声明地址及生产程序一致：{key}')
+    withheld = dependent_writes(selected)
+    for key, candidate in selected.items():
+        decision = reviewed[key]
+        peer = decision.get('interface_peer', '').casefold()
+        example = families[candidate['family']]
+        if gates := withheld.get(key):
+            decision['gated_by'] = gates
+            # A commissioned slot may run wholly inside its own station's step.
+            # The exception requires the same concrete storage, host and independent peer.
+            if not peer or peer in withheld or any(
+                    not same_station_array(candidate, decision, selected[p], reviewed[p]) for p in gates):
+                decision['admission'] = 'review'
+        if decision['admission'] == 'captured' and (example in withheld or peer in withheld):
+            anchor = peer if peer in withheld else example
+            decision.update(admission='review', interface_under_review=eligible[anchor]['name'])
+    chosen = {key: r for key, r in selected.items() if reviewed[key]['admission'] == 'captured'}
+    return chosen, [reviewed[k] for k in sorted(reviewed)]
 
 
 def replay_selectors(names, visible, explicit=None):
@@ -250,10 +321,11 @@ def scope_index(inventory):
                 # Spread excerpts over early/middle/late phases of each routine.
                 for i in sorted({0, len(items)//2, len(items)-1}):
                     site = items[i]
-                    brief = {k: site[k] for k in ('id', 'scope', 'source_line', 'st_line', 'kind', 'from', 'to',
-                             'target', 'child', 'parent', 'comment', 'guard') if site.get(k) is not None}
+                    brief = {k: site[k] for k in ('id', 'scope', 'program', 'source_line', 'st_line', 'kind', 'from', 'to',
+                             'target', 'child', 'parent', 'comment', 'guard', 'co_cursors') if site.get(k) is not None}
                     if site.get('binding'):
                         brief['call'] = [{k: x[k] for k in ('scope', 'instance', 'source_line')} for x in site['binding']]
                     examples.append(brief)
-        yield {'name': row['name'], 'type_issue': row['type_issue'],
+        yield {'name': row['name'], 'family': row['family'], 'declarations': row['declarations'],
+               'type_issue': row['type_issue'],
                'scheduled_writers': row.get('scheduled_writers', {}), 'evidence': examples}

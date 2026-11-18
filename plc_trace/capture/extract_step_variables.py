@@ -25,6 +25,7 @@ from plc_trace.analysis.candidate_filter import glob_regex
 from plc_trace.capture.plcopen_tasks import (
     ProgramWrites, Routine, is_task_declaration, sampling_task, task_declaration, validated_task_name,
 )
+from plc_trace.capture.station_scope import at_path, declaration
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
 from plc_trace.trace.trace_to_pairs import INTEGER_TYPES
@@ -209,6 +210,7 @@ class _SourceScan:
         self.directions = defaultdict(set)
         self.declarations = defaultdict(set)
         self.members = defaultdict(set)
+        self.declaration_sites = {}
         self.aliases = defaultdict(set)
         self.programs = {}
         self.header = ''
@@ -256,6 +258,7 @@ class _SourceScan:
             return
         frames = [_Frame('', None, False, False, '')]
         task_node = None
+        declaration_node = None
         routines = []
         plcopen = self.source_format == 'plcopen'
         with source.open('rb') as stream:
@@ -268,6 +271,13 @@ class _SourceScan:
                     frames.append(_Frame(tag, unit, parent.body or tag in {'body', 'bodycontent'},
                                          parent.comment or tag in _XML_COMMENTS,
                                          name if tag == 'datatypedecl' else parent.type_name))
+                    if (self.matcher is None and self.source_format == 'omron_iec61131_10'
+                            and declaration_node is None and not parent.body and name):
+                        if tag == 'member' and parent.type_name:
+                            declaration_node = (node, ('member', parent.type_name.casefold(), name.casefold()))
+                        elif tag == 'variable' and parent.tag.endswith('vars') and parent.tag != 'externalvars':
+                            owner = None if parent.tag == 'globalvars' else unit
+                            declaration_node = (node, ('variable', owner, name.casefold()))
                     if tag == 'fileheader':
                         self.header = ' '.join(node.get(k, '') for k in ('companyName', 'productName')).casefold()
                     if self.matcher is None and tag in {'program', 'function', 'functionblock'} and name:
@@ -312,6 +322,13 @@ class _SourceScan:
                         routines.pop()
                 if frame.tag == 'typename' and self.source_format == 'omron_iec61131_10':
                     self._type_name(node, frame)
+                if declaration_node is not None:
+                    declared, key = declaration_node
+                    if node is not declared:
+                        continue
+                    # Conflicting declarations cannot serve as unit ownership evidence.
+                    self.declaration_sites[key] = declaration(node) if key not in self.declaration_sites else None
+                    declaration_node = None
                 if task_node is not None:
                     if node is not task_node:
                         continue
@@ -377,6 +394,25 @@ class _SourceScan:
                 if lower is not None and upper is not None and not lower <= int(index) <= upper:
                     return None, '下标超出声明范围'
             pending = next(indexes, None)
+
+    def channel_declarations(self, name):
+        parts = name.split('.')
+        unit = self.programs.get(parts[0].casefold()) if len(parts) > 1 else None
+        local = unit and (unit, parts[1].split('[')[0].casefold()) in self.declarations
+        start = 1 if local else 0
+        root = parts[start].split('[')[0].casefold()
+        owner = unit if local else None
+        site = self.declaration_sites.get(('variable', owner, root))
+        values = self.declarations.get((owner, root), ())
+        result = at_path(site, parts, start)
+        for i in range(start + 1, len(parts)):
+            kind, _ = self._peel_type(values, parts[i-1])
+            if not kind:
+                break
+            key = kind.casefold(), parts[i].split('[')[0].casefold()
+            result.extend(at_path(self.declaration_sites.get(('member', *key)), parts, i))
+            values = self.members.get(key, ())
+        return result
 
     def sysmac_channel(self, name, unit):
         parts = name.split('.')
@@ -545,6 +581,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 raise ValueError('用途判断 JSON 为空')
             chosen, roles = scope_selection(inventory, decisions)
             inventory['decisions'] = roles
+            families = decisions['station_families'] if decisions is not None else []
+            inventory['station_families'] = families
             inventory['reference_sites'] = discovered.reference_sites
             inventory['selector_replay'] = replay_selectors([r['name'] for r in chosen.values()],
                                                            discovered.visible | set(discovered.candidates),
@@ -612,7 +650,9 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         if automatic:
             report.update(selection_mode='automatic', discovery='step_variable_discovery.json',
                           scope_candidates=eligible, inventory_sha256=inventory['inventory_sha256'],
-                          scope_uncertain=sum(r['role'] == 'uncertain' for r in roles))
+                          scope_policy=inventory['scope_policy'], station_family_count=len(families),
+                          scope_excluded=sum(r['admission'] == 'excluded' for r in roles),
+                          scope_uncertain=sum(r['admission'] == 'review' for r in roles))
             report['unproven_candidates'] = len(inventory['candidates']) - eligible
             if (report['scope_uncertain'] or report['unproven_candidates']) and config:
                 report['status'] = 'done_with_review'
@@ -620,7 +660,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                                                        for r in scope_index(inventory)).encode('utf-8')
             if decisions is not None:
                 files['scope_results.json'] = json.dumps({'inventory_sha256': inventory['inventory_sha256'],
-                    'decisions': roles}, ensure_ascii=False, indent=1).encode('utf-8')
+                    'station_families': families, 'decisions': roles}, ensure_ascii=False, indent=1).encode('utf-8')
             files['step_variable_discovery.json'] = json.dumps(inventory, ensure_ascii=False, indent=1).encode('utf-8')
             if fingerprint(source) != digest:
                 raise ValueError('发现期间源码发生变化，请重新执行')

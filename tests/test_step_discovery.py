@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 
 from plc_trace.capture.extract_step_variables import generate
 from plc_trace.capture.step_discovery import Discovery, replay_selectors, scope_selection
+from plc_trace.capture.station_scope import dependent_writes
 from plc_trace.cli import _expand_trace_shorthand
 from tests.test_plcopen_trace_control import ladder, operand, port, program
 
@@ -23,12 +25,27 @@ class StepDiscoveryTests(unittest.TestCase):
         result = generate(self.source, self.out)
         return result, json.loads((self.out / 'step_variable_discovery.json').read_text(encoding='utf-8'))
 
+    @staticmethod
+    def scope(inventory, names):
+        decisions, examples = [], {}
+        for row in inventory['candidates']:
+            if row['eligibility'] != 'scope_required':
+                continue
+            item = {'name': row['name'], 'role': 'uncertain', 'basis': ['t1'], 'reason': '缺少本单元周期依据'}
+            if row['name'] in names:
+                scope = row['transitions'][0]['scope']
+                evidence = [*row['declarations'], *(t for t in row['transitions'] if t['scope'] == scope),
+                            *(e for e in row['effects'] if e['scope'] == scope)]
+                item.update(role='station_auto', basis=[v['id'] for v in evidence], owner_scope=scope,
+                            reason='此实例推进已核对的作业周期')
+                examples.setdefault(row['family'], {'example': row['name'], 'boundary': '此单元从接料到交出工件'})
+            decisions.append(item)
+        return {'inventory_sha256': inventory['inventory_sha256'],
+                'station_families': list(examples.values()), 'decisions': decisions}
+
     def finish(self, inventory, names):
         path = self.root / 'scope.json'
-        decisions = [{'name': row['name'], 'role': 'production' if row['name'] in names else 'uncertain',
-                      'basis': ['t1'], 'reason': '源码分支推进并驱动输出'}
-                     for row in inventory['candidates'] if row['eligibility'] == 'scope_required']
-        path.write_text(json.dumps({'inventory_sha256': inventory['inventory_sha256'], 'decisions': decisions}))
+        path.write_text(json.dumps(self.scope(inventory, names)))
         return generate(self.source, self.out, scope_results=path)
 
     def test_default_route_and_explicit_selector_are_distinct(self):
@@ -92,12 +109,23 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertEqual(self.finish(inv, {'Cold'})['task_name'], 'Task')
 
     def test_cross_run_and_extra_names_rejected_and_selector_cannot_expand(self):
-        inv = {'inventory_sha256':'key', 'candidates':[{'identity':'a','name':'A','eligibility':'scope_required',
-               'transitions':[{'id':'t1'}], 'effects':[], 'control_links':[]}]}
-        for key, decisions in [('old', []), ('key', []), ('key', [{'name':'B'}]),
-                               ('key',[{'name':'A','role':'production','basis':['invented'],'reason':'x'}])]:
-            with self.assertRaises(ValueError):
-                scope_selection(inv, {'inventory_sha256':key,'decisions':decisions})
+        d = Discovery()
+        c = d.candidate('A')
+        c.edge(8, 9, {'scope': 'run'})
+        c.edge(9, 8, {'scope': 'run'})
+        c.declarations = [{'kind': 'declaration', 'path': 'A', 'text': '工程声明', 'line': 18}]
+        inv = d.inventory('source', 'unit')
+        scope = self.scope(inv, {'A'})
+        for field, value in [('name', 'B'), ('role', 'mixed'), ('basis', ['t1']),
+                             ('basis', ['t1', 'd2']), ('basis', ['d1']), ('owner_scope', 'other')]:
+            bad = copy.deepcopy(scope)
+            bad['decisions'][0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                scope_selection(inv, bad)
+        for field, value in [('inventory_sha256', 'old'), ('decisions', []), ('station_families', []),
+                             ('station_families', [{'example': 'B', 'boundary': 'other'}])]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                scope_selection(inv, {**scope, field: value})
         rules = replay_selectors(['Z[1]', 'Z[3]'], ['Z[1]', 'Z[2]', 'Z[3]'])
         self.assertIsNone(rules[0]['selector'])
         self.assertEqual(rules[0]['other_matches'], ['z[2]'])
@@ -174,3 +202,104 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertTrue(all(e['kind']=='plcopen_partial_st_body' for e in rows['Cursor']['transitions']))
         self.assertTrue(any(e['target']=='Pulse' for e in rows['Cursor']['effects']))
         self.assertGreater(inv['parse_limits']['unsupported_st'],0)
+
+    def test_station_scope_blocks_nested_word_and_keeps_parallel_cycles(self):
+        control = ('CASE AxisX OF 2: IF Ready THEN AxisX:=9; END_IF; '
+                   '9: IF ExitOK THEN AxisX:=2; END_IF; END_CASE; '
+                   'IF AxisX=2 THEN CASE Ticket OF 1: Ticket:=5; 5: Ticket:=1; END_CASE; END_IF; '
+                   'CASE Lane OF 4: IF AxisX=2 OR BufferFree THEN Lane:=6; END_IF; '
+                   '6: Lane:=4; END_CASE;')
+        decl = ''.join(f'<Variable name="{n}"><Type><TypeName>INT</TypeName></Type></Variable>'
+                       for n in ('AxisX', 'Lane', 'Ticket'))
+        _, inv = self.prepare('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+decl+
+                              '</GlobalVars><Program name="Bay"><BodyContent name="Cycle"><ST>'+control+
+                              '</ST></BodyContent></Program></Project>')
+        result = self.finish(inv, {'AxisX', 'Lane', 'Ticket'})
+        self.assertEqual({c['name'] for c in result['channels']}, {'AxisX','Lane'})
+        self.assertEqual(result['scope_uncertain'], 1)
+        decision = json.loads((self.out/'scope_results.json').read_bytes())['decisions']
+        self.assertEqual(next(r for r in decision if r['name']=='Ticket')['gated_by'], ['axisx'])
+        self.assertEqual(result['status'], 'done_with_review')
+        import csv
+        with Path(result['configuration']).open(encoding='utf-8-sig', newline='') as f:
+            header = next(r for r in csv.reader(f) if r and r[0] == 'Index')
+        self.assertEqual(header[5:], ['AxisX:INT','Lane:INT'])
+
+    def test_per_element_notes_and_individually_scoped_instances(self):
+        var = ('<Variable name="Cursor"><Documentation>运行序列</Documentation><AddData><Data><VariableComment>'
+               '<ElementComment element="[0]"><Text>工位作业周期</Text></ElementComment>'
+               '<ElementComment element="[1]"><Text>工装内部交接</Text></ElementComment>'
+               '</VariableComment></Data></AddData><Type><TypeName>ARRAY[0..3] OF INT</TypeName></Type></Variable>')
+        code = ' '.join(f'CASE Cursor[{i}] OF 3: Cursor[{i}]:=8; 8: Cursor[{i}]:=3; END_CASE;' for i in (0,1))
+        _, inv = self.prepare('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+var+
+                              '</GlobalVars><Program name="U"><BodyContent name="Cycle"><ST>'+code+
+                              '</ST></BodyContent></Program></Project>')
+        rows = {r['name']:r for r in inv['candidates']}
+        self.assertEqual([s['text'] for s in rows['Cursor[0]']['declarations']], ['运行序列','工位作业周期'])
+        self.assertEqual([s['text'] for s in rows['Cursor[1]']['declarations']], ['运行序列','工装内部交接'])
+        scope = self.scope(inv, {'Cursor[0]'})
+        item = next(r for r in scope['decisions'] if r['name']=='Cursor[1]')
+        item.update(role='component_sequence', basis=['d2','t1'])
+        chosen, reviewed = scope_selection(inv, scope)
+        self.assertEqual(set(chosen), {'cursor[0]'})
+        self.assertEqual(reviewed[1]['admission'], 'excluded')
+        scope['decisions'][0]['basis'].remove('d2')
+        with self.assertRaises(ValueError):
+            scope_selection(inv, scope)
+
+    def test_equal_member_names_keep_own_instance_declarations(self):
+        def struct(name, note):
+            return f'<variable name="{name}"><type><derived name="U"/></type><documentation>{note}</documentation></variable>'
+        types = ('<dataType name="U"><baseType><struct><variable name="Mark"><type><INT/></type>'
+                 '<documentation>位置</documentation></variable></struct></baseType></dataType>')
+        code = ' '.join(f'CASE {name}.Mark OF 7: {name}.Mark:=11; 11: {name}.Mark:=7; END_CASE;'
+                        for name in ('Head','Drive'))
+        _, inv = self.prepare('<project><fileHeader productName="InoProShop"/>'+types+'<globalVars>'+
+                              struct('Head', '装配单元')+struct('Drive', '移送元件')+'</globalVars>'+
+                              program('Line', '<body><ST>'+code+'</ST></body>')+
+                              '<resource><task name="T"><pouInstance name="Line"/></task></resource></project>')
+        rows = {r['name']:r for r in inv['candidates']}
+        self.assertEqual([d['text'] for d in rows['Head.Mark']['declarations']], ['装配单元', '位置'])
+        self.assertEqual([d['text'] for d in rows['Drive.Mark']['declarations']], ['移送元件', '位置'])
+        self.assertEqual(self.finish(inv, {'Head.Mark'})['static_variables'], 1)
+
+    def test_registered_slot_in_own_unit_with_foreign_array_and_program(self):
+        var = '<Variable name="{}"><Type><TypeName>ARRAY[0..5] OF INT</TypeName></Type></Variable>'
+        def cycle(member):
+            return f'CASE {member} OF 2: {member}:=7; 7: {member}:=2; END_CASE;'
+        def prog(name, code):
+            return f'<Program name="{name}"><BodyContent name="Work"><ST>{code}</ST></BodyContent></Program>'
+        code = cycle('Q[0]') + ' IF Q[0]=2 THEN '+cycle('Q[1]')+cycle('Part[1]')+' END_IF;'
+        _, inv = self.prepare('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+
+                              var.format('Q')+var.format('Part')+'</GlobalVars>'+prog('P',code)+
+                              prog('Other',cycle('Q[3]'))+'</Project>')
+        names = {'Q[0]','Q[1]','Q[3]','Part[1]'}
+        scope = self.scope(inv, names)
+        lookup = {r['name']:r for r in scope['decisions']}
+        lookup['Q[1]'].update(role='station_slot', interface_peer='Q[0]')
+        selected, decisions = scope_selection(inv, scope)
+        self.assertIn('q[1]', selected)
+        self.assertNotIn('part[1]', selected)
+        slot = next(r for r in decisions if r['name']=='Q[1]')
+        self.assertEqual((slot['admission'],slot['gated_by']), ('captured',['q[0]']))
+        for peer in ('Q[1]', 'Part[1]', 'Q[3]', 'absent'):
+            with self.subTest(peer=peer), self.assertRaises(ValueError):
+                lookup['Q[1]']['interface_peer'] = peer
+                scope_selection(inv, scope)
+
+    def test_shared_fb_body_keeps_call_instances_distinct_for_dominance(self):
+        def site(instance, line, *peers):
+            return {'scope': 'Reusable::Cycle', 'co_cursors': list(peers),
+                    'binding': [{'scope': 'Line::Run', 'instance': instance, 'source_line': line}]}
+        model = Discovery()
+        word = model.candidate('Word')
+        parent = model.candidate('Cursor')
+        parent.edge(4, 9, site('First', 30, 'word'))
+        parent.edge(4, 9, site('Second', 41))
+        word.edge(1, 2, site('First', 30, 'cursor'))
+        self.assertEqual(len(parent.sites), 2)
+        rows = {r.name.casefold(): r.record() for r in (parent,word)}
+        self.assertEqual(dependent_writes(rows), {})
+        parent.edge(9, 4, site('First', 30))
+        rows['cursor'] = parent.record()
+        self.assertEqual(dependent_writes(rows), {'word':['cursor']})

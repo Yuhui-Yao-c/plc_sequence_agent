@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。
 
-当前简化版为 **13.1.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **14.0.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -27,7 +27,7 @@ opencode
 
 两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。已有产物时自动选用带 `_2`、`_3` 等后缀的新子目录。
 
-入口二省略模式时，根据源码中的状态分支、写回和功能块实参发现具体通道。OpenCode 随后判断工位生产用途并核对类型、任务和配置。单独使用 CLI 时，首次返回 `scope_review_pending`，需提供本轮用途判断才能完成选择。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
+入口二省略模式时，根据源码中的状态分支、写回和功能块实参发现具体通道。OpenCode 按实际控制层级确认工位或独立作业单元的自动周期。同一正式工位数组中承载局部动作的生产槽位可逐项核实。设备内部另设的执行步、许可和通信状态保留在审计里。多个独立步序接口可同时入选。单独使用 CLI 时，首次返回 `scope_review_pending`，需提供本轮用途判断才能完成选择。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
 
 也可连续输入多个独立模式，每个模式用引号包住。命中任一模式的变量进入同一清单，完整变量名去重后自然排序。可混用完整名称、通配符和 `re:` 正则；单模式写法继续有效。
 
@@ -103,7 +103,7 @@ Trace 分析支持 TwinCAT Scope `.trace` 和 Sysmac 导出表、分卷目录，
 
 采样连续而步值不动的时段按实测保留。遇到缺口，每个通道从恢复后的首个样本重新跟踪。缺口两端的值供审计，不能据此补出中间路径。工作簿「采样缺口」和 `trace_sampling_gaps.json` 给出采集内时间、上下文端点和通道范围。每行证据链区分观测发生次数与有效计时次数。
 
-自动发现的控制证据及用途结论见 `step_variable_discovery.json`，按通道阅读的摘要见 `scope_candidates.jsonl`。
+自动发现的控制证据及用途结论见 `step_variable_discovery.json`，按通道阅读的摘要见 `scope_candidates.jsonl`。自动采集以 `admission=captured` 的完整变量为准。升级后需重新判断工位归属；显式模式仍可指定需要的内部变量。
 
 入口二交付 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。
 
