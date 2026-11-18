@@ -9,13 +9,12 @@ Pair construction (single-variable, per-jump):
   For a variable whose value sequence is  0 → 100 → 110 → 120 → 0,
   jumps = [(0→100,ts0),(100→110,ts1),(110→120,ts2),(120→0,ts3)]
   pairs  = [
-    (var=0   → var=100, dur=ts0-first_sample_ts),  # first jump, dwell from sampling start
+    (var=0   → var=100, dur=unknown),  # running when the recording began
     (var=100 → var=110, dur=ts1-ts0),
     (var=110 → var=120, dur=ts2-ts1),
     (var=120 → var=0,   dur=ts3-ts2),              # reset exit, kept + flagged
   ]
-  Every jump is a pair, including jumps[0] (whose duration uses the variable's
-  first-sample timestamp as the dwell start).
+  Keep each within-span jump. Time a dwell only when its entry and exit were observed.
 
 Multi-cycle aggregation:
   The same (var, from_val, to_val) triple observed N times across cycles is
@@ -25,6 +24,7 @@ Multi-cycle aggregation:
 Outputs (in run dir):
   trace_collection_pairs.csv  — main pair table (column-compatible with
                                 prediction_collection_pairs.csv + runtime cols)
+  trace_sampling_gaps.json    — sampling boundaries and their raw endpoint values
   trace_variables.json        — per-variable metadata (reused from analyzer)
   trace_jumps.csv             — all raw jumps (audit)
   trace_segments.csv          — all value segments (audit)
@@ -53,6 +53,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from plc_trace.output.station_identity import source_station_displays
+from plc_trace.trace.sample_continuity import (CAPTURE_HEAD, GAP_HEAD, GAP_FACTOR, GAP_FILE,
+                                                ChannelSamples, clock_breaks, gap_record, merge_recording)
 
 
 # ---- Sysmac trace tables and recording directories ----
@@ -80,6 +82,8 @@ class TablePart:
     row_count: int
     raw_range: tuple | None
     interval_ns: int | None
+    clock_period_ns: float | None
+    time_cuts: set
 
 
 @dataclass(frozen=True)
@@ -162,15 +166,18 @@ def _read_header(reader, path):
         fields = [cell.strip().casefold() for cell in row]
         if 'index' in fields and 'rawtime' in fields:
             channels = {}
+            recorded_columns = []
             for column, cell in enumerate(row):
                 name, _, data_type = cell.strip().rpartition(':')
                 name, data_type = name.strip(), data_type.strip().upper()
+                if name and data_type:
+                    recorded_columns.append(column)
                 if not name or data_type not in INTEGER_TYPES:
                     continue
                 if name in channels:
                     raise ValueError(f'{path}:{reader.line_num}: 重复变量列 {name}')
                 channels[name] = (column, data_type)
-            return fields.index('index'), fields.index('rawtime'), channels, metadata
+            return fields.index('index'), fields.index('rawtime'), channels, metadata, recorded_columns
         if len(row) > 1 and fields[0]:
             metadata[fields[0]] = row[1].strip()
     raise ValueError(f'{path}: 缺少 Index / RawTime 表头')
@@ -207,10 +214,10 @@ def _sample_rows(reader, path, index_column, time_column):
         yield index, raw_time, row
 
 
-def _scan_part(path, encoding, delimiter):
+def _scan_part(path, encoding, delimiter, specified_ns=None):
     with path.open(encoding=encoding, newline='') as stream:
         reader = csv.reader(stream, delimiter=delimiter)
-        index_column, time_column, channels, metadata = _read_header(reader, path)
+        index_column, time_column, channels, metadata, _ = _read_header(reader, path)
         first_index = last_index = first_time = last_time = None
         count = 0
         precise = True
@@ -231,9 +238,11 @@ def _scan_part(path, encoding, delimiter):
     # Round the inferred nominal period to microseconds to avoid extending jitter.
     interval_ns = max(1, round(statistics.median(intervals) / 1000) * 1000) if precise and intervals else None
     settings = tuple(metadata.get(key, '').casefold() for key in CAPTURE_SETTINGS)
+    periodic = settings[1] in ('interval', 'time', 'cyclic')
+    period, cuts = clock_breaks(intervals, specified_ns) if precise and periodic else (None, set())
     return TablePart(path, encoding, delimiter, channels, settings,
                      _decimal(metadata.get('startrawtime', '')), first_index, last_index,
-                     count, (first_time, last_time) if precise else None, interval_ns)
+                     count, (first_time, last_time) if precise else None, interval_ns, period, cuts)
 
 
 def _part_config(part):
@@ -312,12 +321,12 @@ def _validate_recording(recording, duplicates):
     return Recording(recording.recording_id, recording.grouping_source, accepted)
 
 
-def _prepare_parts(tables):
+def _prepare_parts(tables, specified_ns=None):
     """Identify the recording before validating or ordering its sample ranges."""
     named = defaultdict(list)
     unnamed = []
     for path, fmt in tables:
-        part = _scan_part(path, *fmt)
+        part = _scan_part(path, *fmt, specified_ns=specified_ns)
         match = SYSMAC_PART_NAME.fullmatch(path.stem)
         if match:
             named[match[1]].append(part)
@@ -336,7 +345,7 @@ def _prepare_parts(tables):
     return [_validate_recording(rec, duplicates) for rec in recordings], duplicates
 
 
-def _sample_period(parts, sample_interval_ms):
+def _specified_period(sample_interval_ms):
     if sample_interval_ms is not None:
         try:
             period_ns = round(Decimal(str(sample_interval_ms)) * NS_PER_MS)
@@ -344,7 +353,13 @@ def _sample_period(parts, sample_interval_ms):
             raise ValueError('采样间隔须是有限正数（毫秒）') from exc
         if period_ns <= 0:
             raise ValueError('采样间隔须是有限正数（毫秒）')
-        return period_ns, 'specified'
+        return period_ns
+    return None
+
+
+def _sample_period(parts, specified_ns):
+    if specified_ns is not None:
+        return specified_ns, 'specified'
     intervals = [part.interval_ns for part in parts if part.interval_ns is not None]
     if intervals:
         return round(statistics.median(intervals)), 'raw_time'
@@ -365,56 +380,6 @@ def _estimate_time(index, left, right, interval_ns, first_index):
     return anchor_ns + (index - anchor_idx) * interval_ns
 
 
-class _Channel:
-    def __init__(self):
-        self.jumps = []
-        self.segments = []
-        self.dwell_starts = {}
-        self.estimated_dwells = set()
-        self.unique_values = set()
-        self.count = 0
-        self.first_ts = self.last_ts = self.start_ts = self.value = None
-        self.start_estimated = False
-
-    def _close_segment(self, end_ts):
-        self.segments.append((self.value, self.start_ts, end_ts, end_ts - self.start_ts))
-
-    def append(self, index, value, ts, estimated, continuous):
-        if self.start_ts is not None and (not continuous or value is None):
-            self._close_segment(self.last_ts)
-            self.start_ts = None
-        if value is None:
-            return
-        if self.start_ts is not None and value != self.value:
-            self._close_segment(ts)
-            self.jumps.append((index, self.value, value, ts))
-            self.dwell_starts[index] = self.start_ts
-            if estimated or self.start_estimated:
-                self.estimated_dwells.add(index)
-            self.start_ts = None
-        if self.start_ts is None:
-            self.value, self.start_ts, self.start_estimated = value, ts, estimated
-        if self.first_ts is None:
-            self.first_ts = ts
-        self.last_ts = ts
-        self.count += 1
-        self.unique_values.add(value)
-
-    def result(self):
-        if self.start_ts is not None:
-            self._close_segment(self.last_ts)
-        return {
-            'jumps': self.jumps,
-            'segments': self.segments,
-            'dwell_starts': self.dwell_starts,
-            'estimated_dwells': self.estimated_dwells,
-            'sample_count': self.count,
-            'time_range': (self.first_ts or 0, self.last_ts or 0),
-            'inactive': not self.jumps,
-            'unique_values': sorted(self.unique_values),
-        }
-
-
 def _parse_one_recording(parts, channels, interval_ns):
     """Parse one recording in its own time and sample-index coordinate system."""
     right_anchors = [None] * len(parts)
@@ -430,11 +395,15 @@ def _parse_one_recording(parts, channels, interval_ns):
         _estimate_time(first_index, None, right_anchors[0], interval_ns, first_index))
     previous_index = previous_ns = left_anchor = None
     gaps = []
+    # The shared CSV clock is present whenever *any* recorded column has a value.
+    # This includes non-step channels and is independent of the requested pattern.
+    row_clock = ChannelSamples()
+    previous_part = None
     for part, right_anchor in zip(parts, right_anchors):
         estimated = part.raw_range is None
         with part.path.open(encoding=part.encoding, newline='') as stream:
             reader = csv.reader(stream, delimiter=part.delimiter)
-            index_column, time_column, columns, _ = _read_header(reader, part.path)
+            index_column, time_column, columns, _, recorded_columns = _read_header(reader, part.path)
             selected = [(name, columns[name][0], channel) for name, channel in channels.items()]
             count = 0
             for index, raw_time, row in _sample_rows(reader, part.path, index_column, time_column):
@@ -445,31 +414,44 @@ def _parse_one_recording(parts, channels, interval_ns):
                     raise ValueError(f'{part.path}:{reader.line_num}: 合并后的时间戳没有递增，请检查采集分卷')
                 if previous_index is not None and index <= previous_index:
                     raise ValueError(f'{part.path}:{reader.line_num}: 合并后的 Index 没有递增')
-                continuous = previous_index is not None and index == previous_index + 1
-                if previous_index is not None and not continuous:
+                reason = ''
+                if previous_index is not None and index != previous_index + 1:
                     gaps.append({'after_index': previous_index, 'before_index': index})
+                    reason = 'Index 缺号'
+                elif count in part.time_cuts:
+                    reason = 'RawTime 间隔'
+                elif count == 0 and previous_part and previous_part.raw_range and part.raw_range:
+                    period = max(previous_part.clock_period_ns or 0, part.clock_period_ns or 0)
+                    if period and ns - previous_ns > GAP_FACTOR * period:
+                        reason = 'RawTime 间隔'
                 ts = (ns - origin + NS_PER_MS // 2) // NS_PER_MS
+                populated = any(c < len(row) and row[c].strip() for c in recorded_columns)
+                row_clock.append(index, 1 if populated else None, ts, break_reason=reason)
                 for name, column, channel in selected:
                     try:
                         cell = row[column].strip()
                         value = int(cell) if cell else None
                     except (IndexError, ValueError) as exc:
                         raise ValueError(f'{part.path}:{reader.line_num}: {name} 的整型值无效') from exc
-                    channel.append(index, value, ts, estimated, continuous)
+                    channel.append(index, value, ts, estimated, reason)
                 previous_index, previous_ns = index, ns
                 count += 1
             if count != part.row_count or previous_index != part.last_index:
                 raise ValueError(f'{part.path}: 解析期间分卷范围变化，请在导出完成后重试')
         if not estimated:
             left_anchor = (part.last_index, part.raw_range[1])
-    return {name: channel.result() for name, channel in channels.items()}, gaps, ts
+        previous_part = part
+    common = [{'left_ms': g['left_ms'], 'right_ms': g['right_ms'], 'duration_ms': g['right_ms'] - g['left_ms']}
+              for g in row_clock.gaps]
+    return {name: channel.finish() for name, channel in channels.items()}, gaps, common, ts
 
 
 def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
     """Parse recordings independently and aggregate the selected channel union."""
     path = Path(path)
     tables, ignored = _find_tables(path)
-    recordings, duplicates = _prepare_parts(tables)
+    specified_ns = _specified_period(sample_interval_ms)
+    recordings, duplicates = _prepare_parts(tables, specified_ns)
 
     channel_names = {name for rec in recordings for name in rec.parts[0].channels
                      if matches is None or matches(name)}
@@ -481,12 +463,13 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
     all_file_audit = []
     all_gaps = []
     timing_methods = set()
+    gap_records = []
     time_offset_ms = 0
     next_index = None
 
     for rec in recordings:
         parts = rec.parts
-        channels = {name: _Channel() for name in parts[0].channels if name in channel_names}
+        channels = {name: ChannelSamples() for name in parts[0].channels if name in channel_names}
         detail = {
             'recording_id': rec.recording_id, 'grouping_source': rec.grouping_source,
             'files': [p.path.name for p in parts], 'samples': sum(p.row_count for p in parts),
@@ -503,14 +486,19 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
         if not channels:
             continue
 
-        interval_ns, interval_source = _sample_period(parts, sample_interval_ms)
+        interval_ns, interval_source = _sample_period(parts, specified_ns)
         if any(p.raw_range is None for p in parts):
             if parts[0].settings[1] not in ('', 'interval', 'cyclic', 'time'):
                 raise ValueError(f'采集 {rec.recording_id}: 非固定间隔采集的 RawTime 精度不足，请重新导出原始 CSV')
             if interval_ns is None:
                 raise ValueError(f'采集 {rec.recording_id}: RawTime 精度不足。请加入本次采集的精确时间分卷，'
                                  '或指定 --sample-interval-ms')
-        ch_results, gaps, end_ts = _parse_one_recording(parts, channels, interval_ns)
+        ch_results, gaps, row_gaps, end_ts = _parse_one_recording(parts, channels, interval_ns)
+        periods = {p.path.name: p.clock_period_ns / NS_PER_MS if p.clock_period_ns else None for p in parts}
+        gap_audit = gap_record(rec.recording_id, {name: c.gaps for name, c in channels.items()},
+                               periods, len(parts[0].channels))
+        gap_audit['common_gaps'] = row_gaps
+        gap_records.append(gap_audit)
         index_offset = 0 if next_index is None else next_index - parts[0].first_index
         detail.update(sample_interval_ms=interval_ns / NS_PER_MS if interval_ns is not None else None,
                       interval_source=interval_source, index_offset=index_offset,
@@ -521,30 +509,7 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
 
         # Offsets preserve unique internal indices and display order. Every dwell
         # is still computed between samples within the same recording.
-        for name, result in ch_results.items():
-            if name not in all_channel_results:
-                all_channel_results[name] = {
-                    'jumps': [], 'segments': [], 'dwell_starts': {},
-                    'estimated_dwells': set(), 'sample_count': 0,
-                    'time_range': [None, None], 'inactive': True,
-                    'unique_values': set(),
-                }
-            acc = all_channel_results[name]
-            acc['jumps'].extend((idx + index_offset, a, b, ts + time_offset_ms)
-                                for idx, a, b, ts in result['jumps'])
-            acc['segments'].extend((value, start + time_offset_ms, end + time_offset_ms, dur)
-                                   for value, start, end, dur in result['segments'])
-            acc['dwell_starts'].update((idx + index_offset, ts + time_offset_ms)
-                                       for idx, ts in result['dwell_starts'].items())
-            acc['estimated_dwells'].update(idx + index_offset for idx in result['estimated_dwells'])
-            acc['sample_count'] += result['sample_count']
-            if result['sample_count']:
-                r_start, r_end = result['time_range']
-                if acc['time_range'][0] is None:
-                    acc['time_range'][0] = r_start + time_offset_ms
-                acc['time_range'][1] = r_end + time_offset_ms
-            acc['inactive'] = acc['inactive'] and result['inactive']
-            acc['unique_values'].update(result['unique_values'])
+        merge_recording(all_channel_results, ch_results, index_offset, time_offset_ms)
         next_index = parts[-1].last_index + index_offset + 1
         time_offset_ms += end_ts + 1
 
@@ -567,6 +532,7 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
         'duplicate_files': duplicates,
         'ignored_tables': ignored,
         'index_gaps': all_gaps,
+        'gap_records': gap_records,
     }
     return all_channel_results, audit
 
@@ -662,7 +628,7 @@ PAIR_FIELDS = [
     # Runtime columns (trace-specific):
     '动作变量', '发生次数', '中位数时长ms', '最小时长ms', '最大时长ms',
     '首次时间ms', '末次时间ms', '所属周期数', '备注', '估算时长次数', '源码关系',
-    '样例跳变索引', '样例采集ID',
+    '样例跳变索引', '样例采集ID', '有效计时次数', '采集首段未计时次数', '缺口后未计时次数',
 ]
 
 
@@ -720,13 +686,12 @@ def generate(trace_path, run, source=None, proc_name=None,
         variables, trace_input = parse_omron_trace(
             trace_path, sample_interval_ms=sample_interval_ms, matches=matches)
     else:
-        variables = parse_trace(trace_path)
+        trace_input = {}
+        variables = parse_trace(trace_path, audit=trace_input, sample_interval_ms=sample_interval_ms)
         if not any(channel['sample_count'] for channel in variables.values()):
             raise ValueError(f'{trace_path}: 无采样数据，请提供采集后导出的 Trace 记录')
-        unit = next(iter(variables.values()))['timestamp_unit']
         if matches is not None:
             variables = {name: vd for name, vd in variables.items() if matches(name)}
-        trace_input = {'format': 'twincat_scope_xml', 'timestamp_unit': unit}
     # Native microsecond clocks retain sub-ms samples and half-tick medians.
     fine_clock = trace_input.get('timestamp_unit') == 'us'
 
@@ -734,11 +699,17 @@ def generate(trace_path, run, source=None, proc_name=None,
         return round(value, 4) if fine_clock else int(value)
 
     run.mkdir(parents=True, exist_ok=True)
+    gap_records = trace_input.pop('gap_records')
+    common_gaps = sum(len(r['common_gaps']) for r in gap_records)
+    channel_gaps = sum(len(r['channel_gaps']) for r in gap_records)
+    (run / GAP_FILE).write_text(json.dumps(
+        {'schema': 1, 'time_unit': 'ms', 'threshold_factor': GAP_FACTOR, 'recordings': gap_records},
+        ensure_ascii=False, indent=2), encoding='utf-8')
     active_count = sum(1 for v in variables.values() if not v['inactive'])
     inactive_count = sum(1 for v in variables.values() if v['inactive'])
     captures = [r for r in trace_input.get('recording_details', []) if 'index_offset' in r]
     index_starts = [r['first_index'] + r['index_offset'] for r in captures]
-    time_starts = [r['time_offset_ms'] for r in captures]
+    time_starts = [r.get('time_start_ms', r['time_offset_ms']) for r in captures]
 
     # ---- 2. Write trace metadata (audit, same as trace_jump_analyzer) ----
     var_meta = {}
@@ -757,10 +728,15 @@ def generate(trace_path, run, source=None, proc_name=None,
     jump_fields = ['变量', 'from值', 'to值', '时间戳ms', '样本索引']
     if captures:
         jump_fields.append('采集ID')
+    jump_fields.extend(['起始步首次观测ms', '计时状态', '有效停留ms'])
     jump_rows = []
     for name, vd in variables.items():
         for idx, from_v, to_v, ts in vd['jumps']:
+            start = vd['dwell_starts'][idx]
+            partial = vd['partial_dwells'].get(idx)
             row = {
+                '起始步首次观测ms': report_ms(start), '计时状态': partial or '完整',
+                '有效停留ms': '' if partial else report_ms(ts - start),
                 '变量': name,
                 'from值': _val_to_int(from_v),
                 'to值': _val_to_int(to_v),
@@ -814,6 +790,8 @@ def generate(trace_path, run, source=None, proc_name=None,
 
     # ---- 5. Build adjacent-jump pairs per variable ----
     # pair_key = (var_name, from_val, to_val) -> list of duration_ms
+    pair_occurrences = Counter()
+    partial_counts = Counter()
     pair_durations = defaultdict(list)
     pair_first_ts = {}
     pair_example = {}
@@ -824,35 +802,17 @@ def generate(trace_path, run, source=None, proc_name=None,
     for name, vd in variables.items():
         if vd['inactive']:
             continue
-        jumps = vd['jumps']  # [(idx, from_v, to_v, ts_ms), ...]
-        # Each jump is itself a complete state transition (from_v -> to_v).
-        # Iterate from k=0 so the FIRST jump of every variable is captured.
-        # (A prior range(1,...) loop silently dropped jumps[0]; when a variable
-        # only ran one cycle, its first transition was lost forever — e.g.
-        # ST06.AutoStep[2] 50->60, ST07.AutoStep[1] 45->50.)
-        first_sample_ts = report_ms(vd['time_range'][0])
-        dwell_starts = vd.get('dwell_starts')
-        estimated_dwells = vd.get('estimated_dwells', ())
-        for k in range(len(jumps)):
-            idx, from_v, to_v, ts = jumps[k]
-            # Skip degenerate self-loops (from==to).  These arise when a
-            # variable briefly flickers and returns to the same value within
-            # one sample period — they are not real state transitions.
-            if from_v == to_v:
-                continue
-            # Duration = how long the variable stayed at from_v before
-            # moving to to_v.  For k=0 there is no previous jump, so use
-            # the variable's first-sample timestamp (initial state dwell
-            # time from sampling start to first transition).
-            if dwell_starts is not None:
-                prev_ts = dwell_starts[idx]
-            else:
-                prev_ts = first_sample_ts if k == 0 else jumps[k - 1][3]
-            dur = ts - prev_ts
+        for idx, from_v, to_v, ts in vd['jumps']:
             key = (name, from_v, to_v)
-            pair_durations[key].append(report_ms(dur))
-            if idx in estimated_dwells:
-                pair_estimated[key] += 1
+            pair_occurrences[key] += 1
+            prev_ts = vd['dwell_starts'][idx]
+            partial = vd['partial_dwells'].get(idx)
+            if partial:
+                partial_counts[key, partial] += 1
+            else:
+                pair_durations[key].append(report_ms(ts - prev_ts))
+                if idx in vd['estimated_dwells']:
+                    pair_estimated[key] += 1
             if key not in pair_first_ts:
                 pair_first_ts[key] = report_ms(prev_ts)
                 capture = captures[bisect_right(index_starts, idx) - 1] if captures else {}
@@ -872,7 +832,8 @@ def generate(trace_path, run, source=None, proc_name=None,
     rows = []
     review_rows = []
     pair_evidence = {}
-    for key, durs in pair_durations.items():
+    for key, occurrences in pair_occurrences.items():
+        durs = pair_durations[key]
         var_name, from_v, to_v = key
         from_int = _val_to_int(from_v)
         to_int = _val_to_int(to_v)
@@ -901,10 +862,11 @@ def generate(trace_path, run, source=None, proc_name=None,
         # Station name for grouping
         ws_name = indexed_stations.get(var_name) or _station_name(var_name, si_map, var_docs)
 
-        median = statistics.median(durs)
-        median_dur = report_ms(median) if fine_clock else round(median)
-        min_dur = report_ms(min(durs))
-        max_dur = report_ms(max(durs))
+        median_dur = min_dur = max_dur = ''
+        if durs:
+            median = statistics.median(durs)
+            median_dur = report_ms(median) if fine_clock else round(median)
+            min_dur, max_dur = min(durs), max(durs)
         n_cycles = len(pair_cycles[key])
 
         remark = [RELATION_TEXT[relation]]
@@ -940,7 +902,10 @@ def generate(trace_path, run, source=None, proc_name=None,
             '控制器': var_name,
             '分支数': len(guards) if relation == 'direct' else 0,
             '动作变量': '; '.join(action_vars),
-            '发生次数': len(durs),
+            '发生次数': occurrences,
+            '有效计时次数': len(durs),
+            '采集首段未计时次数': partial_counts[key, CAPTURE_HEAD],
+            '缺口后未计时次数': partial_counts[key, GAP_HEAD],
             '中位数时长ms': median_dur,
             '最小时长ms': min_dur,
             '最大时长ms': max_dur,
@@ -995,6 +960,10 @@ def generate(trace_path, run, source=None, proc_name=None,
         'variables_inactive': inactive_count,
         'total_jumps': len(jump_rows),
         'total_segments': len(seg_rows),
+        'common_gap_count': common_gaps, 'channel_gap_count': channel_gaps,
+        'valid_dwell_count': sum(map(len, pair_durations.values())),
+        'partial_dwell_count': sum(partial_counts.values()),
+        'pairs_without_valid_duration': sum(not ds for ds in pair_durations.values()),
         'cycles_detected': len(cycle_data),
         'unique_pairs': len(rows),
         'pairs_with_estimated_duration': len(pair_estimated),
@@ -1010,6 +979,7 @@ def generate(trace_path, run, source=None, proc_name=None,
             'jumps': str(run / 'trace_jumps.csv'),
             'segments': str(run / 'trace_segments.csv'),
             'cycles': str(run / 'trace_cycles.json'),
+            'sampling_gaps': str(run / GAP_FILE),
             'review': str(run / 'trace_pairs_review.csv'),
             'source_evidence': str(run / EVIDENCE_FILE),
             'semantic_memory': str(run / 'trace_semantic_memory.json'),
@@ -1073,7 +1043,7 @@ def main():
                     help='周期检测空闲阈值(ms)，默认5000')
     ap.add_argument('--pattern', help='完整变量名的 glob 或 re: 模式')
     ap.add_argument('--sample-interval-ms', type=float,
-                    help='RawTime 精度不足时使用的 Sysmac 采样间隔(ms)')
+                    help='已知固定采样周期(ms)，可用于识别异常间隔及重建精度不足的 Sysmac 时间')
     a = ap.parse_args()
     stats = generate(a.trace, a.run, a.source, a.proc_name,
                      idle_threshold_ms=a.idle_threshold, pattern=a.pattern,

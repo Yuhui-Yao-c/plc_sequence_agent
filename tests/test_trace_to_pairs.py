@@ -74,25 +74,25 @@ class SysmacRecordingTests(unittest.TestCase):
         self.assertEqual([r['sample_interval_ms'] for r in details], [12, 20])
         rows = self.read_csv(stats['outputs']['pairs_csv'])
         self.assertEqual({(r['开始标签'], r['结束标签'], r['中位数时长ms']) for r in rows},
-                         {('Step[1]=10', 'Step[1]=20', '24'),
-                          ('Step[1]=90', 'Step[1]=100', '40')})
+                         {('Step[1]=10', 'Step[1]=20', ''),
+                          ('Step[1]=90', 'Step[1]=100', '')})
 
     def test_same_sample_index_keeps_distinct_dwell_and_timing_basis(self):
-        rows = [(0, 10), (1, 20), (2, 20)]
+        rows = [(0, 0), (1, 10), (2, 20)]
         self.write_part(self.FIRST + '_00001.csv', self.EPOCH, rows)
         self.write_part(self.SECOND + '_00001.csv', self.EPOCH + 3_600_000_000_000,
                         rows, rounded=True)
         with self.assertRaisesRegex(ValueError, self.SECOND + '.*RawTime'):
             parse_omron_trace(self.trace)
         stats = generate(self.trace, self.root / 'run', proc_name='test', sample_interval_ms=12)
-        row, = self.read_csv(stats['outputs']['pairs_csv'])
+        row = next(r for r in self.read_csv(stats['outputs']['pairs_csv']) if r['开始标签'] == 'Step[1]=10')
         self.assertEqual(tuple(row[k] for k in ('发生次数', '最小时长ms', '中位数时长ms',
                                                  '最大时长ms', '估算时长次数', '所属周期数')),
                          ('2', '12', '12', '12', '1', '2'))
         self.assertEqual(stats['cycles_detected'], 0)
         jumps = self.read_csv(stats['outputs']['jumps'])
         self.assertEqual([(r['采集ID'], r['样本索引']) for r in jumps],
-                         [(self.FIRST, '1'), (self.SECOND, '1')])
+                         [(self.FIRST, '1'), (self.FIRST, '2'), (self.SECOND, '1'), (self.SECOND, '2')])
 
     def test_channel_filter_can_select_a_channel_missing_from_first_recording(self):
         self.write_part(self.FIRST + '_00001.csv', self.EPOCH, [(0, 1), (1, 2)])
@@ -153,7 +153,7 @@ class SysmacRecordingTests(unittest.TestCase):
         self.assertEqual([edge['to'] for edge in skip['candidate_path']], [20, 30])
         rows = self.read_csv(stats['outputs']['pairs_csv'])
         self.assertEqual([(r['开始标签'], r['结束标签'], r['中位数时长ms']) for r in rows],
-                         [('Step[1]=0', 'Step[1]=10', '12'), ('Step[1]=10', 'Step[1]=30', '12')])
+                         [('Step[1]=0', 'Step[1]=10', ''), ('Step[1]=10', 'Step[1]=30', '12')])
 
     def test_trace_descriptions_require_current_command_evidence_and_all_rows(self):
         from plc_trace.description.action_describe import cmd_a, cmd_build, cmd_validate

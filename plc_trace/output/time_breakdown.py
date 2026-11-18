@@ -15,6 +15,7 @@ from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.hyperlink import Hyperlink
 
 from plc_trace.description.trace_description_report import annotation_evidence_text, annotation_supplement, waiting_role
+from plc_trace.trace.sample_continuity import GAP_FILE
 from plc_trace.trace.trace_source_evidence import EVIDENCE_FILE, RELATION_TEXT
 
 
@@ -115,7 +116,7 @@ def _header(ws, proc, digest):
              'A2': '工位标识-源码例程原名。每个完整步序变量独立分块。批注中可查通道和所属源码位置。',
              'B2': '模板的独立动作时间。本表记录观测停留时长，见时长（ms）。',
              'C2': '多次采集按状态对归并，无法给出单次执行的累计完成时间。',
-             'F2': '同一完整起止标签在各次观测中的起始状态停留时长中位数。单位为毫秒。',
+             'F2': '起始步进入和离开均在同一连续采样段内时才计时。显示完整观测的中位数，单位为毫秒。空白表示没有完整计时。',
              'G2': '目标节拍需要独立的工程定额。',
              'M2': '1 表示有依据的等待步。黄色表示待料，灰色表示堵料，表示源码定义的步职责。'
                    '普通等待无色，无法判定时留空。颜色不计量真实缺料或拥堵损失。',
@@ -131,7 +132,13 @@ def _evidence(pair, desc, info, audits):
     obs = f'Trace 观测 {start} → {end}'
     if count := pair.get('发生次数'):
         obs += f'，出现 {count} 次'
-    if duration := pair.get('中位数时长ms'):
+    if pair.get('有效计时次数') not in (None, ''):
+        obs += f'，完整计时 {pair["有效计时次数"]} 次'
+        for field, reason in [('采集首段未计时次数', '采集开始'), ('缺口后未计时次数', '恢复采样')]:
+            if int(pair.get(field) or 0):
+                obs += f'，{reason}时已在本步 {pair[field]} 次'
+    duration = pair.get('中位数时长ms')
+    if duration not in (None, ''):
         obs += f'，起始步停留中位数 {duration} ms'
     if pair.get('估算时长次数') not in (None, '', '0'):
         obs += f'（其中 {pair["估算时长次数"]} 次时长经估算）'
@@ -297,6 +304,10 @@ def _remark(pair, desc, info, owner, role):
         direction = '上游供料' if role == '待料' else '下游接料'
         notes.append(f'等待{direction}。' if not desc.get('描述来源', '').startswith('B档')
                      else f'推断为等待{direction}，请核对。')
+    if str(pair.get('有效计时次数')) == '0':
+        notes.append('进入本步的时刻未采到，时长留空。')
+    if int(pair.get('缺口后未计时次数') or 0):
+        notes.append(f'恢复采样后有 {pair["缺口后未计时次数"]} 次仅计跳变，见「采样缺口」。')
     if pair.get('估算时长次数') not in (None, '', 0, '0'):
         notes.append(f'有 {pair["估算时长次数"]} 次停留时长为估算值。')
     return ''.join(notes) or None
@@ -316,6 +327,36 @@ def restore_annotation_details(evidence, descriptions):
         row.update({'动作描述': text, '描述来源': info['description_source'], '描述状态': '源码注释',
                     '证据': annotation_evidence_text(info), '注释补充': annotation_supplement(info),
                     '等待判定': role, '等待依据': basis})
+
+
+def _write_sampling_gaps(book, run):
+    path = Path(run) / GAP_FILE
+    if not path.is_file():
+        return  # Re-rendering an older run.
+    with path.open(encoding='utf-8') as stream:
+        records = json.load(stream)['recordings']
+    if not any(r['common_gaps'] or r['channel_gaps'] for r in records):
+        return
+    ws = book.create_sheet('采样缺口')
+    ws.append(['时间为各次采集内的毫秒。两端有样本，中间无连续观测，端点值仅供核对。'])
+    ws.merge_cells('A1:K1')
+    ws.append(['范围', '采集ID', '通道', '前样本索引', '前样本时间(ms)', '前值', '后样本索引',
+               '后样本时间(ms)', '后值', '间隔(ms)', '判据'])
+    for record in records:
+        rid = record['recording_id']
+        for gap in record['common_gaps']:
+            ws.append(['全部通道', rid, None, None, gap['left_ms'], None, None, gap['right_ms'],
+                       None, gap['duration_ms'], '所有通道均缺少样本的区间'])
+        for gap in record['channel_gaps']:
+            ws.append(['单通道', rid, gap['channel'], gap['left_index'], gap['left_ms'], gap['left_value'],
+                       gap['right_index'], gap['right_ms'], gap['right_value'],
+                       round(gap['right_ms'] - gap['left_ms'], 6), gap['reason']])
+    for col, width in enumerate([14, 20, 38, 15, 21, 12, 15, 21, 12, 18, 40], 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+        cell = ws.cell(2, col)
+        cell.fill, cell.font, cell.alignment = FILLS['表头'], BOLD, CENTER
+    ws.freeze_panes = 'D3'
+    ws.auto_filter.ref = f'A2:K{ws.max_row}'
 
 
 def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
@@ -338,6 +379,7 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
     r = 3
     for station, blocks in station_blocks:
         total = None
+        missing_times = 0
         for idx, (channel, owner, records) in enumerate(blocks):
             if idx and channel != blocks[idx - 1][0]:
                 for gap in (r, r + 1):
@@ -366,6 +408,8 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
                 if ms is not None:
                     total = (total or 0) + ms
                     measured += 1
+                else:
+                    missing_times += 1
                 values = {4: text or None, 5: origin or None, 6: ms, 8: start, 9: end,
                           13: 1 if role else None,
                           14: _remark(pair, desc, info, annotation_owners.get((start, end)), role),
@@ -397,9 +441,12 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
             needed = sum(max(1, ceil(_width(line) / (COLUMNS[0][1] - 1))) for line in name.splitlines())
             if needed > last - first + 1:
                 _details(book, label, records[0]['开始标签'], records[0]['结束标签'], '构成要素', label.value)
+        subtotal = '本工位各行停留中位数之和，不能作为单次循环时间。'
+        if missing_times:
+            subtotal = f'有 {missing_times} 行缺少完整计时，小计仅含有时长的行。'
         for col in range(2, len(COLUMNS) + 1):
             cell = _cell(sheet, r, col, {4: '总时长', 6: round(total, 4) if total is not None else None,
-                                        14: '本工位各行停留中位数之和，不能作为单次循环时间。'}.get(col))
+                                        14: subtotal}.get(col))
             cell.font = BOLD
             if col == 6:
                 cell.number_format = '0.00##'
@@ -410,6 +457,7 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
             label.fill, label.font = FILLS['构成要素'], BOLD
         sheet.row_dimensions[r].height = 13.8
         r += 1
+    _write_sampling_gaps(book, run)
     book.save(out)
     return {'trace_review_rows': review_rows, 'b_desc_rows': b_rows,
             'trace_duration_backfilled': measured > 0, 'wait_rows': dict(waits)}

@@ -417,9 +417,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         var_docs = load_var_docs(run)
         si_map = load_station_identity(run)
         df['_变量根'] = df['_变量'].map(lambda v: (str(v).split('.')[0] if pd.notna(v) and v else ''))
-        df['_工位'] = df.apply(
-            lambda r: indexed_stations.get(r['_变量']) or workstation(r['构成要素'], r['_变量根'], var_docs, si_map),
-            axis=1)
+        df['_工位'] = [indexed_stations.get(var) or workstation(component, root, var_docs, si_map)
+                     for var, component, root in zip(df['_变量'], df['构成要素'], df['_变量根'])]
         if is_trace and '证据POU' in df:
             display_names = source_station_displays(
                 zip(df['_工位'], df['_变量'], df['证据POU'].fillna('')), si_map)
@@ -443,7 +442,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             if bare != str(vr) and bare in si_map:
                 return tuple(si_map[bare].get('sort_key', [10**9, 0]))
         return _em_sort_key(row.get('_工位', ''))
-    df['_工位序'] = df.apply(_row_sort, axis=1)
+    df['_工位序'] = df.apply(_row_sort, axis=1) if len(df) else []
     df = df.sort_values(['_工位序', '_变量', '_序'], kind='mergesort').reset_index(drop=True)
     if is_trace:
         df['_步序变量'] = df['_变量'].fillna(df.get('控制器', '')).fillna('').str.strip()

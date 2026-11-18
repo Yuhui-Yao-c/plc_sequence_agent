@@ -128,8 +128,8 @@ class TraceDescriptionTests(unittest.TestCase):
         self.assertIn('A3:A4', sheet.merged_cells)
         for row in (5, 6, 8, 9):
             self.assertTrue(all(cell.value is None for cell in sheet[row]))
-        self.assertEqual((sheet['A11'].value, sheet['D11'].value, sheet['F11'].value), ('Line', '总时长', 48))
-        self.assertEqual((sheet['A12'].value, sheet['D13'].value, sheet['F13'].value), ('Solo', '总时长', 12))
+        self.assertEqual((sheet['A11'].value, sheet['D11'].value, sheet['F11'].value), ('Line', '总时长', 12))
+        self.assertEqual((sheet['A12'].value, sheet['D13'].value, sheet['F13'].value), ('Solo', '总时长', None))
 
     def test_trace_workbook_links_long_description_without_changing_data_row_height(self):
         from openpyxl import load_workbook
@@ -172,13 +172,14 @@ class TraceDescriptionTests(unittest.TestCase):
         self.addCleanup(book.close)
         self.assertEqual(book.active['D3'].value, comment)
         self.assertEqual(book.active['E3'].value, '注释')
-        self.assertEqual(book.active['F3'].value, int(self.read_csv(pairs)[0]['中位数时长ms']))
+        self.assertIsNone(book.active['F3'].value)
+        self.assertEqual(self.read_csv(pairs)[0]['中位数时长ms'], '')
         self.assertIn('起始步原注「====判断步====」', book.active['O3'].value)
         self.assertIn('XML行', book.active['O3'].value)
 
     def test_vague_notes_get_only_their_own_routine_and_control_details(self):
         self.write_part(self.FIRST + '_00001.csv', self.EPOCH,
-                        [(0, 0, 20, 20), (1, 20, 0, 0), (2, 0, 0, 0)],
+                        [(0, 99, 99, 99), (1, 0, 20, 20), (2, 20, 0, 0), (3, 0, 0, 0)],
                         channels=('Step[1]', 'Step[2]', 'Step[3]'))
         source = self.root / 'source.xml'
         source.write_text(

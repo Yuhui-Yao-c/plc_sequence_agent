@@ -39,7 +39,8 @@ _TRACE_PREPARED = 'trace_prepared.json'
 _TRACE_STATS = ('variables_total', 'variables_active', 'total_jumps', 'cycles_detected',
                 'unique_pairs', 'pairs_with_action_vars', 'pairs_with_step_comment',
                 'pairs_reset_exit', 'review_count', 'source_relations', 'source_evidence_audit',
-                'proc_name', 'trace_input')
+                'proc_name', 'trace_input', 'common_gap_count', 'channel_gap_count',
+                'valid_dwell_count', 'partial_dwell_count', 'pairs_without_valid_duration')
 
 
 def _trace_inputs(src, trace, args):
@@ -139,7 +140,8 @@ def _run_trace_mode(src,out,args):
                                     proc_name=proc,run=str(out),sheet='trace步序采集表')
   if stats['b_tier_pending_rows']:
    stats['status'] = 'prepared_b_tier_pending'
-  elif stats['review_count'] or stats['description_review_count']:
+  elif (stats['review_count'] or stats['description_review_count'] or stats['channel_gap_count']
+        or stats['pairs_without_valid_duration'] or stats['common_gap_count']):
    stats['status'] = 'done_with_review'
   else:
    stats['status'] = 'done'
@@ -207,7 +209,7 @@ def main():
  x=sub.add_parser('trace',help='trace步序采集模式：trace跳变→状态对→A/B档动作描述→交付表')
  x.add_argument('--source',required=True,help='PLC源码XML路径（用于动作变量映射/步注释/工位身份）')
  x.add_argument('--trace',required=True,help='trace输入：TwinCAT .trace文件 / Sysmac CSV表 / Sysmac采集目录')
- x.add_argument('--sample-interval-ms',type=float,help='Sysmac 单次采集的 RawTime 精度不足时指定采样间隔(ms)')
+ x.add_argument('--sample-interval-ms',type=float,help='已知固定采样周期(ms)，可用于识别异常间隔及重建精度不足的 Sysmac 时间')
  x.add_argument('--proc-name',default=None,help='工序名称；缺省优先使用源码所在工序目录名')
  x.add_argument('--out',required=True,help='输出目录')
  x.add_argument('--pattern',default=None,help='可选：变量名称过滤模式（glob或re:前缀正则）')

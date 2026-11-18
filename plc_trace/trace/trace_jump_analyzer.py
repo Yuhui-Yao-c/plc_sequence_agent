@@ -7,6 +7,7 @@ Does not generate/modify predictions. Outputs CSV/JSON beside the prediction.
 """
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -14,94 +15,96 @@ from xml.etree import ElementTree
 from pathlib import Path
 from collections import defaultdict
 
+from plc_trace.trace.sample_continuity import ChannelSamples, clock_breaks, gap_record, merge_recording
+
 
 # ---------- Trace parsing ----------
 
-def parse_trace(trace_path):
-    """Parse a TwinCAT Scope View .trace XML (UTF-16) file.
-
-    Returns dict: var_name -> {
-        'values': [float,...], 'timestamps': [float,...],
-        'jumps': [(idx, from_val, to_val, ts_ms), ...],
-        'segments': [(value, start_ts, end_ts, duration_ms), ...],
-        'sample_count': int, 'time_range': (first_ts, last_ts),
-        'inactive': bool, 'unique_values': [float,...]
-    }
-    """
-    with open(trace_path, 'rb') as stream:
-        raw = stream.read()
+def parse_trace(trace_path, *, audit=None, sample_interval_ms=None):
+    """Read native XML; times are milliseconds and jumps stay within contiguous samples."""
+    raw = Path(trace_path).read_bytes()
     encoding = 'utf-16' if raw.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
     txt = raw.decode(encoding)
     config = re.search(r'<TraceConfiguration\b[^>]*>.*?</TraceConfiguration>', txt, re.S)
-    microseconds = False
-    if config:
-        flags = {(node.text or '').strip().lower() for node in
-                 ElementTree.fromstring(config[0]).iter('Single') if node.get('Name') == 'MicroSeconds'}
-        if flags - {'true', 'false', '1', '0'} or len({v in ('true', '1') for v in flags}) > 1:
-            raise ValueError('Trace 配置的 MicroSeconds 取值无效或冲突')
-        microseconds = bool(flags & {'true', '1'})
+    flags = {(n.text or '').strip().lower() for n in ElementTree.fromstring(config[0]).iter('Single')
+             if n.get('Name') == 'MicroSeconds'} if config else set()
+    if flags - {'true', 'false', '1', '0'} or len({v in ('true', '1') for v in flags}) > 1:
+        raise ValueError('Trace 配置的 MicroSeconds 取值无效或冲突')
+    unit = 'us' if flags & {'true', '1'} else 'ms'
+    if sample_interval_ms is not None and (not math.isfinite(sample_interval_ms) or sample_interval_ms <= 0):
+        raise ValueError('采样间隔须是有限正数（毫秒）')
+    records = re.findall(r'<TraceRecord\b[^>]*>(.*?)</TraceRecord>', txt, re.S) or [txt]
+    combined, details, gaps = {}, [], []
+    next_index, next_time = 0, None
+    for ordinal, record in enumerate(records, 1):
+        names = set()
+        variables, channel_gaps, periods = {}, {}, {}
+        begins = list(re.finditer(r'<TraceVariable\b', record))
+        ends = list(re.finditer(r'</TraceVariable>', record))
+        if len(begins) != len(ends):
+            raise ValueError('TraceVariable 开始/结束标签数不匹配')
+        for begin, end in zip(begins, ends):
+            node = ElementTree.fromstring(record[begin.start():end.end()])
+            name = node.get('VarName')
+            if not name:
+                continue
+            if name in names:
+                raise ValueError(f'同一 TraceRecord 中通道重复：{name}')
+            names.add(name)
+            vs, ts = node.findtext('Values'), node.findtext('Timestamps')
+            if vs is None or ts is None:
+                continue
+            try:
+                stamp_text = ts.strip().rstrip(',')
+                stamps = [float(v) for v in stamp_text.split(',')] if stamp_text else []
+                fields = vs.strip().split(',')
+                if len(fields) == len(stamps) + 1 and not fields[-1].strip():
+                    fields.pop()  # Exporters may append a comma to both vectors.
+                values = [float(v) if v.strip() else None for v in fields]
+            except ValueError as exc:
+                print(f'trace 变量 {name} 数值解析失败: {exc}', file=sys.stderr)
+                continue
+            if len(stamps) != len(values):
+                print(f'trace 变量 {name} 的值数与时间戳数不一致，跳过', file=sys.stderr)
+                continue
+            if not all(map(math.isfinite, stamps)) or not all(math.isfinite(v) for v in values if v is not None):
+                raise ValueError(f'{name} 的样本含非有限数值')
+            if unit == 'us':
+                stamps = [t / 1000 for t in stamps]
+            deltas = [b - a for a, b in zip(stamps, stamps[1:])]
+            if any(d < 0 for d in deltas):
+                raise ValueError(f'{name} 的时间戳在同一采集内倒退，无法还原连续时间轴')
+            periods[name], cuts = clock_breaks(deltas, sample_interval_ms)
+            channel = ChannelSamples()
+            for i, (value, stamp) in enumerate(zip(values, stamps)):
+                channel.append(i, value, stamp, break_reason='时间戳间隔' if i in cuts else '')
+            variables[name] = dict(channel.finish(), timestamp_unit=unit, values=values, timestamps=stamps)
+            channel_gaps[name] = channel.gaps
+        rid = str(ordinal) if len(records) > 1 else ''
+        gaps.append(gap_record(rid, channel_gaps, periods, len(names)))
+        if len(records) == 1:
+            combined = variables
+        else:
+            nonempty = [v for v in variables.values() if v['sample_count']]
+            if not nonempty:
+                continue
+            start = min(v['time_range'][0] for v in nonempty)
+            end = max(v['time_range'][1] for v in nonempty)
+            offset = 0 if next_time is None else next_time - start
+            details.append({'recording_id': rid, 'first_index': 0, 'index_offset': next_index, 'time_offset_ms': offset,
+                            'time_start_ms': start + offset, 'raw_start_ms': start,
+                            'active_channels': [n for n, v in variables.items() if not v['inactive']]})
+            merge_recording(combined, variables, next_index, offset)
+            next_index += max(len(v['timestamps']) for v in variables.values())
+            next_time = end + offset + 1
+    if len(records) > 1:
+        for channel in combined.values():
+            channel['unique_values'] = sorted(channel['unique_values'])
+    if audit is not None:
+        audit.update(format='twincat_scope_xml', timestamp_unit=unit, recording_details=details,
+                     recordings=len(records), gap_records=gaps)
+    return combined
 
-    # Locate each <TraceVariable>...</TraceVariable> block.
-    starts = [m.start() for m in re.finditer(r'<TraceVariable\b', txt)]
-    ends = [m.start() for m in re.finditer(r'</TraceVariable>', txt)]
-    if len(starts) != len(ends):
-        raise ValueError(f'TraceVariable 开始/结束标签数不匹配: {len(starts)} vs {len(ends)}')
-
-    variables = {}
-    for i in range(len(starts)):
-        block = txt[starts[i]:ends[i] + len('</TraceVariable>')]
-        name_m = re.search(r'VarName="([^"]+)"', block)
-        if not name_m:
-            continue
-        name = name_m.group(1)
-        vals_m = re.search(r'<Values>(.*?)</Values>', block, re.DOTALL)
-        ts_m = re.search(r'<Timestamps>(.*?)</Timestamps>', block, re.DOTALL)
-        if not vals_m or not ts_m:
-            continue
-        try:
-            values = [float(v) for v in vals_m.group(1).split(',') if v.strip()]
-            timestamps = [float(t) for t in ts_m.group(1).split(',') if t.strip()]
-            if microseconds:
-                timestamps = [t / 1000 for t in timestamps]
-        except ValueError as e:
-            print(f'trace 变量 {name} 数值解析失败: {e}', file=sys.stderr)
-            continue
-        if len(values) != len(timestamps):
-            print(f'trace 变量 {name} 值数({len(values)})≠时间戳数({len(timestamps)})，跳过', file=sys.stderr)
-            continue
-        # jumps
-        jumps = []
-        for j in range(1, len(values)):
-            if values[j] != values[j - 1]:
-                jumps.append((j, values[j - 1], values[j], timestamps[j]))
-        # segments
-        segments = []
-        seg_start = 0
-        for j in range(1, len(values)):
-            if values[j] != values[j - 1]:
-                segments.append((values[seg_start], timestamps[seg_start], timestamps[j],
-                                 timestamps[j] - timestamps[seg_start]))
-                seg_start = j
-        if seg_start < len(values):
-            segments.append((values[seg_start], timestamps[seg_start], timestamps[-1],
-                             timestamps[-1] - timestamps[seg_start]))
-        unique_vals = sorted(set(values))
-        inactive = (len(jumps) == 0)
-        variables[name] = {
-            'timestamp_unit': 'us' if microseconds else 'ms',
-            'values': values,
-            'timestamps': timestamps,
-            'jumps': jumps,
-            'segments': segments,
-            'sample_count': len(values),
-            'time_range': (timestamps[0] if timestamps else 0, timestamps[-1] if timestamps else 0),
-            'inactive': inactive,
-            'unique_values': unique_vals,
-        }
-    return variables
-
-
-# ---------- Cycle detection ----------
 
 def detect_cycles(variables, idle_threshold_ms=5000):
     """Detect production cycle boundaries from long idle (value=0) segments.
@@ -113,8 +116,9 @@ def detect_cycles(variables, idle_threshold_ms=5000):
     for name, v in variables.items():
         if v['inactive']:
             continue
+        exits = {t for _, before, _, t in v['jumps'] if before == 0}
         for value, s_ts, e_ts, dur in v['segments']:
-            if value == 0.0 and dur >= idle_threshold_ms:
+            if value == 0.0 and dur >= idle_threshold_ms and e_ts in exits:
                 boundaries.append((e_ts, name))  # boundary = end of idle
     boundaries.sort()
     return boundaries

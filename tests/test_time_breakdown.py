@@ -81,8 +81,8 @@ class TimeBreakdownTests(unittest.TestCase):
                               '</ST></body></pou></pous></types></project>', encoding='utf-8')
             record.write_text('<Trace><TraceConfiguration><Single Type="bool" Name="MicroSeconds">True</Single>'
                               '</TraceConfiguration><TraceData><TraceRecord>' +
-                              ''.join(f'<TraceVariable VarName="S[{i}]"><Values>10,20</Values>'
-                                      '<Timestamps>1000,208974</Timestamps></TraceVariable>' for i in range(len(comments)))
+                              ''.join(f'<TraceVariable VarName="S[{i}]"><Values>0,10,20</Values>'
+                                      '<Timestamps>0,1000,208974</Timestamps></TraceVariable>' for i in range(len(comments)))
                               + '</TraceRecord></TraceData></Trace>', encoding='utf-16')
             run = root / 'results'
             pairs = generate(record, run, source=source)['outputs']['pairs_csv']
@@ -91,7 +91,7 @@ class TimeBreakdownTests(unittest.TestCase):
             stats = workbook(pairs, run=str(run), sheet='trace步序采集表')
             self.assertEqual(load_trace_timing(run)[0]['S[0]=10', 'S[0]=20'], 207.974)
             with open(run / 'trace_segments.csv', encoding='utf-8-sig') as stream:
-                self.assertEqual(next(csv.DictReader(stream))['时长ms'], '207.974')
+                self.assertEqual(next(r['时长ms'] for r in csv.DictReader(stream) if r['值'] == '10'), '207.974')
             with open(stats['out'], 'rb') as stream:
                 book = load_workbook(stream)
             ws = book.active
@@ -103,7 +103,7 @@ class TimeBreakdownTests(unittest.TestCase):
             for merge in ('H1:I1', 'B1:C1'):
                 self.assertIn(merge, ws.merged_cells)
             self.assertTrue(all(ws.column_dimensions[letter].hidden for letter in 'BC'))
-            rows = {r[7].value: r for r in ws.iter_rows(min_row=3) if r[7].value}
+            rows = {r[7].value: r for r in ws.iter_rows(min_row=3) if r[7].value and r[7].value.endswith('=10')}
             self.assertEqual(len(rows), len(comments))
             for i, expected in enumerate(comments):
                 row = rows[f'S[{i}]=10']
@@ -112,7 +112,7 @@ class TimeBreakdownTests(unittest.TestCase):
                 self.assertEqual(row[5].value, 207.974)
                 self.assertTrue(all(row[col].value is None for col in (1, 2, 6, 9, 10, 11)))
                 chain = row[14].value
-                for part in ('样本索引 1', '207.974 ms', f'S[{i}]=10 → S[{i}]=20'):
+                for part in ('样本索引 2', '207.974 ms', f'S[{i}]=10 → S[{i}]=20'):
                     self.assertIn(part, chain)
                 self.assertIn('XML行' if expected else '动作描述待核', chain)
                 self.assertEqual(row[12].value, 1 if i in (0, 1, 2, 9, 10) else None)
