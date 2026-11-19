@@ -9,7 +9,8 @@
       "plc-trace-jump-analysis": "allow",
       "plc-action-description": "allow",
       "plc-station-identity": "allow",
-      "plc-trace-setup": "allow"
+      "plc-trace-setup": "allow",
+      "plc-logic-graph": "allow"
     }
   }
 }

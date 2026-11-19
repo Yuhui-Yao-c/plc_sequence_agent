@@ -1,8 +1,8 @@
 # PLC Trace 工作流
 
-本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。
+本项目通过 OpenCode 提供三个入口。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。入口三从源码和实测记录构建可交互的 PLC 逻辑图谱。
 
-当前简化版为 **14.0.1**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前图谱版为 **14.1.0**，维护分支为 `logic_graph`。双入口基线保存在 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -19,13 +19,16 @@ opencode
 | --- | --- |
 | 一　Trace 步序采集 | `源码路径 Trace路径 -t [-output 输出根目录]` |
 | 二　Trace 采集配置 | `源码路径 [模式1 模式2 ...] --trace-setup [任务选项] [-output 输出根目录]` |
+| 三　PLC 逻辑图谱 | `源码路径 Trace路径 --logic-graph [-output 输出根目录]` |
 
 ```text
 "source/包mylar/PLC程序.xml" "source/包mylar/采集记录" -t -output "D:\工作成果"
 "source/包mylar/PLC程序.xml" --trace-setup -output "D:\工作成果"
 ```
 
-两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。入口二的候选、范围判断、最终配置和通道清单都在同一个工序子目录。同一源码、程序及采集选项重复提交时，校验已有文件后返回当前阶段。不同采集任务或原位置已被其他数据占用时才另选编号。入口一新建独立运行的目录规则见下文。
+前两个入口分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。入口二的候选、范围判断、最终配置和通道清单都在同一个工序子目录。同一源码、程序及采集选项重复提交时，校验已有文件后返回当前阶段。不同采集任务或原位置已被其他数据占用时才另选编号。入口一新建独立运行的目录规则见下文。
+
+入口三输出到 `<工序名>_logic_graph/`。双击 `logic_graph.html`，在步序与观测中选一条跳变，展开门控或打开对应的源码网络。整个文件可复制到离线的现代浏览器单独打开。证据分级和 JSON 结构见 [图谱说明](docs/logic-graph.md)。
 
 入口二省略模式时，根据源码中的状态分支、写回和功能块实参发现具体通道。OpenCode 按实际控制层级确认工位或独立作业单元的自动周期。同一正式工位数组中承载局部动作的生产槽位可逐项核实。设备内部另设的执行步、许可和通信状态保留在审计里。多个独立步序接口可同时入选。单独使用 CLI 时，首次返回 `scope_review_pending`，需提供本轮用途判断才能完成选择。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
 

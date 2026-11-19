@@ -160,7 +160,7 @@ def trace_input_digest(path):
     return digest.hexdigest()
 
 
-def _read_header(reader, path):
+def _read_header(reader, path, all_columns=None):
     metadata = {}
     for row in reader:
         fields = [cell.strip().casefold() for cell in row]
@@ -172,6 +172,8 @@ def _read_header(reader, path):
                 name, data_type = name.strip(), data_type.strip().upper()
                 if name and data_type:
                     recorded_columns.append(column)
+                    if all_columns is not None:
+                        all_columns.append((name, data_type, column))
                 if not name or data_type not in INTEGER_TYPES:
                     continue
                 if name in channels:
@@ -380,7 +382,7 @@ def _estimate_time(index, left, right, interval_ns, first_index):
     return anchor_ns + (index - anchor_idx) * interval_ns
 
 
-def _parse_one_recording(parts, channels, interval_ns):
+def _parse_one_recording(parts, channels, interval_ns, observe_part=None):
     """Parse one recording in its own time and sample-index coordinate system."""
     right_anchors = [None] * len(parts)
     next_anchor = None
@@ -403,7 +405,9 @@ def _parse_one_recording(parts, channels, interval_ns):
         estimated = part.raw_range is None
         with part.path.open(encoding=part.encoding, newline='') as stream:
             reader = csv.reader(stream, delimiter=part.delimiter)
-            index_column, time_column, columns, _, recorded_columns = _read_header(reader, part.path)
+            header = [] if observe_part is not None else None
+            index_column, time_column, columns, _, recorded_columns = _read_header(reader, part.path, header)
+            observe_row = observe_part(header, channels) if observe_part is not None else None
             selected = [(name, columns[name][0], channel) for name, channel in channels.items()]
             count = 0
             for index, raw_time, row in _sample_rows(reader, part.path, index_column, time_column):
@@ -434,6 +438,8 @@ def _parse_one_recording(parts, channels, interval_ns):
                     except (IndexError, ValueError) as exc:
                         raise ValueError(f'{part.path}:{reader.line_num}: {name} 的整型值无效') from exc
                     channel.append(index, value, ts, estimated, reason)
+                if observe_row is not None:
+                    observe_row(index, row)
                 previous_index, previous_ns = index, ns
                 count += 1
             if count != part.row_count or previous_index != part.last_index:
@@ -446,7 +452,7 @@ def _parse_one_recording(parts, channels, interval_ns):
     return {name: channel.finish() for name, channel in channels.items()}, gaps, common, ts
 
 
-def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
+def parse_omron_trace(path, *, sample_interval_ms=None, matches=None, observe_recording=None):
     """Parse recordings independently and aggregate the selected channel union."""
     path = Path(path)
     tables, ignored = _find_tables(path)
@@ -493,7 +499,8 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
             if interval_ns is None:
                 raise ValueError(f'采集 {rec.recording_id}: RawTime 精度不足。请加入本次采集的精确时间分卷，'
                                  '或指定 --sample-interval-ms')
-        ch_results, gaps, row_gaps, end_ts = _parse_one_recording(parts, channels, interval_ns)
+        observer = observe_recording(rec.recording_id) if observe_recording is not None else None
+        ch_results, gaps, row_gaps, end_ts = _parse_one_recording(parts, channels, interval_ns, observer)
         periods = {p.path.name: p.clock_period_ns / NS_PER_MS if p.clock_period_ns else None for p in parts}
         gap_audit = gap_record(rec.recording_id, {name: c.gaps for name, c in channels.items()},
                                periods, len(parts[0].channels))

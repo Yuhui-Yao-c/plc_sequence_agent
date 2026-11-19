@@ -139,7 +139,7 @@ def _case_regions(code):
     return ranges
 
 
-def discover(source, scan):
+def discover(source, scan, *, on_transition=None):
     grid = scan.source_format == 'smc2'
     model = collect_smc2(source) if grid else collect_native(source)
     slices = model.get('native_inline_slices', [])
@@ -187,6 +187,15 @@ def discover(source, scan):
         site = {'source_line': int(line[1]) if line else 0, 'guard': rel['guard'],
                 'guard_complete': rel.get('guard_complete', False), 'kind': rel['evidence']}
         for row, bound in records(var, scope, site, required_cursors(condition)):
+            if on_transition is not None:
+                network = re.match(r'network:(\d+)', rel['body']) if grid else None
+                raw = bound['guard']
+                predicates = model.get('source_predicates', {})
+                for token in re.findall(r'__source_predicate_[0-9a-f]+', raw):
+                    if token in predicates:
+                        raw = raw.replace(token, '(' + predicates[token]['expression'] + ')')
+                on_transition(row.name, rel['from'], rel['to'], {
+                    **bound, 'guard':raw, 'locator': rel['body'], **({'grid_network': int(network[1])} if network else {})})
             row.edge(rel['from'], rel['to'], bound)
 
     # Retain locations and non-monitor instructions in the same executable ST
@@ -230,6 +239,8 @@ def discover(source, scan):
             for key, step in current:
                 states[key].add(step)
                 for row, bound in records(lhs, block['scope'], site, required_cursors(gate)):
+                    if on_transition is not None:
+                        on_transition(row.name, step, number, bound)
                     row.edge(step, number, bound)
             if number is not None and (unit := binding.unit(block['scope'])) and unit[0] == 'program':
                 target = scan.sysmac_channel(lhs, unit)[0]

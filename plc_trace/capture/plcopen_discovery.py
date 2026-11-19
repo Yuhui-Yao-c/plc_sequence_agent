@@ -144,7 +144,7 @@ def _recover_st(code, parser, error):
     return prefix + [s for s in later.statements if s[3] > last and re.split(r'[.\[]', s[0], 1)[0].casefold() not in touched]
 
 
-def discover(source, scan):
+def discover(source, scan, *, on_transition=None):
     root = etree.parse(str(source), etree.XMLParser(huge_tree=True, no_network=True, resolve_entities=False)).getroot()
     names = _nominations(root)
     ci = collect_root(root, names, recover_st=_recover_st)
@@ -194,6 +194,10 @@ def discover(source, scan):
         if others:
             required = required_cursors(source_condition(item['guard'])) & others
             site['co_cursors'] = sorted({resolve(peer, item).name.casefold() for peer in required})
+        if on_transition is not None:
+            on_transition(candidate.name, item['from'], item['to'], {
+                **site, **{k: item[k] for k in ('body', 'network', 'node', 'write_value',
+                                                 'condition_symbols', 'output_dependencies')}})
         candidate.edge(item['from'], item['to'], site)
         for other, conditions in item['numeric_conditions'].items():
             if other.casefold() not in names or other.casefold() == key:

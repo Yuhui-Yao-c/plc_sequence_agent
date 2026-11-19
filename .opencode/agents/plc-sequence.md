@@ -1,5 +1,5 @@
 ---
-description: 执行 PLC Trace 分析与采集配置，依据本轮源码证据生成中文动作描述和采集工作簿。
+description: 执行 PLC Trace 分析、采集配置与源码逻辑图谱，依据本轮源码证据生成中文动作描述和采集工作簿。
 mode: primary
 ---
 
@@ -11,7 +11,7 @@ mode: primary
 
 源码准备和采集记录均属于本轮证据。入口一仅处理 `batches_desc/*.input.json` 对应的动作描述任务。每批回传 `run_id`、`batch_id`，每行保留当前 `basis`。
 
-## 两个入口
+## 工作流入口
 
 ### 入口一　Trace 步序采集
 
@@ -63,6 +63,14 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 检查 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。汇川配置报告任务名、写入覆盖数、名义采样间隔和缓冲点数。若多个任务写入不同通道，说明整份记录使用哪个任务的节拍。`needs_review` 提供清单及具体原因。配置采样数为 0，现场导出的实测记录可进入入口一。
 
+### 入口三　PLC 逻辑图谱
+
+**输入**　`源码路径 Trace路径 --logic-graph [-output 输出根目录]`
+
+**执行**　加载 [PLC 逻辑图谱](../skills/plc-logic-graph/SKILL.md)。使用 `python plc_cli.py logic-graph --source "源码" --trace "实测记录" --out "实际交付目录"` 或对应简写。核验源码端口与观测跳变，沿具体写点、实例和作用域回查门控。
+
+**验收**　交付返回目录的 `logic_graph.html`。相同输入和程序可校验复用。区分直接写点、多步候选、未对齐和仅源码；附实际观测与解析边界。
+
 ## 输出与续跑
 
 `-output` 指定根目录，缺省为 `outputs`。入口一创建 `<工序名>_trace`，入口二创建 `<工序名>_trace_setup`。同一次采集配置的首跑、重试和范围判断共用一个目录。另一个输入、版本或选项占用同名目录时，程序为新任务选择编号。直接使用程序返回的目录名。
@@ -76,6 +84,7 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 | 入口一读取实测记录前 | [plc-trace-jump-analysis](../skills/plc-trace-jump-analysis/SKILL.md) |
 | 入口一填批或合并描述前 | [plc-action-description](../skills/plc-action-description/SKILL.md) |
 | 入口一核验工位展示与分组时 | [plc-station-identity](../skills/plc-station-identity/SKILL.md) |
+| 入口三构建或阅读源码图谱 | [plc-logic-graph](../skills/plc-logic-graph/SKILL.md) |
 | 入口二提取通道前 | [plc-trace-setup](../skills/plc-trace-setup/SKILL.md) |
 
 ## 交付报告

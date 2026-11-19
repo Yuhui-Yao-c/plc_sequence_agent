@@ -20,7 +20,7 @@ from plc_trace.trace.sample_continuity import ChannelSamples, clock_breaks, gap_
 
 # ---------- Trace parsing ----------
 
-def parse_trace(trace_path, *, audit=None, sample_interval_ms=None):
+def parse_trace(trace_path, *, audit=None, sample_interval_ms=None, observe_recording=None, channel_issues=None):
     """Read native XML; times are milliseconds and jumps stay within contiguous samples."""
     raw = Path(trace_path).read_bytes()
     encoding = 'utf-16' if raw.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
@@ -53,6 +53,8 @@ def parse_trace(trace_path, *, audit=None, sample_interval_ms=None):
             names.add(name)
             vs, ts = node.findtext('Values'), node.findtext('Timestamps')
             if vs is None or ts is None:
+                if channel_issues is not None:
+                    channel_issues.append([ordinal, name, 'missing_values_or_timestamps'])
                 continue
             try:
                 stamp_text = ts.strip().rstrip(',')
@@ -60,11 +62,19 @@ def parse_trace(trace_path, *, audit=None, sample_interval_ms=None):
                 fields = vs.strip().split(',')
                 if len(fields) == len(stamps) + 1 and not fields[-1].strip():
                     fields.pop()  # Exporters may append a comma to both vectors.
-                values = [float(v) if v.strip() else None for v in fields]
+                if observe_recording is not None:
+                    fields = [{'true':'1','false':'0'}.get(v.strip().lower(), v.strip()) for v in fields]
+                    values = [int(v) if v.lstrip('+-').isdecimal() else float(v) if v else None for v in fields]
+                else:
+                    values = [float(v) if v.strip() else None for v in fields]
             except ValueError as exc:
+                if channel_issues is not None:
+                    channel_issues.append([ordinal, name, 'nonnumeric_sample'])
                 print(f'trace 变量 {name} 数值解析失败: {exc}', file=sys.stderr)
                 continue
             if len(stamps) != len(values):
+                if channel_issues is not None:
+                    channel_issues.append([ordinal, name, 'vector_length_mismatch'])
                 print(f'trace 变量 {name} 的值数与时间戳数不一致，跳过', file=sys.stderr)
                 continue
             if not all(map(math.isfinite, stamps)) or not all(math.isfinite(v) for v in values if v is not None):
@@ -81,6 +91,8 @@ def parse_trace(trace_path, *, audit=None, sample_interval_ms=None):
             variables[name] = dict(channel.finish(), timestamp_unit=unit, values=values, timestamps=stamps)
             channel_gaps[name] = channel.gaps
         rid = str(ordinal) if len(records) > 1 else ''
+        if observe_recording is not None:
+            observe_recording(rid or '1', variables)
         gaps.append(gap_record(rid, channel_gaps, periods, len(names)))
         if len(records) == 1:
             combined = variables
