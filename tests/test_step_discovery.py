@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from plc_trace.capture.extract_step_variables import generate
 from plc_trace.capture.step_discovery import Discovery, replay_selectors, scope_selection
@@ -56,6 +57,43 @@ class StepDiscoveryTests(unittest.TestCase):
                          ['--pattern=a', '--pattern=b'])
         self.assertEqual(_expand_trace_shorthand(parser, ['cell.xml', 'record.trace', '-t'])[0], 'trace')
 
+    def test_scope_retry_preserves_the_run_and_rolls_back_failed_publication(self):
+        xml = ('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'
+               '<Variable name="Cursor"><Type><TypeName>INT</TypeName></Type></Variable></GlobalVars>'
+               '<Program name="Bay"><BodyContent name="Cycle"><ST>CASE Cursor OF '
+               '1: IF Ready THEN Cursor:=4; END_IF; 4: IF Done THEN Cursor:=1; END_IF; END_CASE;'
+               '</ST></BodyContent></Program></Project>')
+        initial, inventory = self.prepare(xml)
+        self.assertEqual(initial['status'], 'scope_review_pending')
+        scope = self.out / 'scope_results.json'
+        scope.write_text(json.dumps(self.scope(inventory, {'Cursor'})))
+        note = self.out / '现场笔记.txt'
+        note.write_text('现场补充', encoding='utf-8')
+        original = {f.name: f.read_bytes() for f in self.out.iterdir()}
+        self.assertEqual(generate(self.source, self.out), initial)
+        self.assertEqual(scope.read_bytes(), original[scope.name])
+
+        replace = Path.replace
+        def simulate_locked_status(source, destination):
+            if source.parent.name == 'ready' and destination.name == 'workflow_status.json':
+                raise PermissionError('locked status')
+            return replace(source, destination)
+        with patch.object(Path, 'replace', simulate_locked_status), self.assertRaisesRegex(PermissionError, 'locked status'):
+            generate(self.source, self.out, scope_results=scope)
+        self.assertEqual({f.name: f.read_bytes() for f in self.out.iterdir()}, original)
+        self.assertEqual(set(self.root.iterdir()), {self.source, self.out})
+
+        final = generate(self.source, self.out, scope_results=scope)
+        self.assertEqual(final['static_variables'], 1)
+        self.assertEqual(generate(self.source, self.out, scope_results=scope), final)
+        self.assertEqual(generate(self.source, self.out), final)
+        self.assertEqual(note.read_bytes(), original[note.name])
+        self.assertEqual(set(self.root.iterdir()), {self.source, self.out})
+        Path(final['configuration']).write_bytes(b'edited')
+        with self.assertRaisesRegex(ValueError, '缺失或已修改'):
+            generate(self.source, self.out, choose_available=True)
+        self.assertEqual(set(self.root.iterdir()), {self.source, self.out})
+
     def test_scope_proof_local_identity_monitor_and_counter(self):
         ctrl = '<interface><localVars><variable name="K"><type><INT/></type></variable></localVars></interface>'
         body = ('<body><ST>CASE K OF 2: IF Ready THEN K:=7; Valve:=TRUE; END_IF; '
@@ -75,6 +113,26 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertTrue(list(self.out.glob('*.trace')))
         self.assertEqual(json.loads((self.out/'scope_results.json').read_bytes())['inventory_sha256'],
                          inv['inventory_sha256'])
+
+    def test_legacy_pending_status_requires_the_same_recomputed_evidence(self):
+        decl = '<interface><localVars><variable name="K"><type><INT/></type></variable></localVars></interface>'
+        body = ('<body><ST>CASE K OF 2: IF Ready THEN K:=7; Valve:=TRUE; END_IF; '
+                '7: IF Done THEN K:=2; END_IF; END_CASE;</ST></body>')
+        status, inventory = self.prepare('<project><fileHeader productName="InoProShop"/>'
+                                         + program('Line', decl + body)
+                                         + '<resource><task name="Clock"><pouInstance name="Line"/></task></resource></project>')
+        marker = self.out / 'workflow_status.json'
+        legacy = {k:v for k,v in status.items() if k not in {'request_sha256', 'artifact_sha256'}}
+        legacy['version'] = '14.0.0'
+        marker.write_text(json.dumps(dict(legacy, inventory_sha256='different')))
+        with self.assertRaisesRegex(ValueError, '候选证据'):
+            self.finish(inventory, {'Line.K'})
+        self.assertFalse(list(self.out.glob('*.trace')))
+        marker.write_text(json.dumps(legacy))
+        final = self.finish(inventory, {'Line.K'})
+        self.assertEqual([r['name'] for r in final['channels']], ['Line.K'])
+        self.assertTrue(final['artifact_sha256'])
+        self.assertFalse(list(self.root.glob('*.previous-*')))
 
     def test_sysmac_typed_rebinding_across_two_calls_and_readonly_formal(self):
         def var(name, typ):

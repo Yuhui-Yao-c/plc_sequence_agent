@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。
 
-当前简化版为 **14.0.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **14.0.1**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -25,7 +25,7 @@ opencode
 "source/包mylar/PLC程序.xml" --trace-setup -output "D:\工作成果"
 ```
 
-两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。已有产物时自动选用带 `_2`、`_3` 等后缀的新子目录。
+两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。入口二的候选、范围判断、最终配置和通道清单都在同一个工序子目录。同一源码、程序及采集选项重复提交时，校验已有文件后返回当前阶段。不同采集任务或原位置已被其他数据占用时才另选编号。入口一新建独立运行的目录规则见下文。
 
 入口二省略模式时，根据源码中的状态分支、写回和功能块实参发现具体通道。OpenCode 按实际控制层级确认工位或独立作业单元的自动周期。同一正式工位数组中承载局部动作的生产槽位可逐项核实。设备内部另设的执行步、许可和通信状态保留在审计里。多个独立步序接口可同时入选。单独使用 CLI 时，首次返回 `scope_review_pending`，需提供本轮用途判断才能完成选择。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
 
@@ -69,7 +69,9 @@ python plc_cli.py trace-setup --source "source/包mylar/PLC程序.xml" --pattern
 
 Trace 分析支持 TwinCAT Scope `.trace` 和 Sysmac 导出表、分卷目录，时长取同一连续采样段内、进入和离开起始步均有观测的停留中位数。源码原注释优先进入 A 档，其余行由 Agent 按本步证据完成 B 档。
 
-`workflow_status.json` 的 `out` 记录实际运行目录。`prepared_b_tier_pending` 时完成本轮 `batches_desc/*.result.json`，再以相同参数加 `--resume`。`done_with_review` 表示已出表且有待核项。显式重建用 `--force` 整体归档旧运行。
+`workflow_status.json` 的 `out` 记录实际运行目录。入口二收到 `scope_review_pending` 后，在该目录写入 `scope_results.json`，以同一组采集选项和 `--out`、`--scope-results` 合并。普通合并在原处完成。要重新独立判定时，可指定新输出根目录，或用完整命令在原目录显式 `--force` 归档重建。旧版已完成目录作为历史结果保留。旧版待复核任务可显式指定原目录续跑，程序重新核对源码、采集设置及候选指纹。
+
+入口一简写遇到已占用目录时另开编号。`prepared_b_tier_pending` 时完成本轮 `batches_desc/*.result.json`，再以相同参数加 `--resume`。`done_with_review` 表示已出表且有待核项。
 
 入口二的配置在客户端导入并完成现场采集后，可将实测导出交给入口一。类型或解析问题由 `needs_review` 状态报告。
 

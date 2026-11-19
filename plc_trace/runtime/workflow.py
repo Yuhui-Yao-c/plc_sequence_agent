@@ -78,22 +78,44 @@ def _check_output_location(out):
 
 @contextmanager
 def lock_run_dir(out):
- """Serialize commands targeting the same output directory, including rebuilds."""
- out=Path(out).resolve()
- out.parent.mkdir(parents=True,exist_ok=True)
- # A sibling lock stays in place when --force archives the old directory.
- with (out.parent/f'.{out.name}.plc.lock').open('a+b') as lock:
+ """Lock a sibling across directory swaps; leave no lock after the command."""
+ out = Path(out).resolve()
+ out.parent.mkdir(parents=True, exist_ok=True)
+ path = out.parent / f'.{out.name}.plc.lock'
+ busy = f'输出目录正在由其他工作流命令使用：{out}'
+ if os.name == 'nt':
+  import msvcrt
+  # The kernel removes the file when the last handle closes, including on exit.
   try:
-   if os.name=='nt':
-    import msvcrt
-    lock.seek(0)
-    msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
-   else:
-    import fcntl
-    fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-  except OSError as exc:
-   raise SystemExit(f'输出目录正在由其他工作流命令使用：{out}') from exc
-  yield
+   fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TEMPORARY)
+  except PermissionError as exc:
+   raise SystemExit(f'{busy}，或没有创建锁文件的权限') from exc
+  with os.fdopen(fd, 'r+b') as lock:
+   try:
+    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+   except OSError as exc:
+    raise SystemExit(busy) from exc
+   yield
+  return
+
+ import fcntl
+ while True:
+  with path.open('a+b') as lock:
+   try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+   except BlockingIOError as exc:
+    raise SystemExit(busy) from exc
+   # A previous owner may have unlinked this inode after our open().
+   try:
+    if not os.path.samestat(os.fstat(lock.fileno()), path.stat()):
+     continue
+   except FileNotFoundError:
+    continue
+   try:
+    yield
+   finally:
+    path.unlink(missing_ok=True)
+   return
 
 
 def _fresh_output(out, force):

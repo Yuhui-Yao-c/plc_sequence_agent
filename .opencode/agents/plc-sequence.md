@@ -57,7 +57,7 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 **执行**
 
-免填模式收到 `scope_review_pending` 后，按 [采集配置](../skills/plc-trace-setup/SKILL.md) 先确认本工程的工位步序接口，再核验每个实例。内部执行步和不明用途保留审计。在同一运行目录用 `--scope-results` 合并。显式模式按规则提取完整路径和固定下标。核对类型、作用域及解析问题。生成配置后交付客户端导入，检查任务、触发、采样设置和通道容量。
+免填模式收到 `scope_review_pending` 后，保存返回的 `out`。按 [采集配置](../skills/plc-trace-setup/SKILL.md) 先确认本工程的工位步序接口，再核验每个实例。内部执行步和不明用途保留审计。以该 `out` 和首轮采集选项提交 `--scope-results`。查看进度时直接读取该目录的 `workflow_status.json`。收到完成状态后核对并交付现有配置。显式模式按规则提取完整路径和固定下标。核对类型、作用域及解析问题。生成配置后交付客户端导入，检查任务、触发、采样设置和通道容量。
 
 **验收**
 
@@ -65,7 +65,7 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 ## 输出与续跑
 
-`-output` 指定根目录，缺省为 `outputs`。入口一创建 `<工序名>_trace`，入口二创建 `<工序名>_trace_setup`。工序名沿用交付表规则。已有产物时，新任务自动使用 `_2`、`_3` 等可用子目录。
+`-output` 指定根目录，缺省为 `outputs`。入口一创建 `<工序名>_trace`，入口二创建 `<工序名>_trace_setup`。同一次采集配置的首跑、重试和范围判断共用一个目录。另一个输入、版本或选项占用同名目录时，程序为新任务选择编号。直接使用程序返回的目录名。
 
 完整 CLI 的 `--out` 指定实际运行目录，续跑从 `workflow_status.json` 的 `out` 取得该路径。显式重建用 `--force` 整体归档旧运行。程序、资源、规则、输入和准备产物须通过本轮指纹核验。
 

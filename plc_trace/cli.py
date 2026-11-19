@@ -187,17 +187,20 @@ def _expand_trace_shorthand(parser, args):
         add_task_arguments(sampling)
         sampling.parse_args(suffix)
 
+    mode, option = routes[marker]
+    command = [mode, f'--source={source}', *(f'{option}={value}' for value in values), *suffix]
+    if marker == '--trace-setup':
+        return [*command, f'-output={root}']
+
     from plc_trace.output.utils import infer_proc_name
-    proc_name = infer_proc_name(source)
-    name = proc_name + ('_trace_setup' if marker == '--trace-setup' else '_trace')
+    name = infer_proc_name(source) + '_trace'
     out = root / name
     index = 2
     while out.is_symlink() or (out.exists() and (not out.is_dir() or any(out.iterdir()))):
         out = root / f'{name}_{index}'
         index += 1
 
-    mode, option = routes[marker]
-    return [mode, f'--source={source}', *(f'{option}={value}' for value in values), *suffix, f'--out={out}']
+    return [*command, f'--out={out}']
 
 
 def main():

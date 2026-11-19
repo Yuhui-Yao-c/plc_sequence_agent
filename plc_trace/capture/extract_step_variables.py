@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import re
@@ -11,7 +12,6 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from uuid import NAMESPACE_URL, uuid5
 from xml.etree import ElementTree as ET
 
@@ -26,10 +26,13 @@ from plc_trace.capture.plcopen_tasks import (
     ProgramWrites, Routine, is_task_declaration, sampling_task, task_declaration, validated_task_name,
 )
 from plc_trace.capture.station_scope import at_path, declaration
+from plc_trace.capture.setup_output import (
+    legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files,
+)
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
 from plc_trace.trace.trace_to_pairs import INTEGER_TYPES
-from plc_trace.runtime.workflow import _fresh_output, fingerprint, lock_run_dir
+from plc_trace.runtime.workflow import fingerprint, lock_run_dir, pipeline_fingerprint
 
 
 _NAME = r'[^\W\d]\w*'
@@ -495,30 +498,10 @@ def _inovance_config(root, channels, task, source_digest):
     return ET.tostring(root, encoding='utf-16', xml_declaration=True, short_empty_elements=False)
 
 
-def _publish(out, files, force):
-    # Stage all writes before moving an existing run out of the way.
-    with TemporaryDirectory(prefix='.trace-setup-', dir=out.parent) as temporary:
-        stage = Path(temporary) / 'ready'
-        stage.mkdir()
-        for name, contents in files.items():
-            (stage / name).write_bytes(contents)
-        previous = _fresh_output(out, force)
-        try:
-            out.rmdir()
-            stage.rename(out)
-        except OSError:
-            if previous and not out.exists():
-                Path(previous).rename(out)
-            raise
-
-
 def generate(source, out, pattern=None, *, capture_format='auto', task_name=None, scope_results=None,
-             every_n_cycles=None, default_type=None, case_sensitive=False, force=False):
+             every_n_cycles=None, default_type=None, case_sensitive=False, force=False, choose_available=False):
     source_input = Path(source).absolute()
-    source, out = source_input.resolve(), Path(out).resolve()
-    if (source_input.is_relative_to(out) or source.is_relative_to(out) or Path.cwd().is_relative_to(out)
-            or PROJECT_ROOT.is_relative_to(out)):
-        raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
+    source = source_input.resolve()
     automatic = pattern is None
     matcher = None if automatic else _Selectors(pattern, case_sensitive)
     if scope_results is not None and not automatic:
@@ -529,22 +512,44 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         raise ValueError('采集格式须为 auto、sysmac 或 inovance')
     if default_type and default_type not in INTEGER_TYPES:
         raise ValueError('默认类型须为采集分析支持的整数类型')
+    digest = fingerprint(source)
+    request = hashlib.sha256(json.dumps({
+        'source': str(source), 'source_sha256': digest, 'pipeline': pipeline_fingerprint(),
+        'patterns': matcher.patterns if matcher else [], 'case_sensitive': case_sensitive,
+        'capture_format': capture_format, 'task_name': task_name, 'every_n_cycles': every_n_cycles,
+        'default_type': default_type,
+    }, sort_keys=True).encode()).hexdigest()
+    out = Path(out)
+    if choose_available:
+        out = select_run_dir(out.parent.resolve() / out.name, request)
+    out = out.resolve()
+    if (source_input.is_relative_to(out) or source.is_relative_to(out) or Path.cwd().is_relative_to(out)
+            or PROJECT_ROOT.is_relative_to(out)):
+        raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
     with lock_run_dir(out):
+        pending = None
+        scope_bytes = Path(scope_results).read_bytes() if scope_results is not None else None
         if out.exists() and not out.is_dir():
             raise ValueError('输出路径须为目录')
         if out.exists() and any(out.iterdir()):
-            marker = out / 'workflow_status.json'
-            status = json.loads(marker.read_bytes()) if marker.is_file() else None
-            resume_scope = (scope_results is not None and isinstance(status, dict) and status.get('status') == 'scope_review_pending'
-                            and status.get('source') == str(source) and status.get('selection_mode') == 'automatic')
-            if not force and not resume_scope:
-                raise ValueError('请使用空输出目录，或以 --force 归档已有的采集配置')
-            if not isinstance(status, dict) or status.get('mode') != 'trace_setup':
+            status = read_status(out)
+            if status.get('mode') != 'trace_setup':
                 raise ValueError('输出目录属于其他任务，请使用空目录')
-            force = force or resume_scope
+            if not force:
+                legacy = (not choose_available and scope_bytes is not None
+                          and legacy_pending(status, source, out, digest, task_name, every_n_cycles))
+                if not matches_request(status, out, request) and not legacy:
+                    raise ValueError('源码、程序版本或采集选项与已有任务不同，请指定空目录或显式 --force 重建')
+                if scope_bytes is not None and status.get('status') == 'scope_review_pending':
+                    pending = status
+                else:
+                    verify_files(out, status)
+                    if scope_bytes is not None and hashlib.sha256(scope_bytes).hexdigest() not in (
+                            status.get('scope_input_sha256'), status['artifact_sha256'].get('scope_results.json')):
+                        raise ValueError('已有任务已结束，范围判断与已提交结果不同，请核对后显式重建')
+                    return status
         source_format = detect_source_format(source)
         before = source.stat()
-        digest = fingerprint(source)
         scan = _SourceScan(matcher, source_format, case_sensitive)
         scan.read(source)
         after = source.stat()
@@ -576,7 +581,10 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 discovered.issues['reason'] = 'no_static_executable_references'
             discovered.add_unproven_siblings(scan)
             inventory = discovered.inventory(digest, source_format)
-            decisions = json.loads(Path(scope_results).read_bytes()) if scope_results is not None else None
+            if pending and (pending.get('inventory_sha256') != inventory['inventory_sha256']
+                            or pending.get('capture_format') != capture_format):
+                raise ValueError('重算的候选证据或采集格式与待复核目录不同，请重新准备')
+            decisions = json.loads(scope_bytes) if scope_bytes is not None else None
             if scope_results is not None and decisions is None:
                 raise ValueError('用途判断 JSON 为空')
             chosen, roles = scope_selection(inventory, decisions)
@@ -662,10 +670,14 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 files['scope_results.json'] = json.dumps({'inventory_sha256': inventory['inventory_sha256'],
                     'station_families': families, 'decisions': roles}, ensure_ascii=False, indent=1).encode('utf-8')
             files['step_variable_discovery.json'] = json.dumps(inventory, ensure_ascii=False, indent=1).encode('utf-8')
-            if fingerprint(source) != digest:
-                raise ValueError('发现期间源码发生变化，请重新执行')
+        if fingerprint(source) != digest:
+            raise ValueError('发现期间源码发生变化，请重新执行')
+        report['request_sha256'] = request
+        report['artifact_sha256'] = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+        if scope_bytes is not None:
+            report['scope_input_sha256'] = hashlib.sha256(scope_bytes).hexdigest()
         files['workflow_status.json'] = json.dumps(report, ensure_ascii=False, indent=2).encode('utf-8')
-        _publish(out, files, force)
+        publish(out, files, force=force, completing=pending is not None)
         return report
 
 
@@ -681,7 +693,9 @@ def add_arguments(parser):
                           help='完整变量名、通配符或 re: 正则；可重复指定，取并集并去重')
     selector.add_argument('--regex', help='对完整变量名匹配的 Python 正则')
     parser.add_argument('--scope-results', help='自动发现后由 Agent 按本轮源码证据生成的用途判断 JSON')
-    parser.add_argument('--out', required=True, help='独立输出目录')
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument('--out', help='实际运行目录，合并时使用首轮返回的 out')
+    destination.add_argument('-output', dest='output_root', help='输出根目录，在其中选择本任务的工序子目录')
     parser.add_argument('--format', choices=('auto', 'inovance', 'sysmac'), default='auto')
     add_task_arguments(parser)
     parser.add_argument('--default-type', type=str.upper, choices=sorted(INTEGER_TYPES),
@@ -692,11 +706,16 @@ def add_arguments(parser):
 
 def run(args):
     pattern = args.pattern if args.regex is None else 're:' + args.regex
+    out = args.out
+    if args.output_root is not None:
+        from plc_trace.output.utils import infer_proc_name
+        out = Path(args.output_root) / (infer_proc_name(args.source) + '_trace_setup')
     try:
-        report = generate(args.source, args.out, pattern, capture_format=args.format,
+        report = generate(args.source, out, pattern, capture_format=args.format,
                           task_name=args.task_name,
                           every_n_cycles=args.every_n_cycles, default_type=args.default_type,
-                          case_sensitive=args.case_sensitive, force=args.force, scope_results=args.scope_results)
+                          case_sensitive=args.case_sensitive, force=args.force, scope_results=args.scope_results,
+                          choose_available=args.output_root is not None)
     except (OSError, ValueError, re.error, etree.XMLSyntaxError) as exc:
         raise SystemExit(f'采集配置生成失败：{exc}') from exc
     print(json.dumps(report, ensure_ascii=False, indent=2))

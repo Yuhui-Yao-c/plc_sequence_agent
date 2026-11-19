@@ -312,3 +312,20 @@ class WorkflowRunTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob('out.previous-*')), [])
         with lock_run_dir(self.out), self.assertRaisesRegex(SystemExit, '正在由其他工作流命令使用'):
             self.cli('trace', '--force')
+
+    def test_output_lock_is_removed_after_error_and_process_contention(self):
+        lock = self.root / '.out.plc.lock'
+        lock.touch()  # An inactive lock left by an earlier release.
+        script = ('from plc_trace.runtime.workflow import lock_run_dir\n'
+                  'import sys\nwith lock_run_dir(sys.argv[1]): print("entered")')
+        with self.assertRaisesRegex(ValueError, 'test failure'):
+            with lock_run_dir(self.out):
+                result = subprocess.run([sys.executable, '-c', script, str(self.out)],
+                                        cwd=Path(__file__).resolve().parents[1], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b'entered', result.stdout)
+                raise ValueError('test failure')
+        self.assertFalse(lock.exists())
+        with lock_run_dir(self.out):
+            self.assertTrue(lock.exists())
+        self.assertFalse(lock.exists())

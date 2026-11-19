@@ -174,6 +174,32 @@ class TraceSetupTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '其他任务'):
             generate(self.source, other, 'Step[1]', force=True)
 
+    def test_shorthand_reuses_only_an_identical_source_options_and_program(self):
+        import subprocess
+        import sys
+        self.plcopen('<ST>Step[1] := 20; Step[2] := 30;</ST>')
+        project = Path(__file__).resolve().parents[1]
+        root = self.root / '输出'
+        def invoke(pattern):
+            result = subprocess.run([sys.executable, str(project/'plc_cli.py'), str(self.source),
+                                     pattern, '--trace-setup', '-output', str(root)],
+                                    cwd=self.root, capture_output=True, text=True, check=True)
+            return Path(json.loads(result.stdout)['out'])
+        original = self.source.read_bytes()
+        first = invoke('Step[1]')
+        self.assertEqual(invoke('Step[1]'), first)
+        second = invoke('Step[2]')
+        self.assertNotEqual(first, second)
+        self.assertEqual(invoke('Step[2]'), second)
+        self.source.write_bytes(original.replace(b':= 20', b':= 40'))
+        third = invoke('Step[1]')
+        self.assertEqual(len({first, second, third}), 3)
+        self.source.write_bytes(original)
+        self.assertEqual(invoke('Step[1]'), first)
+        with patch('plc_trace.capture.extract_step_variables.pipeline_fingerprint', return_value='changed'):
+            fourth = generate(self.source, first, 'Step[1]', choose_available=True)
+        self.assertEqual(set(root.iterdir()), {first, second, third, Path(fourth['out'])})
+
     def test_smc2_decodes_json_values_and_audits_malformed_input(self):
         network = {'CMT': '步序[99]', 'CLs': [{'Var': '步序[10]'}, {'TXT': '步序[2] := 20;'}]}
         payload = json.dumps(network, ensure_ascii=True)
