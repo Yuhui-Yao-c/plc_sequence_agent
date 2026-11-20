@@ -37,11 +37,18 @@ def st_body(node, code):
         parser.seq()
     except (ValueError, WireError, RecursionError, IndexError) as exc:
         node.setdefault('limits', []).append(str(exc)[:200])
-    node['assignments'] = [
-        {'line': code.count('\n', 0, offset) + 1, 'target': lhs, 'value': rhs, 'guard': guard.text(),
-         'reads': sorted(_conditions(guard, '') | (set(scalar_reads(rhs)) if valid_scalar(rhs) else set()))}
-        for lhs, rhs, guard, offset, _ in parser.statements
-    ]
+    node['assignments'] = []
+    for lhs, rhs, guard, offset, _ in parser.statements:
+        when = _conditions(guard, '')
+        if valid_scalar(rhs):
+            values = set(scalar_reads(rhs))
+        else:
+            expr = source_condition(rhs)
+            # An opaque function call has an interface, not a known value expression.
+            values = set() if '@' in expr.text() else _conditions(expr, '')
+        node['assignments'].append({'line': code.count('\n', 0, offset) + 1, 'target': lhs, 'value': rhs,
+                                    'guard': guard.text(), 'reads': sorted(when | values),
+                                    'when_reads': sorted(when), 'value_reads': sorted(values)})
     if parser.skipped:
         node['other_statements'] = [
             {'line': code.count('\n', 0, parser.spans[s['token']][0]) + 1, **s}
@@ -135,6 +142,14 @@ class Topology:
             idx = node['id']
             outputs = elem.findall('./{*}outputVariables/{*}variable') + elem.findall('./{*}inOutVariables/{*}variable')
             if outputs:
+                marked = [v.get('formalParameter', '') for v in outputs if any(
+                    tag(c) == 'IsMainOutput' and text(c).casefold() == 'true' for c in v.iter())]
+                if len(marked) == 1:
+                    node['main_output'] = marked[0]
+                elif len(outputs) == 1:
+                    node['main_output'] = outputs[0].get('formalParameter', '')
+                elif len(outputs) > 1:
+                    node['ambiguous_output'] = True
                 self.output_pins[idx] = {v.get('formalParameter','').casefold() for v in outputs}
             lookup[key].append((idx, ''))
             if typ == 'connector':

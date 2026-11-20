@@ -1,19 +1,71 @@
 /* Follow only transitions justified by an individual ST statement or a wired write. */
 const Lineage = (() => {
-  let upstream, downstream;
+  let upstream, downstream, boundaries, byNode, boundaryNodes;
 
   function index() {
     if (upstream) return;
     upstream = new Map();
     downstream = new Map();
+    boundaries = new Map();
+    byNode = new Map();
+    boundaryNodes = new Map();
     const add = (map, key, i) => {
       if (!map.has(key)) map.set(key, []);
       map.get(key).push(i);
     };
+    (D.plant.dependency_boundaries || []).forEach((row,i) => {
+      add(boundaries,row[0],i);
+      add(boundaryNodes,row[2],i);
+    });
     D.plant.dependencies.forEach(([target, sources], i) => {
       add(upstream, target, i);
+      add(byNode,D.plant.dependencies[i][3],i);
       for (const sid of sources) add(downstream, sid, i);
     });
+  }
+
+  function showBoundaries(parent,rows) {
+    if (!rows?.length) return;
+    const d = box(parent,'接口边界 · ' + rows.length);
+    paged(d,rows,(p,i) => {
+      const [,net,node,line,limits] = D.plant.dependency_boundaries[i];
+      for (const [at,pin,why] of limits) {
+        const [sourceNet,sourceNode] = nodeMap.get(at);
+        p.append(button(sourceNode.label + (pin ? '.' + pin : '') + ' · ' + ({
+          block_output:'块输出',block_status:'执行状态',ambiguous_port:'输出端口待核',element_output:'元件输出'
+        }[why] || why) + ' · XML L' + sourceNode.line,() => go('nets',sourceNet.id,{focus:at})));
+      }
+      p.append(button('目标写点',() => go('nets',net,{focus:node,stLine:line})));
+    },8);
+  }
+
+  function writes(parent,node,line) {
+    index();
+    const rows = (byNode.get(node.id) || []).filter(i => !line || D.plant.dependencies[i][5] === line);
+    const limits = (boundaryNodes.get(node.id) || []).filter(i => !line || D.plant.dependency_boundaries[i][3] === line);
+    showBoundaries(parent,limits);
+    if (!rows.length) return;
+    const panel = box(parent,'本写点的信号依赖 · ' + rows.length);
+    panel.ontoggle = () => {
+      if (!panel.open || panel.dataset.ready) return;
+      panel.dataset.ready = '1';
+      paged(panel,rows,(p,i) => {
+        const [sid,,,,,st,call] = D.plant.dependencies[i], r = D.plant.dependency_roles[i];
+        const a = node.assignments?.[r.statement];
+        const header = a ? 'ST ' + st + '　' + a.target + ' := ' + a.value : node.label;
+        p.append(el('h4',header + '　→ ' + D.symbols[sid].name));
+        if (call != null) {
+          const c = D.calls[call];
+          p.append(button('调用实例 · ' + (c.instance || c.type),() => go('nets',c.net,{focus:c.node,stLine:c.st_line})));
+        }
+        for (const [field,label] of [['when','写入条件'],['value','赋值取数'],['value_enable','取数使能']]) {
+          if (!r[field]?.length) continue;
+          const line = terms(p);
+          line.append(el('strong',label));
+          for (const id of r[field]) line.append(button(D.symbols[id].name,() => go('symbols',id)));
+        }
+      },8);
+    };
   }
 
   function render(parent, origin, drawRoute, locate) {
@@ -30,7 +82,7 @@ const Lineage = (() => {
       panel.append(content);
       let route = [origin],
         steps = [],
-        direction = 'down';
+        direction = 'down', role = 'all';
 
       function draw() {
         content.replaceChildren();
@@ -45,6 +97,7 @@ const Lineage = (() => {
           drawRoute(route);
           draw();
         });
+        select(row,[['all','全部依赖'],['when','写入条件'],['value','赋值取数'],['value_enable','取数使能']],role,v => { role=v; draw(); });
         if (steps.length) row.append(button('退回一段', () => {
           route.pop();
           steps.pop();
@@ -76,19 +129,26 @@ const Lineage = (() => {
           })));
           callEvidence(content, call);
         });
+        if (direction === 'up') showBoundaries(content,boundaries.get(key));
         const next = [];
         for (const i of ids) {
           const [target, inputs] = D.plant.dependencies[i], options = direction === 'down' ? [target] : inputs;
-          for (const sid of options) next.push([sid, i]);
+          for (const sid of options) {
+            const src = direction === 'down' ? key : sid, r = D.plant.dependency_roles[i];
+            if (role !== 'all' && !r[role]?.includes(src)) continue;
+            const caption = [['when','写入条件'],['value','赋值取数'],['value_enable','取数使能']]
+              .filter(([field]) => r[field]?.includes(src)).map(([,label]) => label).join(' / ');
+            next.push([sid,i,caption]);
+          }
         }
         if (!next.length) {
-          para(content, '这里没有再经单条已解析赋值或接线证实的依赖。可从信号读写索引继续核查调用或间接引用。', 'muted');
+          para(content, '当前范围没有下一段指令依赖。', 'muted');
           return;
         }
-        paged(content, next, (p, [sid, i]) => {
+        paged(content, next, (p, [sid, i, caption]) => {
           const [dest, , net, node, kind, st, call] = D.plant.dependencies[i], n = nodeMap.get(node)[1],
             src = direction === 'down' ? key : sid;
-          const b = button(label(sid) + ' · ' + leafScope(net) + ' / ' + (kind === 'wire' ? n.type : 'ST ' +
+          const b = button(caption + ' · ' + label(sid) + ' · ' + leafScope(net) + ' / ' + (kind === 'wire' ? n.type : 'ST ' +
             st) + ' · L' + n.line, () => {
             route.push(sid);
             steps.push([i, src, dest]);
@@ -114,6 +174,6 @@ const Lineage = (() => {
     }
   }
   return {
-    render
+    render, writes
   };
 })();

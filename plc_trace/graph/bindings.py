@@ -90,7 +90,7 @@ def call_bindings(nets, calls, symbol_ids, namespace, formals):
     return bindings
 
 
-def instance_dependencies(top, symbol_ids, symbol_keys, bindings):
+def instance_dependencies(top, symbol_ids, symbol_keys, bindings, dependency_roles=None):
     """Specialize a direct formal-to-formal assignment for one proven call site."""
     bodies = defaultdict(list)
     for net in top.nets:
@@ -100,14 +100,17 @@ def instance_dependencies(top, symbol_ids, symbol_keys, bindings):
             continue
         roles = top.formals[owner]
         for node in net['nodes']:
-            for assignment in node.get('assignments', ()):
+            for index, assignment in enumerate(node.get('assignments', ())):
                 lhs = assignment['target'].casefold()
                 if roles.get(re.split(r'[.\[]', lhs, 1)[0]) not in ('write','inout'):
                     continue
-                sources = [name.casefold() for name in assignment['reads']
-                           if roles.get(re.split(r'[.\[]', name.casefold(), 1)[0]) in ('read','inout')]
-                if sources:
-                    bodies[owner].append((lhs, sources, net['id'], node['id'], assignment['line']))
+                def inputs(names):
+                    return [name.casefold() for name in names if roles.get(
+                        re.split(r'[.\[]', name.casefold(), 1)[0]) in ('read', 'inout')]
+                when = inputs(assignment['when_reads'])
+                values = inputs(assignment['value_reads'])
+                if when or values:
+                    bodies[owner].append((lhs, when, values, net['id'], node['id'], assignment['line'], index))
 
     result = []
     for i, ports in bindings:
@@ -134,11 +137,14 @@ def instance_dependencies(top, symbol_ids, symbol_keys, bindings):
                 return None
             return symbol_ids.get((ns, path + formal[len(root):]))
 
-        for lhs, operands, net, node, line in bodies[target]:
+        for lhs, conditions, values, net, node, line, statement in bodies[target]:
             dest = resolve(lhs)
             if dest is None:
                 continue
-            sources = {sid for name in operands if (sid := resolve(name)) is not None and sid != dest}
-            if sources:
-                result.append([dest, sorted(sources), net, node, 'instance_st', line, i])
+            when = {sid for name in conditions if (sid := resolve(name)) is not None and sid != dest}
+            data = {sid for name in values if (sid := resolve(name)) is not None and sid != dest}
+            if when or data:
+                result.append([dest, sorted(when | data), net, node, 'instance_st', line, i])
+                if dependency_roles is not None:
+                    dependency_roles.append({'when': sorted(when), 'value': sorted(data), 'statement': statement})
     return result

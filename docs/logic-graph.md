@@ -4,7 +4,8 @@
 
 | 视图 | 可核对的事实 |
 | --- | --- |
-| 整机协作图 | 同一固定地址的跨程序写入和使用、步序门控、源码调用与任务挂载。各程序可在同一张图展开到原始网络。 |
+| 协作总览 | 行是写入程序，列是接收程序。单元格按完整地址去重，分别可看步序门控、接收状态对有实测的门控、全部跨程序读写。选择信号后按这两个程序分别显示端点。 |
+| 整机图纸 | 同一固定地址的跨程序写入和使用、步序门控、源码调用与任务挂载。各程序可在同一张图展开到原始网络。 |
 | 步序与观测 | 连续采样中的相邻变化，发生次数、采集 ID、原始样本索引及记录内毫秒时间。多个采集、共同断档及单通道缺测沿用入口一的边界。 |
 | 门控与源码网络 | 源码局部写点、原文、布尔层级、接线端口、静态候选路线和可能的其他写点。PLCopen 使用 body 内的 localId 和输出形参，Sysmac 使用单梯级输出端口，SMC2 使用 CLs/VLs 坐标连通关系。 |
 | 信号读写 | 显式实际操作数、线圈和 ST 的赋值及读取位置。核对声明后区分全局与程序局部。同名来源可能多于一个。 |
@@ -12,7 +13,9 @@
 
 整机图从左侧目录选择程序或信号。蓝色箭头从写入方指向信号，橙色箭头从信号指向接收方。使用“定位发起端 / 接收端”展开对应网络，或点证据明细查看所有可能端点。全部展开后纵向浏览整个工程，横移查看长梯级。“全部连线”为当前筛选范围中的每个信号或调用组分配独立通道，向左横移可浏览其余连线。缩放和滚动只改变可见范围。
 
-源码 LD 依端口还原为触点、线圈、功能块及正交支路。斜线表示取反；P / N 表示边沿；S / R 表示线圈置位 / 复位。数据引脚使用虚线。网络展开后，已解析的 ST 赋值各显示一条带相对行号的派生梯级，点选可核查原文。跨程序共享数据使用有向信号线。不同的图分别回答“条件如何接线”和“哪个程序向哪个程序提供信号”。[CODESYS 触点](https://content.helpme-codesys.com/en/CODESYS%20LD%20FBD/_cds_ld_element_contact.html) · [线圈](https://content.helpme-codesys.com/en/CODESYS%20LD%20FBD/_cds_ld_element_coil.html) · [Rockwell 梯形图手册，第 11–12 页](https://literature.rockwellautomation.com/idc/groups/literature/documents/pm/1756-pm008_-en-p.pdf)
+只共用电源轨的独立回路各占一行，带公共触点和分支的回路保持连通。源码 LD 依端口还原为触点、线圈、功能块及正交支路。斜线表示取反；P / N 表示边沿；S / R 表示线圈置位 / 复位。数据引脚使用虚线。网络展开后，已解析的 ST 赋值各显示一条带相对行号的派生梯级，点选可核查原文。跨程序共享数据使用有向信号线。不同的图分别回答“条件如何接线”和“哪个程序向哪个程序提供信号”。[CODESYS 触点](https://content.helpme-codesys.com/en/CODESYS%20LD%20FBD/_cds_ld_element_contact.html) · [线圈](https://content.helpme-codesys.com/en/CODESYS%20LD%20FBD/_cds_ld_element_coil.html) · [Rockwell 梯形图手册，第 11–12 页](https://literature.rockwellautomation.com/idc/groups/literature/documents/pm/1756-pm008_-en-p.pdf)
+
+梯级的串并联排版参考 STEP 7 的网络规则，地址索引参考 CODESYS 交叉引用中的读写类型。沿信号逐段展开能在大型顺序控制图中保留当前输出涉及的指令。[Siemens LAD 梯级](https://docs.tia.siemens.cloud/r/en-us/v21/creating-lad-programs/rungs-in-lad/basic-information-on-rungs-in-lad) · [CODESYS 交叉引用](https://content.helpme-codesys.com/en/CODESYS%20Development%20System/_cds_cmd_view_cross_reference_list.html) · [顺序控制程序的数据依赖图](https://www.jstage.jst.go.jp/article/sicetr/50/1/50_24/_article/-char/en)
 
 ## 对照规则
 
@@ -36,4 +39,6 @@
 | `plant.groups / routines / net_routine` | 源码的程序或定义、例程和网络归属，每个网络恰有一个归属。 |
 | `plant.signal_buses` | 跨单元同地址符号号、写方、读方、引用该信号的非实例化步序写点。只读共享量保留在符号索引。 |
 | `plant.call_links / port_bindings / task_links` | 调用点到唯一定义、该处可解析的形参与实参、任务挂载。复用同一模板的调用保留各自实例。 |
-| `plant.dependencies` | 每条为目标符号号、来源符号号列表、网络号、元件号、证据类型及 ST 相对行。实例专化的赋值追加调用点号，可分别打开调用方和被调方原文。可串联追踪通过同一赋值的条件或值，以及可解析的连线。对已声明的具名 ST 实参及有接线的图形实参，直接的形参赋值可按具体调用实例展开。库函数内部、动态别名和模板局部量保留在各自源码位置。 |
+| `plant.dependencies` | 每条为目标符号号、来源符号号列表、网络号、元件号、证据类型及 ST 相对行。实例专化的赋值追加调用点号，可分别打开调用方和被调方原文。可串联追踪通过同一赋值的条件或值，以及可解析的连线。标准运算块按已解析的输出端口追线，块执行状态和数值输出单独处理。对已声明的具名 ST 实参及有接线的图形实参，直接的形参赋值可按具体调用实例展开。库函数内部、动态别名和模板局部量保留在各自源码位置。 |
+| `plant.dependency_roles` | 与 `dependencies` 同索引。`when` 是影响写入的条件，`value` 是赋值取数，`value_enable` 是上游取数运算的使能。`enable` 标出内嵌 ST 外部使能，`statement` 区分同一行的多条赋值。普通线圈写入梯级布尔值，置位和复位线圈以梯级为动作条件。 |
+| `plant.dependency_boundaries` | 按目标符号、网络、写点、相对行列出在何处止于块输出、执行状态或未明确的输出引脚。查看器可定位对应元件。 |

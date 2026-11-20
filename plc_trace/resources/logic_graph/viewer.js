@@ -83,6 +83,7 @@ function indexData() {
 }
 
 function options() {
+  if (mode === 'overview') return [['all','程序 / 工位']];
   if (mode === 'plant') return [['all','全部单元与关系'],['groups','程序 / 设备单元'],['peer','程序间步序门控'],['guards','跨单元步序门控'],['signals','共享信号'],['call','调用关系'],['task','任务挂载']];
   if (mode === 'states') return [
     ['observed', '实测通道'],
@@ -116,6 +117,7 @@ function setupTab(m, reset = true) {
   }
   $('subset').value = choices[0][0];
   $('filter').placeholder = {
+    overview: '按程序或工位筛选',
     plant: '查找工位、例程归属或协作信号',
     states: '完整地址或部分名称',
     nets: '例程、编号或网络注释',
@@ -130,6 +132,7 @@ function listRows() {
   const q = $('filter').value.trim().toLowerCase(),
     group = $('subset').value;
   const match = s => s.toLowerCase().includes(q);
+  if (mode === 'overview') return Overview.listing(q);
   if (mode === 'plant') return Plant.listing(q,group);
   if (mode === 'states') return D.channels.flatMap((c, i) => (group === 'observed' && !c.samples) || (group ===
     'source' && !c.pairs.some(p => p.sites.length)) || !match(c.name) ? [] : [
@@ -196,10 +199,11 @@ function go(m, key, opts = {}, record = true) {
     para(target, '没有匹配的条目。');
     return;
   }
-  if (m === 'plant') Plant.scene(target,key);
+  if (m === 'overview') Overview.render(target,key,opts);
+  if (m === 'plant') Plant.scene(target,key,opts);
   if (m === 'states') stateView(target, D.channels[key], opts);
   if (m === 'nets') networkView(target, D.nets[key], opts);
-  if (m === 'symbols') symbolView(target, D.symbols[key]);
+  if (m === 'symbols') symbolView(target, D.symbols[key], key);
   if (m === 'project') projectView(target, key);
 }
 
@@ -496,11 +500,24 @@ function showSignals(parent, labels, chooseScope = false) {
   }
 }
 
-function gateFigure(parent, site) {
-  para(parent, '根据源码条件推导的逻辑梯级。串联表示 AND，并联表示 OR。悬停可读完整表达式。', 'muted');
-  const g = el('div', undefined, 'viewport');
-  g.append(LD.guard(site.guard_tree, site.channel + ' := ' + site.end));
-  parent.append(g);
+function gateFigure(parent, site, highlight = null) {
+  const label = site.st_line ? 'ST ' + site.st_line : (D.nets[site.net]?.language || '');
+  const controls = bar(parent);
+  controls.append(el('span',[label,'写入条件','XML L' + site.source_line].filter(Boolean).join(' · '),'drawing-caption'));
+  const viewport = el('div',undefined,'viewport');
+  const svg = LD.guard(site.guard_tree,site.channel + ' := ' + site.end,undefined,highlight);
+  const w = Number(svg.getAttribute('width')), h = Number(svg.getAttribute('height'));
+  let zoom = 1;
+  const scale = v => {
+    zoom = Math.max(0.12,Math.min(2.5,v));
+    svg.setAttribute('width',Math.ceil(w*zoom));
+    svg.setAttribute('height',Math.ceil(h*zoom));
+  };
+  controls.append(button('适宽',() => scale((viewport.clientWidth || w)/w)),
+    button('原尺寸',() => scale(1)),button('－',() => scale(zoom/1.25)),button('＋',() => scale(zoom*1.25)));
+  viewport.append(svg);
+  parent.append(viewport);
+  scale(Math.max(.85,Math.min(1,(viewport.clientWidth || w)/w)));
 }
 
 function siteCard(parent, index, first = false) {
@@ -512,8 +529,9 @@ function siteCard(parent, index, first = false) {
     if (panel.dataset.drawn) return;
     panel.dataset.drawn = '1';
     para(panel, s.scope);
-    para(panel, (s.guard_complete ? '已解析局部条件' : '局部条件含待解依赖') + ' · ' + s.kind, 'tag');
-    panel.append(el('pre', s.guard));
+    if (!s.guard_complete) para(panel,'部分条件待核','warn');
+    const raw = box(panel,'条件表达式');
+    raw.append(el('pre',s.guard));
     if (s.comment) para(panel, '源码注释　' + s.comment);
     const actions = bar(panel);
     if (s.net !== null && s.net !== undefined) actions.append(button('打开源码网络', () => go('nets', s.net, {
@@ -689,10 +707,11 @@ function nodeDetail(p, net, n, o) {
   p.replaceChildren();
   title(p, n.type + '　' + n.label);
   para(p, 'XML L' + n.line + (n.key !== undefined ? ' · 元件 ' + n.key : '') + ' · ' + net.scope, 'muted');
+  Lineage.writes(p,n,o.stLine);
   const extra = Object.entries(n).filter(([k]) => !['id', 'key', 'line', 'type', 'label', 'assignments',
     'limits', 'st', 'other_statements', 'operands'
   ].includes(k));
-  if (extra.length) para(p, extra.map(([k, v]) => k + '=' + (typeof v === 'object' ? JSON.stringify(v) : v))
+  if (extra.length) para(box(p,'元件属性'), extra.map(([k, v]) => k + '=' + (typeof v === 'object' ? JSON.stringify(v) : v))
     .join('　'));
   if (n.operands) {
     const t = el('table');
@@ -869,9 +888,10 @@ function networkView(p, net, o) {
   }
 }
 
-function symbolView(p, s) {
+function symbolView(p, s, sid) {
   p.append(el('h2', s.name));
   para(p, s.scope, 'muted');
+  Lineage.render(p,sid,() => {}, ref => go('nets',ref.net,{focus:ref.node,stLine:ref.st}));
   if (s.scope.startsWith('unresolved:')) para(p, '声明作用域未核实；这里列出同一例程内的同名出现位置。', 'warn');
   if (s.guard_sites && s.guard_sites.length) {
     const d = box(p, '此地址参与门控的写步位置 · ' + s.guard_sites.length);
@@ -1078,8 +1098,8 @@ async function start() {
     const list = sidebar();
     go(mode, list.length ? list[0][0] : null);
   };
-  setupTab('plant');
-  go('plant','home',{},false);
+  setupTab('overview');
+  go('overview','home',{},false);
 }
 start().catch(err => {
   $('detail').textContent = '图谱读取失败。请用支持本地 gzip 解码的当前版 Edge、Chrome 或 Firefox 打开。 ' + err.message;

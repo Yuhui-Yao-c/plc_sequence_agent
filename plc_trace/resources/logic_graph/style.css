@@ -268,3 +268,24 @@ tr {
 .plant-route small { color:#687f85; }
 
 .ld-key { display:flex; flex-wrap:wrap; gap:8px; padding:8px 2px; }
+.drawing-caption,.matrix-caption { color:#42616a; font-size:13px; }
+.matrix-wrap { overflow:auto; max-height:62vh; border:1px solid #b8caca; border-radius:5px; background:white; }
+.matrix-grid { width:max-content; min-width:100%; border-collapse:separate; border-spacing:0; font-variant-numeric:tabular-nums; }
+.matrix-grid td,.matrix-grid th { text-align:center; vertical-align:middle; white-space:nowrap; padding:3px 5px; line-height:1.2; border-bottom:1px solid #dee8e8; border-right:1px solid #e4ebeb; }
+.matrix-grid th { background:#edf3f3; color:#294b52; font:600 12px/1.2 Consolas,"Microsoft YaHei",monospace; }
+.matrix-grid thead th { position:sticky; top:0; z-index:2; padding:10px 6px; }
+.matrix-grid tr th:first-child { position:sticky; left:0; z-index:1; text-align:left; max-width:19em; white-space:normal; min-width:75px; }
+.matrix-grid thead th:first-child { z-index:3; }
+.matrix-grid td { min-width:35px; height:31px; color:#9caeb1; }
+.matrix-grid .matrix-self { background:#f0f3f3; color:#b5c3c5; }
+.matrix-grid .matrix-cell { min-width:27px; text-align:center; padding:3px 5px; font:600 13px/1.2 Consolas,monospace; background:#dbefeb; color:#085954; border:1px solid #8bbcb2; border-radius:3px; }
+.matrix-grid .matrix-cell:hover,.matrix-grid .matrix-cell.current,.matrix-grid .matrix-cell:focus-visible { background:#0e665e; color:white; border-color:#0a504d; }
+.matrix-pair { padding-top:8px; scroll-margin:16px; }
+.matrix-ends { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+.matrix-ends>section { min-width:0; padding:10px 12px; background:white; border:1px solid #c1d3d2; border-top:3px solid #327d87; border-radius:4px; }
+.matrix-ends>section+section { border-top-color:#ab733c; }
+.matrix-ends h4 { margin:1px 0 9px; overflow-wrap:anywhere; }
+.endpoint { width:100%; margin:3px 0; overflow-wrap:anywhere; font:13px/1.4 Consolas,"Microsoft YaHei",monospace; }
+.endpoint small { display:block; color:#48646b; margin-top:4px; }
+.matrix-ends .viewport { max-height:52vh; }
+@media(max-width:900px){ .matrix-ends {grid-template-columns:minmax(0,1fr);} }

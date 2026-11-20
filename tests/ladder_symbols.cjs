@@ -40,3 +40,17 @@ assert.equal(gate.children.filter(n=>n.attrs['data-symbol']==='contact').length,
 const xor=ld.guard(['xor',['term','A'],['term','B']],'Step := 20');
 assert.equal(xor.children.filter(n=>n.attrs['data-symbol']==='block').length,1);
 assert.equal(ld.draw(plan,()=>{},null,[-100,-100,-5,-5]).children.filter(n=>n.tag==='g').length,0);
+const railOnly = ld.layout(net.slice(0,5),[[0,'',1,'','control'],[0,'',2,'','control'],
+  [1,'',3,'','control'],[2,'',4,'','control']],'LD');
+assert.equal(railOnly.dividers.length,1);
+const railPaint = ld.draw(railOnly,()=>{},null);
+assert.equal(railPaint.children.filter(e=>e.attrs['data-node']===0).length,2);
+assert.equal(railPaint.children.filter(e=>'data-wire' in e.attrs).length,4);
+const branched = ld.layout(net.slice(0,5),[[0,'',1,'','control'],[1,'',2,'','control'],
+  [1,'',3,'','control'],[2,'',4,'','control']],'LD');
+assert(!branched.dividers?.length);
+const through = ld.guard(['term','TRUE'],'Target.WithALongVariableName[12] := SourceInput');
+assert(!through.children.some(n=>n.attrs['data-symbol']==='contact'));
+assert(through.children.some(n=>n.attrs['data-symbol']==='assignment'));
+const compare = ld.guard(['term','Value[2,1].Quality<>0'],'Next := 200');
+assert(compare.children.some(n=>n.attrs['data-symbol']==='compare' && n.children.some(c=>c.text==='<> 0')));

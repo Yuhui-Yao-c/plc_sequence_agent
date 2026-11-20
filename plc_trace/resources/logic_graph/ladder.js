@@ -114,7 +114,7 @@ const LD = (() => {
     }
   }
 
-  function layout(items, wires, language) {
+  function layoutCircuit(items, wires, language) {
     const layers = [],
       ranks = new Map(),
       pending = new Map(),
@@ -278,6 +278,60 @@ const LD = (() => {
     };
   }
 
+  // Independent rungs can share a rail. A shared contact, port or branch remains one circuit.
+  function layout(items, wires, language) {
+    if (!['LD','SMC2'].includes(language) || items.length < 2) return layoutCircuit(items,wires,language);
+    const rails = new Set(items.filter(n => kind(n,language) === 'rail').map(n => n.id));
+    const parents = new Map(items.filter(n => !rails.has(n.id)).map(n => [n.id,n.id]));
+    function root(id) {
+      while (parents.get(id) !== id) {
+        parents.set(id, parents.get(parents.get(id)));
+        id = parents.get(id);
+      }
+      return id;
+    }
+    for (const [a,,b] of wires)
+      if (parents.has(a) && parents.has(b)) parents.set(root(b),root(a));
+    const components = new Map(), byId = new Map(items.map(n => [n.id,n]));
+    function component(id) {
+      if (!components.has(id)) components.set(id,{ids:new Set(),wires:[]});
+      return components.get(id);
+    }
+    for (const id of parents.keys()) component(root(id)).ids.add(id);
+    const usedRails = new Set();
+    for (const w of wires) {
+      const a = w[0], b = w[2];
+      if (!byId.has(a) || !byId.has(b)) continue;
+      const c = component(parents.has(a) ? root(a) : parents.has(b) ? root(b) : 'rails');
+      c.wires.push(w);
+      for (const id of [a,b]) {
+        c.ids.add(id);
+        if (rails.has(id)) usedRails.add(id);
+      }
+    }
+    for (const r of rails) if (!usedRails.has(r)) component(r).ids.add(r);
+    if (components.size < 2) return layoutCircuit(items,wires,language);
+    const all = {points:new Map(),glyphs:[],wires:[],junctions:[],dividers:[],width:0,height:0};
+    for (const c of components.values()) {
+      const plan = layoutCircuit([...c.ids].map(id => byId.get(id)),c.wires,language);
+      const dy = all.height;
+      if (dy) all.dividers.push(dy - 5);
+      for (const [id,item] of plan.points) {
+        const v = {...item,y:item.y + dy};
+        all.glyphs.push([id,v]);
+        if (!all.points.has(id)) all.points.set(id,v);
+      }
+      for (const w of plan.wires) {
+        const [x,y,u,v] = w.bounds;
+        all.wires.push({...w,dy,bounds:[x,y + dy,u,v + dy]});
+      }
+      for (const b of plan.junctions) all.junctions.push({...b,y:b.y + dy});
+      all.width = Math.max(all.width,plan.width);
+      all.height += plan.height + 12;
+    }
+    return all;
+  }
+
   function draw(plan, open, focus, clip) {
     const visible = (a, b, c, d) => !clip || (a <= clip[2] && c >= clip[0] && b <= clip[3] && d >= clip[1]);
     const svg = sv('svg', {
@@ -289,8 +343,10 @@ const LD = (() => {
       role: 'img',
       'aria-label': '源码元件与端口接线'
     });
+    for (const y of plan.dividers || [])
+      if (visible(0,y,plan.width,y)) svg.append(path('M 4 ' + y + ' H ' + (plan.width-4),'#e1e9e9',{'stroke-width':1}));
     for (const {
-        w,
+        w, dy,
         route,
         bounds
       }
@@ -301,6 +357,7 @@ const LD = (() => {
           'data-wire': w[0] + '>' + w[2],
           'stroke-width': dataPin ? 1.3 : 2
         });
+      if (dy) wire.setAttribute('transform','translate(0 ' + dy + ')');
       if (dataPin) wire.setAttribute('stroke-dasharray', '4 3');
       wire.append(sv('title', {}, '#' + w[0] + ' ' + w[1] + ' → #' + w[2] + ' ' + (w[3] || '')));
       svg.append(wire);
@@ -312,7 +369,7 @@ const LD = (() => {
         r: 3,
         fill: b.role === 'pin' ? data : flow
       }));
-    for (const [id, v] of plan.points) {
+    for (const [id, v] of plan.glyphs || plan.points) {
       if (!visible(v.x - 105, v.y - v.h / 2 - 32, v.x + 105, v.y + v.h / 2 + 12)) continue;
       const g = sv('g', {
         transform: 'translate(' + v.x + ' ' + v.y + ')',
@@ -348,6 +405,35 @@ const LD = (() => {
     return svg;
   }
 
+  function textWidth(label) {
+    return Array.from(label).reduce((n,c) => n + (/[\u2e80-\uffff]/u.test(c) ? 13 : 7.6),0);
+  }
+  function fitLines(label,width,count) {
+    const lines = [];
+    let rest = label;
+    while (rest && lines.length < count) {
+      let cut = 0, at = 0, w = 0;
+      for (const c of rest) {
+        if (w + textWidth(c) > width) break;
+        w += textWidth(c);
+        cut += c.length;
+        if ('.[ /'.includes(c)) at = cut;
+      }
+      if (cut === rest.length) { lines.push(rest); break; }
+      if (lines.length === count-1) { lines.push(rest.slice(0, Math.max(1,cut-1)) + '…'); break; }
+      cut = at > cut / 2 ? at : Math.max(1,cut);
+      lines.push(rest.slice(0,cut));
+      rest = rest.slice(cut);
+    }
+    return lines;
+  }
+  function outputBox(target) {
+    const cut = target.indexOf(' := '), lhs = cut < 0 ? target : target.slice(0,cut);
+    const rhs = cut < 0 ? '' : ':= ' + target.slice(cut+4);
+    return {lhs,rhs,w:Math.max(158,Math.min(390,Math.ceil(Math.max(textWidth(lhs),textWidth(rhs)) + 26)))};
+  }
+  const guardWidth = (s,target) => s.w + outputBox(target).w + 62;
+
   function guardPlan(tree) {
     // Series and parallel are used only for AND/OR. Preserve the operator of
     // negated compound expressions and XOR instead of depicting them as OR.
@@ -365,21 +451,20 @@ const LD = (() => {
         repr).join(', ') + ')';
       const neg = t[0] === 'not' && t[1]?.[0] === 'term',
         atom = neg ? t[1] : t;
-      const label = repr(atom),
-        contact = atom[0] === 'term' && /^[\p{L}_][\p{L}\d_.\[\],]*$/u.test(label);
-      return {
-        op: contact ? 'contact' : 'block',
-        label: contact ? label : (neg ? 'NOT (' + label + ')' : label),
-        neg,
-        w: 214,
-        h: 72
-      };
+      const label = repr(atom), plain = atom[0] === 'term';
+      if (plain && !neg && /^TRUE$/i.test(label)) return {op:'through',label,w:68,h:76};
+      const comparison = plain && !neg && /^(.+?)\s*(<>|<=|>=|(?<![<>=!])=(?!=)|<|>)\s*([^<>=]+)$/u.exec(label);
+      const contact = plain && !/^(TRUE|FALSE)$/i.test(label) && /^[\p{L}_][\p{L}\d_.\[\],]*$/u.test(label);
+      const parts = comparison ? [comparison[1].trim(),comparison[2],comparison[3].trim()] : null;
+      const display = neg && !contact ? 'NOT (' + label + ')' : label;
+      const w = Math.max(155,Math.min(360,Math.ceil((parts ? Math.max(textWidth(parts[0]),textWidth(parts[2])) : textWidth(display)) + 48)));
+      return {op:parts ? 'compare' : contact ? 'contact' : 'block',label:display,parts,neg,opaque:atom[0] === 'opaque',w,h:86};
     }
     return shape(tree);
   }
 
-  function guard(tree, target, s = guardPlan(tree)) {
-    const width = s.w + 208,
+  function guard(tree, target, s = guardPlan(tree), highlight = null) {
+    const output = outputBox(target), width = guardWidth(s,target),
       height = s.h + 30;
     const svg = sv('svg', {
       xmlns: svgNS,
@@ -388,7 +473,7 @@ const LD = (() => {
       viewBox: '0 0 ' + width + ' ' + height,
       class: 'ladder-svg',
       role: 'img',
-      'aria-label': '从源码条件推导的逻辑梯级'
+      'aria-label': '写入条件梯形图'
     });
     const line = (x, y, u, v) => svg.append(path('M ' + x + ' ' + y + ' L ' + u + ' ' + v, flow));
 
@@ -416,12 +501,12 @@ const LD = (() => {
         line(k, y, x + a.w, y);
         for (const at of [j, k]) {
           line(at, centers[0], at, centers.at(-1));
-          svg.append(sv('circle', {
-            cx: at,
-            cy: y,
-            r: 3,
-            fill: flow
-          }));
+          const taps = new Set(centers);
+          for (const cy of new Set([...centers,y])) {
+            const degree = Number(taps.has(cy)) + Number(cy === y) +
+              Number(cy > centers[0]) + Number(cy < centers.at(-1));
+            if (degree >= 3) svg.append(sv('circle',{cx:at,cy,r:3,fill:flow}));
+          }
         }
         return;
       }
@@ -432,27 +517,25 @@ const LD = (() => {
         });
       g.append(sv('title', {}, a.label));
       svg.append(g);
-      if (a.op === 'contact') symbol(g, 'contact', {
-        label: a.label,
-        negated: a.neg
-      }, 44, {
-        left: [],
-        right: []
-      });
-      else {
-        g.append(sv('rect', {
-          x: -90,
-          y: -16,
-          width: 180,
-          height: 32,
-          fill: '#f3f8f7',
-          stroke: ink
-        }));
-        g.append(textAt(0, 4, short(a.label, 24), {
-          'text-anchor': 'middle'
-        }));
+      if (a.op === 'through') { line(x,y,x+a.w,y); return; }
+      const hit = highlight && (a.parts || [a.label]).some(v => v.toLowerCase() === highlight.toLowerCase());
+      const pad = a.op === 'contact' ? 65 : a.w / 2 - 12;
+      if (hit) g.append(sv('rect',{x:-a.w/2+3,y:-40,width:a.w-6,height:77,rx:4,fill:'#fff4d8'}));
+      if (a.op === 'contact') {
+        g.append(path('M -65 0 H -10 M 10 0 H 65 M -10 -13 V 13 M 10 -13 V 13',flow));
+        if (a.neg) g.append(path('M -15 15 L 15 -15',flow));
+        const lines=fitLines(a.label,a.w-12,2);
+        lines.forEach((t,i) => g.append(textAt(0,-20-14*(lines.length-1-i),t,{'text-anchor':'middle'})));
+      } else {
+        const hh = a.parts ? 32 : 23;
+        g.append(sv('rect',{x:-pad,y:-hh,width:2*pad,height:2*hh,rx:2,fill:'#f4f8f8',stroke:ink,
+          ...(a.opaque ? {'stroke-dasharray':'4 3'} : {})}));
+        const lines = a.parts ? [...fitLines(a.parts[0],2*pad-12,2),a.parts[1] + ' ' + a.parts[2]] :
+          fitLines(a.label,2*pad-12,3);
+        lines.forEach((t,i) => g.append(textAt(0,4 + (i - (lines.length-1)/2)*15,t,{
+          'text-anchor':'middle','font-weight':a.parts && i === lines.length-1 ? 700 : 400
+        })));
       }
-      const pad = a.op === 'contact' ? 65 : 90;
       line(x, y, mid - pad, y);
       line(mid + pad, y, x + a.w, y);
     }
@@ -462,17 +545,11 @@ const LD = (() => {
     render(s, 22, y);
     const x = 22 + s.w;
     line(x, y, x + 12, y);
-    svg.append(sv('rect', {
-      x: x + 12,
-      y: y - 18,
-      width: 158,
-      height: 36,
-      fill: '#e5f2ec',
-      stroke: flow
-    }), textAt(x + 91, y + 4, short(target, 23), {
-      'text-anchor': 'middle'
-    }));
-    svg.lastChild.append(sv('title', {}, target));
+    const g = sv('g',{'data-symbol':'assignment',transform:'translate(' + (x+12) + ' ' + y + ')'});
+    g.append(sv('title',{},target),sv('rect',{x:0,y:-33,width:output.w,height:66,rx:2,fill:'#e6f3ed',stroke:flow}));
+    const lines = [...fitLines(output.lhs,output.w-16,2),...fitLines(output.rhs,output.w-16,2)];
+    lines.forEach((t,i) => g.append(textAt(output.w/2,4 + (i-(lines.length-1)/2)*14,t,{'text-anchor':'middle','font-weight':i===0 ? 700 : 400})));
+    svg.append(g);
     return svg;
   }
   function legend(parent) {
@@ -496,6 +573,7 @@ const LD = (() => {
     draw,
     guard,
     guardPlan,
+    guardWidth,
     legend,
     kind
   };

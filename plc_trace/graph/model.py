@@ -264,8 +264,12 @@ def build(source, trace, interval=None, progress=lambda message: None):
     plant = build_plant(top.units, top.nets, symbols, sites, top.calls, top.tasks)
     plant['port_bindings'] = call_bindings(top.nets, top.calls, symbol_ids, top.namespace, top.formals)
     plant['coverage']['calls_with_bound_ports'] = len(plant['port_bindings'])
-    plant['dependencies'] = signal_dependencies(top.nets, symbol_ids, top.namespace, top.program_scopes)
-    bound = instance_dependencies(top, symbol_ids, symbol_keys, plant['port_bindings'])
+    roles, boundaries = [], []
+    plant['dependencies'] = signal_dependencies(top.nets, symbol_ids, top.namespace, top.program_scopes,
+                                                sites=sites, calls=top.calls, roles=roles, boundaries=boundaries)
+    plant['dependency_roles'] = roles
+    plant['dependency_boundaries'] = boundaries
+    bound = instance_dependencies(top, symbol_ids, symbol_keys, plant['port_bindings'], roles)
     plant['dependencies'].extend(bound)
     guards = {}
     plant['st_guards'] = []
@@ -279,6 +283,7 @@ def build(source, trace, interval=None, progress=lambda message: None):
                 item['guard_id'] = guards[raw]
     plant['coverage']['instance_witnesses'] = len(bound)
     plant['coverage']['dependency_witnesses'] = len(plant['dependencies'])
+    plant['coverage']['writes_with_interface_boundaries'] = len(boundaries)
     summary['plant'] = plant['coverage']
     return {'plant': plant, 'schema':'plc.logic_graph.v1','source_name':source.name,'trace_name':trace.name,
             'dialect':dialect,'summary':summary,'trace_audit':audit,'limits':discovery.issues,

@@ -27,7 +27,7 @@ const Plant = (() => {
     const observedSites = new Set();
     for (const c of D.channels)
       for (const e of c.pairs)
-        if (e.events)
+        if (e.events?.length)
           for (const i of e.sites) observedSites.add(i);
     catalog = p.signal_buses.map(b => {
       const gates = b.guard_groups.some(r => b.writers.some(w => r !== w));
@@ -68,7 +68,7 @@ const Plant = (() => {
       instance
     }));
     byKey = new Map(catalog.map(v => [v.key, v]));
-    selected = catalog[0]?.key;
+    selected = null;
   }
   const layer = (r, l) => l === 'all' || (l === 'peer' && r.peer) || (l === 'guards' && r.gates) || (l === 'signals' && r.kind ===
     'signal') || r.kind === l;
@@ -176,16 +176,26 @@ const Plant = (() => {
       (n?.storage && n.storage !== 'none' ? ' · ' + n.storage : '') + (n?.latch ? ' · ' + n.latch : '');
   }
 
-  function scene(parent, key) {
+  function scene(parent, key, opts = {}) {
     init();
     const p = D.plant,
       focusGroup = /^g\d+$/.test(key) ? Number(key.slice(1)) : null;
+    let pairFocus = opts.from != null && opts.to != null;
+    function scopedRefs(r) {
+      const refs = occurrences(r);
+      if (!pairFocus || r.key !== key || r.kind !== 'signal') return refs;
+      return refs.filter(ref => groupOf(ref.net) === (ref.k === 'from' ? opts.from : opts.to) &&
+        (opts.scope === 'all' || ref.k !== 'to') &&
+        (opts.scope !== 'observed' || ref.k !== 'guard' || observed.has(ref.site)));
+    }
+    const observed = opts.scope === 'observed' ? new Set(D.channels.flatMap(c => c.pairs.filter(e => e.events?.length).flatMap(e => e.sites))) : null;
     if (byKey.has(key)) {
       selected = key;
       allLines = false;
     }
+    if (key === 'home') { selected = null; allLines = false; }
     if (focusGroup != null) groupsOpen.add(focusGroup);
-    parent.append(el('h2', '整机协作与源码梯形图'));
+    parent.append(el('h2', '整机图纸'));
     LD.legend(parent);
     para(parent, p.groups.length + ' 个程序或定义 · ' + number(D.nets.length) + ' 个网络 · ' + number(p.coverage
         .cross_signals) + ' 个跨单元读写信号，其中 ' + number(p.coverage.cross_guard_signals) + ' 个进入其他单元的步序门控。',
@@ -268,7 +278,7 @@ const Plant = (() => {
                   shape
                 };
                 add(r, shape.h + 64);
-                maxWidth = Math.max(maxWidth, shape.w + 330);
+                maxWidth = Math.max(maxWidth, LD.guardWidth(shape,a.target + ' := ' + a.value) + 110);
                 const mark = 'line' + n.id + '/' + a.line;
                 anchors.set(mark, anchors.has(mark) ? null : r);
               }
@@ -309,7 +319,7 @@ const Plant = (() => {
       screen.setAttribute('data-relations', tracks.length);
       lineInfo.textContent = (routeIds.length ? '指令依赖　' + routeIds.map(sid => D.symbols[sid].name).join(' / ') :
         allLines ? '全部匹配关系（' + number(tracks.length) + ' 条通道，向左横移查看）' : '当前关系　' + (byKey.get(selected)
-          ?.label || '无可关联读写')) + '　　蓝色 → 写入 / 发起　橙色 → 读 / 门控 / 接收';
+          ?.label || '未选中')) + '　　蓝色 → 写入 / 发起　橙色 → 读 / 门控 / 接收';
     }
 
     function location(ref) {
@@ -349,7 +359,7 @@ const Plant = (() => {
     function endpoints(track) {
       if (track.ends) return track.ends;
       const unique = new Map();
-      for (const ref of occurrences(track.r)) {
+      for (const ref of scopedRefs(track.r)) {
         const pt = location(ref),
           k = pt.x + ',' + pt.y + ',' + ref.k,
           e = unique.get(k);
@@ -399,11 +409,11 @@ const Plant = (() => {
       selection.replaceChildren();
       overview.replaceChildren();
       if (!r) {
-        para(selection, '此工程没有可按声明和端点绑定的跨程序信号、调用或任务。');
+        if (!catalog.length) para(selection,'工程中未定位到跨程序信号、调用或任务挂载。');
         return;
       }
       title(selection, r.label);
-      const refs = occurrences(r),
+      const refs = scopedRefs(r),
         actions = terms(selection);
       const source = refs.find(a => a.k === 'from');
       const firstGroup = source?.net != null ? groupOf(source.net) : null;
@@ -422,7 +432,7 @@ const Plant = (() => {
         const others = r.kind === 'signal' && (r.b.writers.length > 1 || new Set([...r.b.readers, ...r.b
           .guard_groups
         ]).size > 1);
-        if (others) overview.append(el('small', '示例两端 · 全部位置见下方'));
+        if (others && !pairFocus) overview.append(el('small', '示例两端 · 全部位置见下方'));
       }
       if (source) actions.append(button('定位发起端', () => locate(source)));
       if (remote) actions.append(button('定位接收端', () => locate(remote)));
@@ -538,7 +548,7 @@ const Plant = (() => {
               y: a.y + 18,
               fill: '#4d656b',
               'font-size': 13
-            }, a.label + ' · 根据源码条件推导   ' + a.a.target + ' := ' + a.a.value);
+            }, a.label);
             const rung = LD.guard(p.st_guards[a.a.guard_id], a.a.target + ' := ' + a.a.value, a.shape);
             rung.setAttribute('x', left + 80);
             rung.setAttribute('y', a.y + 23);
@@ -696,6 +706,7 @@ const Plant = (() => {
         return;
       }
       routeIds = [];
+      pairFocus = false;
       selected = id;
       if (single) allLines = false;
       rebuild();
@@ -711,6 +722,7 @@ const Plant = (() => {
     controls.append(button('全部展开', () => {
       routeIds = [];
       allLines = true;
+      pairFocus = false;
       p.groups.forEach((_, i) => groupsOpen.add(i));
       p.routines.forEach((_, i) => routinesOpen.add(i));
       D.nets.forEach(n => netsOpen.add(n.id));
@@ -733,6 +745,7 @@ const Plant = (() => {
     select(controls, layers, allLayer, l => {
       routeIds = [];
       allLayer = l;
+      pairFocus = false;
       const first = catalog.find(r => layer(r, l));
       if (first) selected = first.key;
       else selected = null;
@@ -744,6 +757,7 @@ const Plant = (() => {
     controls.append(button('上一关系', () => cycle(-1)), button('下一关系', () => cycle(1)), button('全部连线', () => {
       routeIds = [];
       allLines = true;
+      pairFocus = false;
       rebuild();
       frame.scrollLeft = Math.max(0, (left - 260) * zoom);
       paint();
@@ -772,19 +786,19 @@ const Plant = (() => {
     rebuild();
     describe();
     if (focusGroup != null) jump('g' + focusGroup);
-    else if (!last && selected && byKey.get(selected)?.kind === 'signal') {
-      const refs = occurrences(byKey.get(selected));
+    else if ((pairFocus || !last) && selected && byKey.get(selected)?.kind === 'signal') {
+      const refs = scopedRefs(byKey.get(selected));
       const first = refs.find(a => a.k === 'guard' && a.node != null && D.nets[a.net].language === 'LD');
       if (first) locate(first);
-      else jump('g' + groupOf(refs[0].net));
+      else if (refs.length) jump('g' + groupOf(refs[0].net));
+      else paint();
     } else if (byKey.has(key)) {
-      const first = occurrences(byKey.get(key))[0];
+      const first = scopedRefs(byKey.get(key))[0];
       if (first?.net != null) jump('g' + groupOf(first.net));
       else paint();
     } else {
       frame.scrollLeft = last?.x ?? Math.max(0, (left - 120) * zoom);
-      frame.scrollTop = last?.y ?? (selected && catalog[0]?.b ? Math.max(0, anchors.get('g' + catalog[0].b
-        .writers[0]).y - 80) : 0);
+      frame.scrollTop = last?.y ?? 0;
       paint();
     }
     if (typeof ResizeObserver === 'function') {
