@@ -22,6 +22,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from plc_trace.output.time_breakdown import restore_annotation_details, write_breakdown
+from plc_trace.trace.branch_report import BRANCH_FILE, delivery_evidence
 from plc_trace.trace.trace_source_evidence import read_trace_evidence
 from plc_trace.output.station_identity import source_station_displays
 from plc_trace.output.utils import load_station_identity, infer_proc_name
@@ -360,7 +361,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
     out/proc_name default like the CLI: <proc_name>_步序采集表.xlsx beside the prediction.
     Raises ValueError on missing columns (caller decides how to report)."""
     run = run or os.path.dirname(prediction)
-    is_trace = sheet == 'trace步序采集表' or os.path.basename(prediction) == 'trace_collection_pairs.csv'
+    branch_mode = os.path.basename(prediction) == BRANCH_FILE
+    is_trace = branch_mode or sheet == 'trace步序采集表' or os.path.basename(prediction) == 'trace_collection_pairs.csv'
     indexed_stations = {}
     if is_trace:
         summary_path = os.path.join(run, 'trace_pairs_summary.json')
@@ -395,7 +397,8 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             vt = '' if pd.isna(vt) or str(vt).strip() in ('nan', 'None') else str(vt)
             desc_text = r.get('动作描述', '')
             desc_text = '' if pd.isna(desc_text) or str(desc_text).strip().lower() in ('nan', 'none') else str(desc_text).strip()
-            desc_map[(str(r['开始标签']), str(r['结束标签']))] = {
+            key = cell_str(r.get('分支ID', '')) if branch_mode else (str(r['开始标签']), str(r['结束标签']))
+            desc_map[key] = {
                 '动作描述': desc_text, '动作变量': vt,
                 **{field: cell_str(r.get(field, '')) for field in (
                     '描述来源', '描述状态', '推断依据', '证据等级', '注释补充', '证据',
@@ -456,11 +459,11 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             sha16.update(block)
     sha16 = sha16.hexdigest()[:16]
     if is_trace:
-        evidence = read_trace_evidence(run) or {}
-        if needs_annotation_details:
+        evidence = (delivery_evidence(run) if branch_mode else read_trace_evidence(run)) or {}
+        if needs_annotation_details and not branch_mode:
             restore_annotation_details(evidence, desc_map)
             desc_stats = pd.Series([d.get('描述来源', '') for d in desc_map.values()], dtype=str).value_counts().to_dict()
-        rendered = write_breakdown(workstations, desc_map, out, proc_name, sha16, run, evidence)
+        rendered = write_breakdown(workstations, desc_map, out, proc_name, sha16, run, evidence, branch_mode=branch_mode)
         return {'proc_name': proc_name, 'rows': len(df), 'action_variable_rows': hits,
                 'workstation_groups': workstations.ngroups, 'group_by': group_by,
                 'desc_sources': desc_stats, 'source_sha16': sha16, 'amap_keys': 0, 'out': out,

@@ -118,7 +118,7 @@ def _fact_text(item):
         detail = f'{role}「{data["text"]}」'
     elif category == 'timer_alarm':
         detail = f'定时器输出关联报警 {data["target"]}'
-    elif category == 'observed_pair':
+    elif category in ('observed_pair', 'source_branch'):
         return ''  # The Trace pair is already in the report's two label cells.
     else:
         detail = f'源码上下文 {category}'

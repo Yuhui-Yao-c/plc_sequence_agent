@@ -4,7 +4,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from functools import lru_cache
 
-from plc_trace.capture.extract_step_variables import _SourceScan
+from plc_trace.capture.step_discovery import discover_source_writes
 from plc_trace.graph.bindings import call_bindings, instance_dependencies
 from plc_trace.graph.dependencies import signal_dependencies
 from plc_trace.graph.plant import build_plant
@@ -106,7 +106,7 @@ def portable_literal(value):
 
 
 def scope_key(site):
-    return (site['scope'], tuple((c.get('scope'),c.get('instance'),c.get('source_line'))
+    return (site['scope'], tuple((c.get('scope'),c.get('instance'),c.get('source_line'),c.get('node'),c.get('offset'))
                                  for c in site.get('binding', ())))
 
 
@@ -143,12 +143,6 @@ def build(source, trace, interval=None, progress=lambda message: None):
     top.index_operands()
     locations = Locations(top.nets)
     progress('解析写步条件、分支和实例实参')
-    scan = _SourceScan(None, dialect, False)
-    scan.read(source)
-    if dialect == 'plcopen':
-        from plc_trace.capture.plcopen_discovery import discover
-    else:
-        from plc_trace.capture.sysmac_discovery import discover
     impaired = {i['net'] for i in top.issues if i.get('reason') in ('duplicate_source_id','missing_source_id','unknown_output_pin')}
     sites, seen, by_channel = [], set(), defaultdict(lambda: defaultdict(list))
     names = {}
@@ -158,7 +152,7 @@ def build(source, trace, interval=None, progress=lambda message: None):
         key = name.casefold()
         # Two instructions with the same guards remain two different write sites.
         ident = (key,a,b,scope_key(site),site.get('source_line'),site.get('st_line'),
-                 site.get('node'),site.get('locator'),site['guard'],site['kind'])
+                 site.get('node'),site.get('locator'),site.get('offset'),site['guard'],site['kind'])
         if ident in seen:
             return
         loc, node = locations.find(site)
@@ -173,7 +167,7 @@ def build(source, trace, interval=None, progress=lambda message: None):
         seen.add(ident)
         names[key] = name
         sites.append(item)
-    discovery = discover(source, scan, on_transition=witness)
+    discovery = discover_source_writes(source, dialect, witness)
     # Canonical IDs do not depend on hash-randomized traversal of candidates.
     sites.sort(key=lambda s:(s['channel'].casefold(),s['start'],s['end'],s['source_line'],s.get('st_line',0),
                              json.dumps(s,ensure_ascii=False,sort_keys=True)))

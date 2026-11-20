@@ -15,7 +15,8 @@ import pandas as pd
 
 from plc_trace.paths import RESOURCE_ROOT
 from plc_trace.output.gen_workstation_xlsx import load_action_map, var_of, load_var_docs
-from plc_trace.trace.trace_source_evidence import RELATION_TEXT, read_trace_evidence
+from plc_trace.trace.trace_source_evidence import RELATION_TEXT
+from plc_trace.trace.branch_report import BRANCH_FILE, delivery_evidence, row_key
 from plc_trace.description.trace_description_report import (
     action_evidence_text, annotation_evidence_text, annotation_supplement, waiting_role,
 )
@@ -275,26 +276,29 @@ def cmd_a(run):
     # Fallback to final_prediction_pairs.csv for older runs that only have it.
     # v9.28: trace mode produces trace_collection_pairs.csv — check it FIRST
     # so trace mode uses its own pairs, not the workflow.create candidate pairs.
-    src_csv = os.path.join(run, 'trace_collection_pairs.csv')
+    src_csv = os.path.join(run, BRANCH_FILE)
+    if not os.path.isfile(src_csv):
+        src_csv = os.path.join(run, 'trace_collection_pairs.csv')
     if not os.path.exists(src_csv):
         src_csv = os.path.join(run, 'prediction_collection_pairs.csv')
     if not os.path.exists(src_csv):
         src_csv = os.path.join(run, 'final_prediction_pairs.csv')
     df = pd.read_csv(src_csv, dtype=str, encoding='utf-8-sig', keep_default_na=False)
-    trace_evidence = read_trace_evidence(run)
+    trace_evidence = delivery_evidence(run)
     p = os.path.join(run, 'action_desc_a.csv')
     if trace_evidence is not None:
         rows = []
         for i, r in df.iterrows():
-            key = f"{r['开始标签']}|||{r['结束标签']}"
+            key = row_key(r)
             evidence = trace_evidence.get(key, {})
             desc = evidence.get('description', '')
             rows.append({
-                '行号': i, '开始标签': r['开始标签'], '结束标签': r['结束标签'],
+                '分支ID': r.get('分支ID', ''), '行号': i, '开始标签': r['开始标签'], '结束标签': r['结束标签'],
                 '动作变量': r.get('动作变量', ''), 'A档描述': desc,
                 '行性质': '源码步序' if desc else '待核验',
             })
-        pd.DataFrame(rows, columns=_A_FIELDS).to_csv(p, index=False, encoding='utf-8-sig')
+        fields = _A_FIELDS + (['分支ID'] if '分支ID' in df else [])
+        pd.DataFrame(rows, columns=fields).to_csv(p, index=False, encoding='utf-8-sig')
         print(f"Trace A档: {sum(bool(r['A档描述']) for r in rows)}/{len(rows)}行有对齐源码注释")
         return p
 
@@ -360,7 +364,7 @@ def cmd_build(run, batch_size=40):
     df = df[df['A档描述'].fillna('').str.strip() == ''].reset_index(drop=True)
     outdir = Path(run) / 'batches_desc'
     outdir.mkdir(exist_ok=True)
-    trace_evidence = read_trace_evidence(run)
+    trace_evidence = delivery_evidence(run)
     run_id = _description_run_id(run)
     if trace_evidence is not None:
         return _build_trace_batches(df, outdir, trace_evidence, batch_size, run_id)
@@ -394,7 +398,7 @@ def cmd_build(run, batch_size=40):
             gi = full_idx[0] if full_idx else 0
             # v9.29: id uses stable label key "start|||end" so result.json survives
             # re-runs even if row order shifts.  rid (行号) kept for review display.
-            label_key = f"{r['开始标签']}|||{r['结束标签']}"
+            label_key = row_key(r)
             toks = _tokens(r['动作变量'])
             tdocs = []
             for t in toks:
@@ -437,7 +441,7 @@ def _build_trace_batches(df, outdir, evidence, batch_size, run_id):
         raise ValueError('B档batch_size须大于0')
     rows = []
     for _, row in df.iterrows():
-        key = f"{row['开始标签']}|||{row['结束标签']}"
+        key = row_key(row)
         info = evidence.get(key, {})
         context = info.get('description_context', {})
         if context.get('schema') != TRACE_CONTEXT_SCHEMA:
@@ -562,7 +566,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
     rows, review = [], []
     for row in a.to_dict('records'):
         candidate = {}
-        key = f"{row['开始标签']}|||{row['结束标签']}"
+        key = row_key(row)
         info = evidence.get(key, {})
         desc, kind, refs = info.get('description', ''), row['行性质'], info.get('description_refs', [])
         source = info.get('description_source', '') or '待核验'
@@ -596,7 +600,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
                       else RELATION_TEXT.get(relation, '缺少Trace源码证据，需重跑'))
             counts['unresolved_rows'] += 1
         wait, wait_ref = waiting_role(info, row['开始标签'], candidate, results.get(key))
-        record = {k: row[k] for k in ('行号', '开始标签', '结束标签', '动作变量')}
+        record = {k: row[k] for k in ('行号', '开始标签', '结束标签', '动作变量', '分支ID') if k in row}
         rows.append({
             **record, '动作描述': desc, '行性质': kind, '描述来源': source,
             '描述状态': status, '证据引用': '; '.join(refs),
@@ -608,7 +612,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
         })
         if reason:
             review.append({**record, '描述状态': status, '原因': reason})
-    fields = ['行号', '开始标签', '结束标签', '动作变量']
+    fields = ['行号', '开始标签', '结束标签', '动作变量'] + (['分支ID'] if '分支ID' in a else [])
     out = run / 'action_desc_final.csv'
     columns = fields + ['动作描述', '行性质', '描述来源', '描述状态', '证据引用', '推断依据', '证据等级', '注释补充', '证据', '等待判定', '等待依据', '待核原因']
     pd.DataFrame(rows, columns=columns).to_csv(out, index=False, encoding='utf-8-sig')
@@ -627,7 +631,7 @@ def _validate_trace(run, a, evidence, allowed, stats):
 def cmd_validate(run, *, stats=None):
     """Validate the current batch protocol and produce descriptions and review."""
     a = pd.read_csv(os.path.join(run, 'action_desc_a.csv'), dtype=str, encoding='utf-8-sig', keep_default_na=False)
-    evidence = read_trace_evidence(run)
+    evidence = delivery_evidence(run)
     if evidence is not None and all(info.get('description_context') or not info.get('b_evidence')
                                     or info.get('description') for info in evidence.values()):
         return _validate_trace(run, a, evidence, set(), stats)
@@ -676,7 +680,7 @@ def cmd_validate(run, *, stats=None):
                 words.append(d['word'])
                 actions.append(d['action'])
         rid = str(r['行号'])
-        label_key = f"{r['开始标签']}|||{r['结束标签']}"
+        label_key = row_key(r)
         lex = (toks, words, actions)
         row_lex[label_key] = lex
         row_lex_by_rid[rid] = lex

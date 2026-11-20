@@ -54,7 +54,7 @@ _ST_OPERATOR = re.compile(r'\(|\)|:=|=>')
 _OUTPUT_END = re.compile(r'\s*[,)]')
 
 
-def _executable_text(text):
+def _executable_text(text, *, keep_positions=False):
     """Keep tokens separated when removing PLC comments and string literals."""
     position = 0
     while match := _IGNORED.search(text, position):
@@ -69,6 +69,8 @@ def _executable_text(text):
                     break
             else:
                 return
+        if keep_positions:
+            yield " " * (position - match.start())
     yield text[position:]
 
 

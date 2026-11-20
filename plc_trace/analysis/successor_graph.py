@@ -195,11 +195,65 @@ class STParser:
         self.strict=strict
         self.source = s if retain_source else None
         self.statements = []
+        self.dispatch_conditions = {}
+        self.arm_conditions = {}
+        self.call_guards = {}
+        self.frames = {}  # statement offset -> enclosing (kind, decision, arm, selector)
         tokens = list(_st_tokens_with_spans(s)) if retain_source else []
         self.spans = [span for _, span in tokens]
         self.ts = [token for token, _ in tokens] if retain_source else st_tokens(s)
         self.i=0;self.writes=[];self.actions=[];self.skipped=[]
         self.condition_parser=condition_parser or parse
+
+    def operating_condition(self, offset, selector):
+        for kind, decision, _, name in reversed(self.frames.get(offset, ())):
+            if kind == 'case' and name.casefold() == selector.casefold():
+                return self.dispatch_conditions[decision]
+        return TRUE
+
+    def selector_decisions(self, offset, name):
+        from plc_trace.analysis.boundary_logic import constrained_states
+        result = []
+        for kind, decision, arm, var in self.frames.get(offset, ()):
+            if kind == 'case' and var.casefold() == name.casefold():
+                result.append(decision)
+            elif kind == 'if' and any(constrained_states(self.arm_conditions[arm], {name.casefold()})):
+                result.append(decision)
+        return tuple(result)
+
+    def staged_writes(self, statements, same_type):
+        """Resolve a final scalar commit from a typed temporary in this ST evaluation."""
+        self.commit_sites = {}
+        from plc_trace.source.source_expressions import valid_scalar
+        if not statements or any(skip['reason'] != 'st_expression_assignment_unmodeled_effects'
+                                 or not valid_scalar(skip['stmt'].partition(':=')[2]) for skip in self.skipped):
+            return statements
+        state, temporary, _, commit, _ = statements[-1]
+        if not re.fullmatch(IDENT, temporary) or state.casefold() == temporary.casefold() or not same_type(state, temporary):
+            return statements
+        # A leading default (next := current), one CASE on current, and the final
+        # commit rule out an old retained value or an intervening unconditional write.
+        temporary = temporary.casefold()
+        prefix = self.frames.get(commit, ())
+        definitions = [r for r in statements[:-1] if r[0].casefold() == temporary]
+        if not definitions or definitions[0][1].strip().casefold() != state.casefold():
+            return statements
+        if self.frames.get(definitions[0][3], ()) != prefix or any(r[0].casefold() == state.casefold() for r in statements[:-1]):
+            return statements
+        rewritten = {}
+        decision = None
+        for _, rhs, gate, pos, note in definitions[1:]:
+            frames = self.frames.get(pos, ())
+            rest = frames[len(prefix):]
+            if (frames[:len(prefix)] != prefix or not rest or rest[0][0] != 'case'
+                    or rest[0][3].casefold() != state.casefold() or decision not in (None, rest[0][1])):
+                return statements
+            decision = rest[0][1]
+            rewritten[pos] = (state, rhs, gate, pos, note)
+        if not rewritten:
+            return statements
+        self.commit_sites = {pos: {'temporary': definitions[0][0], 'commit_offset': commit} for pos in rewritten}
+        return [rewritten.get(row[3], row) for row in statements[:-1] if row is not definitions[0]]
 
     def branch_note(self, inherited):
         if self.source is None or self.i == len(self.ts):
@@ -237,32 +291,48 @@ class STParser:
                 if n is None:return None
                 vals.append(n)
         return j+1,vals
-    def seq(self,guard=TRUE,stops=(),case_context=False,note=None):
+    def seq(self,guard=TRUE,stops=(),case_context=False,note=None,frames=()):
         while self.i<len(self.ts) and not self.is_(*stops):
             if case_context and self.case_label():return
             if self.is_(';'):self.pop();continue
             if self.is_('IF'):
+                decision = self.i
+                def arm(position, condition):
+                    if self.source is not None:
+                        self.arm_conditions[self.spans[position][0]] = condition
+                    return frames + (('if', decision, position, ''),)
                 self.pop();cond=self.condition_parser(self.until('THEN'));seen=cond
                 # case_context must survive nested IF/ELSIF/ELSE bodies: a CASE
                 # branch label after an (unclosed) inner IF is a branch boundary,
                 # never a statement.
-                self.seq(combine('and',guard,cond),('ELSIF','ELSE','END_IF'),case_context,self.branch_note(note))
+                self.seq(combine('and',guard,cond),('ELSIF','ELSE','END_IF'),case_context,self.branch_note(note),arm(decision, cond))
                 while self.is_('ELSIF'):
+                    position = self.i
                     self.pop();cond=self.condition_parser(self.until('THEN'))
-                    self.seq(combine('and',guard,negate(seen),cond),('ELSIF','ELSE','END_IF'),case_context,self.branch_note(note))
+                    self.seq(combine('and',guard,negate(seen),cond),('ELSIF','ELSE','END_IF'),case_context,self.branch_note(note),arm(position, combine('and', negate(seen), cond)))
                     seen=combine('or',seen,cond)
-                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_IF',),case_context,self.branch_note(note))
+                if self.is_('ELSE'):
+                    position = self.i
+                    self.pop()
+                    self.seq(combine('and',guard,negate(seen)),('END_IF',),case_context,self.branch_note(note),arm(position, negate(seen)))
                 self.pop('END_IF')
             elif self.is_('CASE'):
+                decision = self.i
                 self.pop();var=symbol(self.until('OF'))
                 if not re.fullmatch(IDENT,var):raise WireError('ST computed CASE selector')
+                if self.source is not None:
+                    self.dispatch_conditions[self.spans[decision][0]] = guard
                 seen=FALSE
                 while not self.is_('ELSE','END_CASE'):
                     lab=self.case_label()
                     if not lab:raise WireError('ST invalid CASE label')
+                    position = self.i
                     self.i,vals=lab;cond=combine('or',*(Expr('eq',(var,v)) for v in vals));seen=combine('or',seen,cond)
-                    self.seq(combine('and',guard,cond),('ELSE','END_CASE'),True,self.branch_note(note))
-                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_CASE',),True,self.branch_note(note))
+                    self.seq(combine('and',guard,cond),('ELSE','END_CASE'),True,self.branch_note(note),frames + (('case', decision, position, var),))
+                if self.is_('ELSE'):
+                    position = self.i
+                    self.pop()
+                    self.seq(combine('and',guard,negate(seen)),('END_CASE',),True,self.branch_note(note),frames + (('case', decision, position, var),))
                 self.pop('END_CASE')
             elif self.is_('FOR','WHILE','REPEAT','JMP','RETURN','EXIT','CONTINUE','GOTO'):
                 # RETURN blocks: statements after it are unreachable this scan;
@@ -282,11 +352,14 @@ class STParser:
                     if stmt.upper()=='RETURN':reason='st_return_no_direct_state_effect'
                     elif '(' in stmt:reason='st_call_may_write_state'
                     else:reason='st_opaque_statement_may_write_state'
+                    if self.source is not None and reason == 'st_call_may_write_state':
+                        self.call_guards[self.spans[begin][0]] = guard
                     self.skipped.append({'token':begin,'reason':reason,'stmt':stmt[:200]})
                     continue
                 lhs=symbol(stmt.split(':=',1)[0]);rhs=stmt.split(':=',1)[1].strip()
                 if self.source is not None:
                     offset = self.spans[begin][0]
+                    self.frames[offset] = tuple((k, self.spans[d][0], self.spans[a][0], v) for k, d, a, v in frames)
                     statement = self.source[offset:self.spans[self.i - 1][0]]
                     self.statements.append((lhs, statement.split(':=', 1)[1].strip(), guard, offset, note))
                 if rhs.upper() in ('TRUE','FALSE'):
@@ -407,7 +480,7 @@ def write_graph(source,out,model=None):
     rows=[{**r,'path':';'.join(r['path'])} for r in graph['transitions']]
     fields=['id','scope','binding_scope','body','variable','from','to','guard','guard_complete','evidence','path','timing_proof']
     with (out/'source_transition_edges.csv').open('w',encoding='utf-8-sig',newline='') as f:
-        w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
+        w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(rows)
     if graph.get('adapter') in ('smc2','omron_iec61131_10'):
         from plc_trace.analysis.boundary_normalizer import write_csv
         write_csv(out/'source_state_inventory.csv',graph.get('state_observations',[]))

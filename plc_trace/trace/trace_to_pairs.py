@@ -640,7 +640,7 @@ PAIR_FIELDS = [
 
 
 def generate(trace_path, run, source=None, proc_name=None,
-             idle_threshold_ms=5000, *, pattern=None, sample_interval_ms=None):
+             idle_threshold_ms=5000, *, pattern=None, sample_interval_ms=None, action_branches=False, branch_index=None):
     """Run the full trace → pairs extraction.
 
     Parameters
@@ -993,6 +993,9 @@ def generate(trace_path, run, source=None, proc_name=None,
             'summary': str(run / 'trace_pairs_summary.json'),
         },
     }
+    if action_branches:
+        from plc_trace.trace.branch_report import prepare
+        summary['action_branches'] = prepare(run, source, rows, jump_rows, source_index, variables, branch_index)
     (run / 'trace_pairs_summary.json').write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
 

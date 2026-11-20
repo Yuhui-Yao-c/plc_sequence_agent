@@ -8,6 +8,7 @@ verbatim in guard text, can never anchor a positive state, and count as
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from collections import defaultdict
 import re
 from typing import Iterable
 
@@ -141,6 +142,24 @@ def canonical(s: str) -> str:
 def comparisons(x: Expr) -> list[Expr]:
     if x.kind in ('eq','ne'): return [x]
     return [a for child in x.args if isinstance(child,Expr) for a in comparisons(child)]
+
+def constrained_states(guard, watched):
+    anchors = defaultdict(set)
+    atoms = comparisons(guard)
+    for atom in atoms:
+        name, number = atom.args
+        if atom.kind == 'eq' and name.casefold() in watched:
+            anchors[name.casefold()].add(number)
+    for name, values in anchors.items():
+        # A branch that can also run outside these equality values provides
+        # no unambiguous start state. In particular, preserve OR bypasses.
+        other = max(a.args[1] for a in atoms if a.args[0].casefold() == name) + 1
+        if substitute(guard, name, other) != FALSE:
+            continue
+        for value in sorted(values):
+            if compatible(guard, name, value, check_remaining=True):
+                yield name, value
+
 
 def positive_states(x: Expr) -> tuple[str,set[int]] | None:
     xs=list(x.args) if x.kind=='or' else [x]

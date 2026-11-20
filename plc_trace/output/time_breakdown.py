@@ -1,4 +1,5 @@
 """Render the entry-one time breakdown. All row facts are keyed by both Trace labels."""
+import csv
 import json
 import re
 from collections import Counter, defaultdict
@@ -15,6 +16,7 @@ from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.hyperlink import Hyperlink
 
 from plc_trace.description.trace_description_report import annotation_evidence_text, annotation_supplement, waiting_role
+from plc_trace.trace.branch_report import OBSERVATIONS_FILE, EVIDENCE_FILE as BRANCH_EVIDENCE
 from plc_trace.trace.sample_continuity import GAP_FILE
 from plc_trace.trace.trace_source_evidence import EVIDENCE_FILE, RELATION_TEXT
 
@@ -130,6 +132,12 @@ def _header(ws, proc, digest):
 def _evidence(pair, desc, info, audits):
     start, end = pair['开始标签'], pair['结束标签']
     obs = f'Trace 观测 {start} → {end}'
+    if pair.get('分支ID'):
+        obs = f"{pair['本次状态']}　{start} → {end}"
+        obs += f"\n源码写点 {pair['分支ID']}　{pair['源码位置']}\n{pair['收录依据']}"
+        for ref in info.get('witnesses', ()):
+            obs += (f"\n关联实测 {ref['start']} → {ref['end']}，采集 {ref['recording']}，样本 {ref['sample_index']}"
+                    + (f"，判断 {ref['decision']}" if ref.get('decision') else ''))
     if count := pair.get('发生次数'):
         obs += f'，出现 {count} 次'
     if pair.get('有效计时次数') not in (None, ''):
@@ -248,7 +256,7 @@ def _component_blocks(groups, row_owners):
         channels = sorted(rows.groupby('_步序变量', sort=False), key=lambda group: _channel_sort(group[0]))
         for channel, records in channels:
             pairs = records.fillna('').to_dict('records')
-            for owner, batch in groupby(pairs, key=lambda p: row_owners.get((p['开始标签'], p['结束标签']))):
+            for owner, batch in groupby(pairs, key=lambda p: row_owners.get(p.get('分支ID') or (p['开始标签'], p['结束标签']))):
                 blocks.append((channel, owner, list(batch)))
         station_blocks.append((station, blocks))
         for channel, owner, _ in blocks:
@@ -304,7 +312,7 @@ def _remark(pair, desc, info, owner, role):
         direction = '上游供料' if role == '待料' else '下游接料'
         notes.append(f'等待{direction}。' if not desc.get('描述来源', '').startswith('B档')
                      else f'推断为等待{direction}，请核对。')
-    if str(pair.get('有效计时次数')) == '0':
+    if str(pair.get('有效计时次数')) == '0' and pair.get('本次状态') != '本次未观测':
         notes.append('进入本步的时刻未采到，时长留空。')
     if int(pair.get('缺口后未计时次数') or 0):
         notes.append(f'恢复采样后有 {pair["缺口后未计时次数"]} 次仅计跳变，见「采样缺口」。')
@@ -359,10 +367,48 @@ def _write_sampling_gaps(book, run):
     ws.auto_filter.ref = f'A2:K{ws.max_row}'
 
 
-def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
+def _observation_sheets(book, run):
+    path = Path(run) / OBSERVATIONS_FILE
+    candidates = json.loads((Path(run) / BRANCH_EVIDENCE).read_text(encoding='utf-8'))['candidates']
+    with path.open(encoding='utf-8-sig', newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    fields = ('构成要素', '开始标签', '结束标签', '发生次数', '有效计时次数', '中位数时长ms',
+              '分支判定', '样例采集ID', '样例跳变索引', '分支ID')
+    for title, selected, headers in (
+            ('实测跳变', rows, fields),
+            ('分支待核', (r for r in rows if r['分支判定'] != '分支已观测' or r['待核出口']),
+             (*fields[:7], '候选写点及位置', '待核出口', '工况核对信号'))):
+        ws = book.create_sheet(title)
+        for col, name in enumerate(headers, 1):
+            c = _cell(ws, 1, col, name)
+            c.fill = FILLS['表头']
+            ws.column_dimensions[c.column_letter].width = 68 if name == '候选写点及位置' else 30 if col in (2, 3, 7) else 21
+        for i, row in enumerate(selected, 2):
+            for col, name in enumerate(headers, 1):
+                value = row.get(name, '')
+                if name == '候选写点及位置':
+                    items = (candidates[ident] for ident in row['候选写点'].split('、') if ident)
+                    value = '\n'.join(filter(None, [*(f"{e['from']} → {e['to']}　{e['location']}" for e in items), row.get('待核写入')]))
+                elif name in ('发生次数', '有效计时次数', '中位数时长ms', '样例跳变索引') and value:
+                    value = float(value)
+                cell = _cell(ws, i, col, value if value != '' else None)
+                if name == '候选写点及位置':
+                    cell.alignment = Alignment(vertical='top', wrap_text=True)
+        ws.freeze_panes = 'D2'
+        ws.auto_filter.ref = ws.dimensions
+
+
+def write_breakdown(groups, descriptions, out, proc, digest, run, evidence, *, branch_mode=False):
     book = Workbook()
     sheet = book.active
     _header(sheet, proc, digest)
+    columns = COLUMNS
+    if branch_mode:
+        columns += (('本次状态', 27), ('转移条件', 52), ('关联实测跳变', 30), ('源码位置', 52), ('适用工况', 45))
+        for col, (heading, width) in enumerate(columns[len(COLUMNS):], len(COLUMNS) + 1):
+            cell = _cell(sheet, 2, col, heading)
+            cell.fill = FILLS['表头']
+            sheet.column_dimensions[cell.column_letter].width = width
     audits = {name for name in ('trace_jumps.csv', 'trace_segments.csv', EVIDENCE_FILE) if (Path(run) / name).is_file()}
     manifest = Path(run) / 'workflow_manifest.json'
     native_source = False
@@ -371,7 +417,7 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
             native_source = json.load(stream).get('extraction', {}).get('format') == 'omron_iec61131_10'
     owners, annotation_owners = {}, {}
     for key, info in evidence.items():
-        pair_key = tuple(key.split('|||', 1))
+        pair_key = key if branch_mode else tuple(key.split('|||', 1))
         owners[pair_key], annotation_owners[pair_key] = _row_owners(info, native_source)
     station_blocks, components = _component_blocks(groups, owners)
     review_rows = b_rows = measured = 0
@@ -388,8 +434,9 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
             first = r
             for pair in records:
                 start, end = pair['开始标签'], pair['结束标签']
-                desc = descriptions.get((start, end), {})
-                info = evidence.get(f'{start}|||{end}', {})
+                key = pair.get('分支ID') or (start, end)
+                desc = descriptions.get(key, {})
+                info = evidence.get(key if branch_mode else f'{start}|||{end}', {})
                 text = desc.get('动作描述', '')
                 status, source = desc.get('描述状态', ''), desc.get('描述来源', '')
                 origin = ''
@@ -412,16 +459,18 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
                     missing_times += 1
                 values = {4: text or None, 5: origin or None, 6: ms, 8: start, 9: end,
                           13: 1 if role else None,
-                          14: _remark(pair, desc, info, annotation_owners.get((start, end)), role),
+                          14: _remark(pair, desc, info, annotation_owners.get(key), role),
                           15: _evidence(pair, desc, info, audits)}
-                for col, (heading, width) in enumerate(COLUMNS, 1):
+                if branch_mode:
+                    values.update({16: pair['本次状态'], 17: pair['原始条件'], 18: pair['关联实测'], 19: pair['源码位置'], 20: pair['适用工况']})
+                for col, (heading, width) in enumerate(columns, 1):
                     value = values.get(col)
                     cell = _cell(sheet, r, col, value)
                     if col >= 4 and role in ('待料', '堵料'):
                         cell.fill = FILLS[role]
                     if col in (2, 3, 6, 7):
                         cell.number_format = '0.00##'
-                    if col in (4, 14, 15):
+                    if col in (4, 14, 15, 17, 18, 19, 20):
                         cell.alignment = LEFT
                     if col == 5 and origin == 'LLM':
                         cell.font = RED
@@ -444,9 +493,11 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
         subtotal = '本工位各行停留中位数之和，不能作为单次循环时间。'
         if missing_times:
             subtotal = f'有 {missing_times} 行缺少完整计时，小计仅含有时长的行。'
-        for col in range(2, len(COLUMNS) + 1):
-            cell = _cell(sheet, r, col, {4: '总时长', 6: round(total, 4) if total is not None else None,
-                                        14: subtotal}.get(col))
+        values = {4: '总时长', 6: round(total, 4) if total is not None else None, 14: subtotal}
+        if branch_mode:
+            values = {4: '工位分支汇总', 14: '各行对应不同工况，时长按分支分别统计。'}
+        for col in range(2, len(columns) + 1):
+            cell = _cell(sheet, r, col, values.get(col))
             cell.font = BOLD
             if col == 6:
                 cell.number_format = '0.00##'
@@ -457,6 +508,8 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence):
             label.fill, label.font = FILLS['构成要素'], BOLD
         sheet.row_dimensions[r].height = 13.8
         r += 1
+    if branch_mode:
+        _observation_sheets(book, run)
     _write_sampling_gaps(book, run)
     book.save(out)
     return {'trace_review_rows': review_rows, 'b_desc_rows': b_rows,

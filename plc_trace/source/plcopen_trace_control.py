@@ -8,12 +8,13 @@ import re
 from lxml import etree
 
 from plc_trace.analysis.atomic_boundaries import stable_id
+from plc_trace.analysis.boundary_logic import constrained_states as _states
 from plc_trace.analysis.boundary_logic import (IDENT, FALSE, TRUE, BoundarySyntaxError, Expr, combine,
-                            comparisons, compatible, negate, substitute, symbol)
+                            comparisons, compatible, integer, negate, substitute, symbol)
 from plc_trace.analysis.fb_transport import bindings, bound_expr, interface, required_signals
 from plc_trace.source.source_expressions import (DECIMAL, INTEGER_BOUNDS, INTEGER_OPERATORS, combine_wiring,
                                 required_atoms, source_condition, state_write_value)
-from plc_trace.analysis.successor_graph import STParser, WireBody, WireError, own_expr, owner, pin, pins, tag, text
+from plc_trace.analysis.successor_graph import STParser, WireBody, WireError, connections, own_expr, owner, pin, pins, tag, text
 
 ERRORS = (WireError, BoundarySyntaxError)
 _COMPARATORS = {'EQ': '=', 'NE': '<>', 'GE': '>=', 'GT': '>', 'LE': '<=', 'LT': '<',
@@ -248,6 +249,33 @@ class EvidenceWire(WireBody):
         }
         return gate
 
+    def selector_ports(self, control, actuals):
+        """Identity of a physical EQ output on necessary series wiring. A bypass breaks the proof."""
+        ports, seen = [], set()
+        refs = connections(control)
+        while len(refs) == 1:
+            ref, port = refs[0]
+            if ref in seen or ref not in self.nodes:
+                break
+            seen.add(ref)
+            node = self.nodes[ref]
+            if tag(node) == 'contact':
+                refs = connections(next((x for x in node if tag(x) == 'connectionPointIn'), None))
+                continue
+            if tag(node) != 'block' or port.upper() == 'ENO' or node.get('typeName', '').upper() not in ('EQ', '=', '=='):
+                break
+            data = [p for p in pins(node, 'inputVariables') if p.get('formalParameter', '').upper() != 'EN']
+            if len(data) == 2:
+                try:
+                    left, right = (self.value(p) for p in data)
+                    for address, literal in ((left, right), (right, left)):
+                        if re.fullmatch(IDENT, address) and (number := integer(literal)) is not None:
+                            ports.append((bound_expr(address, actuals), number, ref, port.upper()))
+                except ERRORS:
+                    pass
+            refs = connections(pin(node, 'inputVariables', 'EN'))
+        return tuple(ports)
+
     def dependencies(self, guard):
         raw = guard.text()
         return tuple(value for key, value in self.output_provenance.items() if key in raw)
@@ -399,24 +427,6 @@ def _numeric_conditions(guard, state_variable):
     return dict(terms)
 
 
-def _states(guard, watched):
-    anchors = defaultdict(set)
-    atoms = comparisons(guard)
-    for atom in atoms:
-        name, number = atom.args
-        if atom.kind == 'eq' and name.casefold() in watched:
-            anchors[name.casefold()].add(number)
-    for name, values in anchors.items():
-        # A branch that can also run outside these equality values provides
-        # no unambiguous start state. In particular, preserve OR bypasses.
-        other = max(a.args[1] for a in atoms if a.args[0].casefold() == name) + 1
-        if substitute(guard, name, other) != FALSE:
-            continue
-        for value in sorted(values):
-            if compatible(guard, name, value, check_remaining=True):
-                yield name, value
-
-
 @dataclass(frozen=True)
 class Site:
     scope: str
@@ -431,6 +441,12 @@ class Site:
     note_st_line: int = 0
     program: str = ''
     output_dependencies: tuple = ()
+    frames: tuple = ()
+    offset: int = -1
+    selector_ports: tuple = ()
+    operating_guard: str = ''
+    commit: tuple = ()
+    selectors: tuple = ()
 
     def evidence(self, guard):
         condition = guard.text()
@@ -439,6 +455,8 @@ class Site:
                 'instance_path': self.chain, 'guard': condition,
                 'guard_complete': _UNKNOWN not in condition and _ST_UNKNOWN not in condition,
                 'output_dependencies': self.output_dependencies,
+                'frames': self.frames, 'offset': self.offset, 'selector_ports': self.selector_ports,
+                'operating_guard': self.operating_guard, 'commit': dict(self.commit), 'selectors': self.selectors,
                 'comment': self.raw if comment_text(self.raw) else ''}
 
 
@@ -544,7 +562,10 @@ class ControlIndex:
         grade = 'plcopen_structured_st'
         try:
             parser.seq()
-            statements = parser.statements
+            def same_type(lhs, rhs):
+                left = self.types.bounds(target(lhs).casefold(), site.program)
+                return left is not None and left == self.types.bounds(target(rhs).casefold(), site.program)
+            statements = parser.staged_writes(parser.statements, same_type)
         except ERRORS as exc:
             self._issue('unsupported_st', candidates, site, str(exc))
             if self.recover_st is None:
@@ -565,7 +586,12 @@ class ControlIndex:
             condition = _bound_guard(condition, actuals)
             gate = combine_wiring('and', outer, condition)
             line = 1 + code.count('\n', 0, offset)
-            located = replace(site, st_line=line, node=f'{site.node}:ST:{line}')
+            frames = tuple((k, d, a, bound_expr(v, actuals) if v else '') for k, d, a, v in parser.frames.get(offset, ()))
+            operating = combine_wiring('and', outer, _bound_guard(parser.operating_condition(offset, lhs), actuals))
+            commit = getattr(parser, 'commit_sites', {}).get(offset, {})
+            located = replace(site, st_line=line, node=f'{site.node}:ST:{line}', frames=frames, offset=offset,
+                              operating_guard='' if operating == TRUE else operating.text(), commit=tuple(commit.items()),
+                              selectors=parser.selector_decisions(offset, lhs))
             if note and comment_text(note[0]):
                 located = replace(located, raw=note[0], note_line=site.line,
                                   note_st_line=1 + code.count('\n', 0, note[1]))
@@ -639,7 +665,7 @@ class ControlIndex:
                 default = TRUE if operator else None
                 wired = wire.cp(control, default)
                 gate = combine_wiring('and', outer, _bound_guard(wired, actuals))
-                site = replace(site, output_dependencies=wire.dependencies(wired))
+                site = replace(site, output_dependencies=wire.dependencies(wired), selector_ports=wire.selector_ports(control, actuals))
             except ERRORS as exc:
                 watched = {bound_expr(name, actuals).casefold() for name in targets} & self.wanted
                 if typ == 'EXECUTE':
@@ -735,7 +761,8 @@ class ControlIndex:
         alias = {key: value for key, value in actuals.items() if key in formals}
         ro = {key for key, param in formals.items()
               if param['direction'] != 'inOutVars' or key not in alias}
-        call = {'scope': site.scope, 'node': site.node, 'source_line': site.line,
+        call = {'scope': site.scope, 'node': site.node, 'source_line': site.line, 'body': site.body,
+                'network': site.network, 'guard': gate.text(), 'selector_ports': wire.selector_ports(en, parent),
                 'instance': instance, 'type': unit.get('name'),
                 'actuals': alias,
                 'formal_documentation': {key: formals[key]['documentation'] for key in alias

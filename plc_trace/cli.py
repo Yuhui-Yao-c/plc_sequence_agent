@@ -40,7 +40,7 @@ _TRACE_STATS = ('variables_total', 'variables_active', 'total_jumps', 'cycles_de
                 'unique_pairs', 'pairs_with_action_vars', 'pairs_with_step_comment',
                 'pairs_reset_exit', 'review_count', 'source_relations', 'source_evidence_audit',
                 'proc_name', 'trace_input', 'common_gap_count', 'channel_gap_count',
-                'valid_dwell_count', 'partial_dwell_count', 'pairs_without_valid_duration')
+                'valid_dwell_count', 'partial_dwell_count', 'pairs_without_valid_duration', 'action_branches')
 
 
 def _trace_inputs(src, trace, args):
@@ -49,6 +49,7 @@ def _trace_inputs(src, trace, args):
  return {
      'source': str(src), 'source_sha256': fingerprint(src),
      'trace': str(trace), 'trace_sha256': trace_input_digest(trace),
+     'branch_index_sha256': fingerprint(Path(args.branch_index)) if args.branch_index else None,
      'description_schema': SCHEMA, 'pipeline_sha256': pipeline_fingerprint(),
      'options': {name: getattr(args, name) for name in ('batch_size', 'pattern', 'proc_name', 'sample_interval_ms')},
  }
@@ -60,7 +61,7 @@ def _trace_prepared_files(out):
  files += [out/'action_desc_a.csv', out/'workflow_manifest.json']
  for name in ('variable_documentation.json', 'step_comments.json', 'station_identity.json',
               'native_command_evidence.csv', 'plcopen_action_trace.csv', 'source_stage_candidates.csv',
-              'source_transition_edges.csv', 'indexed_candidates.csv', 'indexed_events.csv'):
+              'source_transition_edges.csv', 'source_branch_index.json', 'indexed_candidates.csv', 'indexed_events.csv'):
   if (out/name).is_file():
    files.append(out/name)
  files += sorted((out/'batches_desc').glob('*.input.json'))
@@ -74,6 +75,8 @@ def _run_trace_mode(src,out,args):
   raise FileNotFoundError(f'PLC源码不存在：{src}')
  if not trace.exists():
   raise FileNotFoundError(f'Trace输入不存在：{trace}')
+ if args.branch_index and Path(args.branch_index).resolve().is_relative_to(out):
+  raise ValueError('复用索引须位于本次输出目录之外')
  if any(p.is_relative_to(out) for p in (src,trace,Path(args.source).absolute(),Path(args.trace).absolute())):
   raise ValueError('输出目录须与PLC源码和Trace输入分开')
  cache_path = out/_TRACE_PREPARED
@@ -110,7 +113,7 @@ def _run_trace_mode(src,out,args):
    from plc_trace.trace.trace_to_pairs import generate as gen_trace_pairs
    trace_stats = gen_trace_pairs(str(trace),str(out),source=str(src),pattern=args.pattern,
                                  proc_name=args.proc_name,
-                                 sample_interval_ms=args.sample_interval_ms)
+                                 sample_interval_ms=args.sample_interval_ms, action_branches=True, branch_index=args.branch_index)
    stats.update({k: trace_stats[k] for k in _TRACE_STATS})
    stage = 'description'
    print('Trace [4/4] 准备动作描述批次', file=sys.stderr, flush=True)
@@ -136,11 +139,12 @@ def _run_trace_mode(src,out,args):
   from plc_trace.output.gen_workstation_xlsx import generate as gen_ws
   proc = stats['proc_name'] or '工序'
   xlsx_out = str(out/f'{proc}_trace步序采集表.xlsx')
-  stats['workstation_xlsx'] = gen_ws(str(out/'trace_collection_pairs.csv'),out=xlsx_out,
+  from plc_trace.trace.branch_report import BRANCH_FILE
+  stats['workstation_xlsx'] = gen_ws(str(out/BRANCH_FILE),out=xlsx_out,
                                     proc_name=proc,run=str(out),sheet='trace步序采集表')
   if stats['b_tier_pending_rows']:
    stats['status'] = 'prepared_b_tier_pending'
-  elif (stats['review_count'] or stats['description_review_count'] or stats['channel_gap_count']
+  elif (stats['action_branches']['review_pairs'] or stats['review_count'] or stats['description_review_count'] or stats['channel_gap_count']
         or stats['pairs_without_valid_duration'] or stats['common_gap_count']):
    stats['status'] = 'done_with_review'
   else:
@@ -212,6 +216,7 @@ def main():
  sub=p.add_subparsers(dest='mode',required=True)
  x=sub.add_parser('trace',help='trace步序采集模式：trace跳变→状态对→A/B档动作描述→交付表')
  x.add_argument('--source',required=True,help='PLC源码XML路径（用于动作变量映射/步注释/工位身份）')
+ x.add_argument('--branch-index',help='可选，复用同版源码和解析程序生成的 source_branch_index.json')
  x.add_argument('--trace',required=True,help='trace输入：TwinCAT .trace文件 / Sysmac CSV表 / Sysmac采集目录')
  x.add_argument('--sample-interval-ms',type=float,help='已知固定采样周期(ms)，可用于识别异常间隔及重建精度不足的 Sysmac 时间')
  x.add_argument('--proc-name',default=None,help='工序名称；缺省优先使用源码所在工序目录名')
