@@ -5,6 +5,9 @@ from collections import Counter, defaultdict, deque
 from functools import lru_cache
 
 from plc_trace.capture.extract_step_variables import _SourceScan
+from plc_trace.graph.bindings import call_bindings, instance_dependencies
+from plc_trace.graph.dependencies import signal_dependencies
+from plc_trace.graph.plant import build_plant
 from plc_trace.graph.samples import Snapshots
 from plc_trace.graph.topology import Topology
 from plc_trace.source.plcopen_trace_control import _conditions
@@ -257,10 +260,30 @@ def build(source, trace, interval=None, progress=lambda message: None):
             for event in edge.get('events', ()):
                 if len(event) == 4:
                     event[3] = {name:portable_literal(v) for name,v in event[3].items()}
-    return {'schema':'plc.logic_graph.v1','source_name':source.name,'trace_name':trace.name,
+    symbols = [dict(top.symbols[key], scope=key[0]) for key in symbol_keys]
+    plant = build_plant(top.units, top.nets, symbols, sites, top.calls, top.tasks)
+    plant['port_bindings'] = call_bindings(top.nets, top.calls, symbol_ids, top.namespace, top.formals)
+    plant['coverage']['calls_with_bound_ports'] = len(plant['port_bindings'])
+    plant['dependencies'] = signal_dependencies(top.nets, symbol_ids, top.namespace, top.program_scopes)
+    bound = instance_dependencies(top, symbol_ids, symbol_keys, plant['port_bindings'])
+    plant['dependencies'].extend(bound)
+    guards = {}
+    plant['st_guards'] = []
+    for net in top.nets:
+        for node in net['nodes']:
+            for item in node.get('assignments', ()):
+                raw = item['guard']
+                if raw not in guards:
+                    guards[raw] = len(guards)
+                    plant['st_guards'].append(condition(raw)[0])
+                item['guard_id'] = guards[raw]
+    plant['coverage']['instance_witnesses'] = len(bound)
+    plant['coverage']['dependency_witnesses'] = len(plant['dependencies'])
+    summary['plant'] = plant['coverage']
+    return {'plant': plant, 'schema':'plc.logic_graph.v1','source_name':source.name,'trace_name':trace.name,
             'dialect':dialect,'summary':summary,'trace_audit':audit,'limits':discovery.issues,
             'tasks':top.tasks,'units':top.units,'calls':top.calls,'nets':top.nets,'wiring_issues':top.issues,
-            'symbols':[dict(top.symbols[key],scope=key[0]) for key in symbol_keys],
+            'symbols':symbols,
             'channel_dependencies':[{'read':names[a],'written':names[b],'sites':ids}
                                     for (a,b),ids in sorted(explicit_reads.items())],
             'sites':sites,'channels':rows}

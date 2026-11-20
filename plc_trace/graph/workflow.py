@@ -19,8 +19,10 @@ ARTIFACTS = ('logic_graph.html', 'logic_graph.json.gz')
 
 def render(payload):
     template = (RESOURCE / 'index.html').read_text(encoding='utf-8')
+    scripts = '\n'.join((RESOURCE / name).read_text(encoding='utf-8')
+                        for name in ('ladder.js', 'lineage.js', 'plant.js', 'viewer.js'))
     return (template.replace('/*__STYLE__*/', (RESOURCE / 'style.css').read_text(encoding='utf-8'))
-            .replace('/*__APP__*/', (RESOURCE / 'viewer.js').read_text(encoding='utf-8'))
+            .replace('/*__APP__*/', scripts)
             .replace('__PAYLOAD__', base64.b64encode(payload).decode('ascii')))
 
 

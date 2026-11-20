@@ -65,6 +65,9 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 ### 入口三　PLC 逻辑图谱
 
+整机核验从“整机协作图”进入，依次定位信号的写入和使用位置、门控梯级以及可能的实例调用。用户指定某次跳变时从“步序与观测”交叉核对。
+
+
 **输入**　`源码路径 Trace路径 --logic-graph [-output 输出根目录]`
 
 **执行**　加载 [PLC 逻辑图谱](../skills/plc-logic-graph/SKILL.md)。使用 `python plc_cli.py logic-graph --source "源码" --trace "实测记录" --out "实际交付目录"` 或对应简写。核验源码端口与观测跳变，沿具体写点、实例和作用域回查门控。

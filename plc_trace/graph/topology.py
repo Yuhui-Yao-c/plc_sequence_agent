@@ -5,6 +5,7 @@ from collections import defaultdict
 from lxml import etree
 
 from plc_trace.analysis.boundary_logic import IDENT
+from plc_trace.graph.bindings import named_arguments
 from plc_trace.analysis.successor_graph import STParser, WireError, tag, text
 from plc_trace.capture.plcopen_tasks import is_task_declaration, task_declaration
 from plc_trace.source.omron_native import kind, scope_of
@@ -60,6 +61,7 @@ class Topology:
         self.globals = defaultdict(list)
         self.types = defaultdict(dict)
         self.calls = []
+        self.formals = defaultdict(dict)
         self.output_pins = {}
 
     def net(self, scope, language, line, label='', comment=''):
@@ -287,10 +289,13 @@ class Topology:
         for unit in doc.iter('{*}pou','{*}Program','{*}FunctionBlock','{*}Function'):
             scope = _scope(unit) if tag(unit) == 'pou' else unit.get('name', '')
             self.locals.setdefault(scope.casefold(), set())
-            for group in list(unit.findall('./{*}interface/*')) + list(unit):
-                if tag(group).lower() in ('localvars','tempvars','inputvars','outputvars','inoutvars'):
+            for group in [*unit.findall('./{*}interface/*'), *unit.findall('./{*}Parameters/*'), *unit]:
+                if tag(group).lower() in ('vars','localvars','tempvars','inputvars','outputvars','inoutvars'):
                     self.locals.setdefault(scope.casefold(), set())
                     for var in group:
+                        role = {'inputvars':'read', 'outputvars':'write', 'inoutvars':'inout'}.get(tag(group).lower())
+                        if role and tag(var).lower() == 'variable' and var.get('name'):
+                            self.formals[scope.casefold()][var.get('name').casefold()] = role
                         type_name = var.find('./{*}Type/{*}TypeName')
                         if type_name is not None and var.get('name') and text(type_name):
                             self.types[scope.casefold()][var.get('name').casefold()] = text(type_name)
@@ -346,20 +351,29 @@ class Topology:
                     refs.extend(('read', v, pin) for v in a['reads'])
                 call_names = []
                 if node['type'].casefold() in ('block','f','fb'):
-                    call_names.append((node['label'], 0))
+                    call_names.append((node['label'], None, node.get('instanceName', '')))
                 for statement in node.get('other_statements', ()):
                     fn = re.match(r'([\w.]+)\s*\(', statement['stmt'])
                     if fn:
-                        call_names.append((self.types[owner].get(fn[1].casefold(), fn[1]), statement['line']))
-                for callee, st_line in call_names:
+                        call_names.append((self.types[owner].get(fn[1].casefold(), fn[1]), statement, fn[1]))
+                for callee, stmt, instance in call_names:
+                    st_line = stmt['line'] if stmt is not None else 0
                     options = definitions.get(callee.casefold(), ())
                     actions = [u for u in options if u['kind'] in ('action','method')
                                and owner and u['scope'].rpartition('::')[0].casefold() == owner]
                     targets = actions or [u for u in options if u['kind'] not in ('action','method')]
                     if targets:
-                        self.calls.append({'net':net['id'], 'node':node['id'], 'type':callee,
+                        call = {'net':net['id'], 'node':node['id'], 'type':callee,
                                            'st_line':st_line, 'targets':[u['scope'] for u in targets],
-                                           'resolved':len(targets) == 1})
+                                           'resolved':len(targets) == 1, 'instance':instance}
+                        if stmt is not None and call['resolved']:
+                            args = named_arguments(stmt['stmt'], self.formals[targets[0]['scope'].casefold()])
+                            if args:
+                                call['arguments'] = args
+                                call['st_token'] = stmt['token']
+                                refs.extend((role, actual, f"ST {st_line} · {pin} @{stmt['token']}")
+                                            for role, actual, pin in args)
+                        self.calls.append(call)
                 for role, name, pin in refs:
                     if not simple_name(name):
                         continue

@@ -252,3 +252,19 @@ tr {
     padding:14px;
   }
 }
+.plant-frame { position:relative; overflow:auto; height:clamp(340px,61vh,810px); border:1px solid #b8ccca; border-radius:5px; background:white; }
+.plant-world { position:relative; }
+.plant-screen { position:absolute; display:block; }
+.plant-screen [role=button],.ladder-svg [role=button] { cursor:pointer; }
+.plant-screen [role=button]:focus-visible,.ladder-svg [role=button]:focus-visible { outline:2px solid #b77731; }
+.plant-legend { color:#36545b; font-size:13px; margin:12px 0 7px; }
+.plant-inspector { margin:17px 0; }
+.proof-row { display:flex; gap:5px; flex-wrap:wrap; margin:3px 0; }
+.proof-row button { overflow-wrap:anywhere; font-size:13px; }
+.plant-screen text { font-family:"Microsoft YaHei",system-ui,sans-serif; }
+.ladder-svg text { font-family:Consolas,"Microsoft YaHei",monospace; }
+.plant-route { display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:12px 0 0;color:#43636a; }
+.plant-route strong { font:600 13px Consolas,"Microsoft YaHei",monospace;overflow-wrap:anywhere; }
+.plant-route small { color:#687f85; }
+
+.ld-key { display:flex; flex-wrap:wrap; gap:8px; padding:8px 2px; }

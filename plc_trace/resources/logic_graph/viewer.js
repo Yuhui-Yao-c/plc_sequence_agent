@@ -83,6 +83,7 @@ function indexData() {
 }
 
 function options() {
+  if (mode === 'plant') return [['all','全部单元与关系'],['groups','程序 / 设备单元'],['peer','程序间步序门控'],['guards','跨单元步序门控'],['signals','共享信号'],['call','调用关系'],['task','任务挂载']];
   if (mode === 'states') return [
     ['observed', '实测通道'],
     ['source', '源码通道'],
@@ -115,6 +116,7 @@ function setupTab(m, reset = true) {
   }
   $('subset').value = choices[0][0];
   $('filter').placeholder = {
+    plant: '查找工位、例程归属或协作信号',
     states: '完整地址或部分名称',
     nets: '例程、编号或网络注释',
     symbols: '信号或作用域',
@@ -128,6 +130,7 @@ function listRows() {
   const q = $('filter').value.trim().toLowerCase(),
     group = $('subset').value;
   const match = s => s.toLowerCase().includes(q);
+  if (mode === 'plant') return Plant.listing(q,group);
   if (mode === 'states') return D.channels.flatMap((c, i) => (group === 'observed' && !c.samples) || (group ===
     'source' && !c.pairs.some(p => p.sites.length)) || !match(c.name) ? [] : [
     [i, c.name]
@@ -193,6 +196,7 @@ function go(m, key, opts = {}, record = true) {
     para(target, '没有匹配的条目。');
     return;
   }
+  if (m === 'plant') Plant.scene(target,key);
   if (m === 'states') stateView(target, D.channels[key], opts);
   if (m === 'nets') networkView(target, D.nets[key], opts);
   if (m === 'symbols') symbolView(target, D.symbols[key]);
@@ -493,47 +497,10 @@ function showSignals(parent, labels, chooseScope = false) {
 }
 
 function gateFigure(parent, site) {
-  const nodes = [],
-    edges = [];
-
-  function add(t) {
-    const id = nodes.length;
-    const atom = t[0] === 'term' || t[0] === 'opaque';
-    nodes.push({
-      id,
-      label: atom ? t[1] : ({
-        and: '全部满足',
-        or: '任一满足',
-        not: '取反',
-        xor: '异或'
-      } [t[0]] || t[0]),
-      type: atom ? '谓词' : t[0].toUpperCase(),
-      opaque: t[0] === 'opaque'
-    });
-    if (!atom)
-      for (const child of t.slice(1)) edges.push({
-        a: add(child),
-        b: id
-      });
-    return id;
-  }
-  const root = add(site.guard_tree),
-    dest = nodes.length;
-  nodes.push({
-    id: dest,
-    label: site.channel + ' := ' + site.end,
-    type: '写步',
-    active: true
-  });
-  edges.push({
-    a: root,
-    b: dest
-  });
-  const selected = el('p', undefined, 'muted');
-  diagram(parent, nodes, edges, n => {
-    selected.textContent = n.label;
-  }, '源码写步条件结构');
-  parent.append(selected);
+  para(parent, '根据源码条件推导的逻辑梯级。串联表示 AND，并联表示 OR。悬停可读完整表达式。', 'muted');
+  const g = el('div', undefined, 'viewport');
+  g.append(LD.guard(site.guard_tree, site.channel + ' := ' + site.end));
+  parent.append(g);
 }
 
 function siteCard(parent, index, first = false) {
@@ -841,6 +808,31 @@ function networkView(p, net, o) {
       }
     }
     g.replaceChildren();
+    if (['LD','SMC2'].includes(net.language)) {
+      para(g, '源码梯形图　实线为控制通路，虚线为数据或其他引脚。触点与线圈保留取反、边沿和置位复位标记。点选元件查看原文。', 'muted');
+      LD.legend(g);
+      const viewport = el('div',undefined,'viewport');
+      const plan=LD.layout([...ids].map(id=>nodeMap.get(id)[1]),wires,net.language);
+      const svg=LD.draw(plan, id=>{
+        focus=id;
+        inspect(id);
+      },focus);
+      viewport.append(svg);
+      const zoomBar=bar(g);
+      let scale=1;
+      function resize(factor){
+        scale=Math.max(0.12,Math.min(3,factor));svg.setAttribute('width',plan.width*scale);svg.setAttribute('height',plan.height*scale);
+      }
+      zoomBar.append(button('缩小',()=>resize(scale/1.25)),button('放大',()=>resize(scale*1.25)),
+        button('适应宽度',()=>resize((viewport.clientWidth||900)/plan.width)),button('原始比例',()=>resize(1)));
+      g.append(viewport);
+      if(focused){
+        const pt=plan.points.get(focus);
+        if(pt){viewport.scrollLeft=Math.max(0,pt.x-(viewport.clientWidth||900)/2);viewport.scrollTop=Math.max(0,pt.y-(viewport.clientHeight||470)/2);}
+      }
+      inspect(focus);
+      return;
+    }
     para(g, '箭头指向输入。实线为已识别的控制连接，点线为其余引脚连接；[#] 表示 XML 中未命名输入的位置。', 'muted');
     const nodes = Array.from(ids).map(id => {
       const [origin, n] = nodeMap.get(id);
@@ -1086,9 +1078,8 @@ async function start() {
     const list = sidebar();
     go(mode, list.length ? list[0][0] : null);
   };
-  setupTab('states');
-  const entries = sidebar();
-  go('states', entries.length ? entries[0][0] : null, {}, false);
+  setupTab('plant');
+  go('plant','home',{},false);
 }
 start().catch(err => {
   $('detail').textContent = '图谱读取失败。请用支持本地 gzip 解码的当前版 Edge、Chrome 或 Firefox 打开。 ' + err.message;
