@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from plc_trace.analysis.atomic_boundaries import stable_id
 from plc_trace.analysis.boundary_logic import combine, compatible
 from plc_trace.source.source_expressions import source_condition
+from plc_trace.trace.source_paths import example_route, returns_to_earlier_rung, shape, source_paths
 
 
 @dataclass
@@ -68,8 +69,9 @@ class Write:
 
 
 class BranchIndex:
-    def __init__(self, writes, unresolved=None):
+    def __init__(self, writes, unresolved=None, entries=None):
         self.unresolved = unresolved or {}
+        self.entries = entries or {}
         self.writes = {}
         self.outgoing = defaultdict(list)
         self.incoming = defaultdict(list)
@@ -152,11 +154,16 @@ class BranchIndex:
         for anchor in observations:
             channel, start, end = anchor
             paths, limited, retries = self.routes(channel, start, end)
+            cross = example_route(self, channel, start, end, handoff=True)
+            entries = self.entries.get((channel, end), ())
+            origin = source_paths(self, anchor, paths, limited, cross, entries)
+            same_steps = (bool(paths) and len(paths[0])>1 and
+                          all(shape(path)==shape(paths[0]) for path in paths))
+            returning = any(returns_to_earlier_rung(path) for path in paths)
             # A retry before the target can be invisible between samples. Require
             # a common dispatch and a genuine branch on a route to the endpoint.
             cycles = [r for r in retries if any(r[0].dispatch == p[0].dispatch and any(
                         x.start == y.start and x.decision(y) for x in r for y in p) for p in paths)]
-            candidates = sorted({e.id for path in paths for e in path})
             direct = [p[0] for p in paths if len(p) == 1]
             uncertain = [site for value in {start, *(e.start for p in paths for e in p)}
                          for site in self.unresolved.get((channel, value), ())]
@@ -164,22 +171,47 @@ class BranchIndex:
                 state = '动态写步目标待核'
             elif limited:
                 state = '路径搜索未收敛'
+            elif entries and (paths or cross):
+                state = '写入来源待辨'
+            elif cross:
+                state = '端点已见，分支待辨' if paths else '跨动作段接续'
+            elif entries:
+                state = '其他逻辑写入终值'
             elif not paths:
                 state = '缺少对应写点或路径'
             elif cycles:
                 state = '端点间可能重试'
+            elif returning and all(returns_to_earlier_rung(path) for path in paths):
+                state = '返回前序梯级接续'
+            elif origin['intermediate_writers']:
+                state = '路径含其他写入来源'
+            elif same_steps:
+                state = '端点间存在中间步'
             elif len(paths) > 1:
                 state = '端点已见，分支待辨'
             elif any(not edge.complete for edge in paths[0]):
                 state = '写入或门控待核'
             else:
                 state = '分支已观测' if len(paths[0]) == 1 else '端点间存在中间步'
-            candidates = sorted(set(candidates) | {e.id for r in cycles for e in r})
-            dispositions[anchor] = {'state': state, 'candidates': candidates, 'unresolved': uncertain}
+            candidates = {edge.id for path in (*paths, *cycles) for edge in path}
+            candidates.update(ident for route in origin['routes'] for hop in route['hops'] for ident in hop)
+            dispositions[anchor] = {'state': state, 'candidates': sorted(candidates), 'unresolved': uncertain, 'origin': origin}
             seeds = []
-            if state in ('分支已观测', '端点间存在中间步'):
+            if state == '分支已观测':
                 seeds = list(paths[0])
-            elif state in ('端点已见，分支待辨', '端点间可能重试'):
+            elif state == '写入或门控待核' and len(paths)==1 and len(direct)==1 and direct[0].ports:
+                # The selector and sink can be definite even when a feedback
+                # signal required inside the rung is absent from the recording.
+                seeds=direct
+            elif state == '端点间存在中间步':
+                # One value chain may contain multiple physical writes to the
+                # same destination. Admit alternatives only at a shared decision.
+                for hop in zip(*paths):
+                    sites=list({e.id:e for e in hop}.values())
+                    if (len(sites)==1 or set.intersection(*(set(e.ports) for e in sites)) or
+                            all(a.decision(b) for i,a in enumerate(sites) for b in sites[i+1:])):
+                        seeds.extend(sites)
+            elif state in ('端点已见，分支待辨', '端点间可能重试') and not cross and not returning:
                 # All explanations must enter the same concrete decision. Different
                 # owners remain exclusively in the observation review.
                 first = {p[0].id: p[0] for p in paths}
@@ -191,10 +223,13 @@ class BranchIndex:
             if state == '分支已观测':
                 dispositions[anchor]['branch'] = direct[0].id
             incomplete = {other.id for seed in seeds for other in self.outgoing[channel, seed.start]
-                          if not other.complete and seed.decision(other)}
+                          if other.id != seed.id and not other.complete and
+                          (seed.decision(other) or (other.end != seed.end and seed.ports & other.ports))}
             dispositions[anchor]['pending_exits'] = sorted(incomplete)
             for seed in seeds:
                 self._alternatives(seed, anchor, admitted, observed_states[channel])
+                if not seed.complete:
+                    continue
                 for port in seed.ports:
                     key = (*port[1:], seed.site.get('selector', channel).casefold(), seed.start)
                     for child in self.calls_by_port.get(key, ()):
@@ -205,14 +240,16 @@ class BranchIndex:
         return dict(admitted), dispositions
 
     def _alternatives(self, seed, anchor, admitted, observed):
+        if seed.site.get('write_conflict'):
+            return
         siblings = []
         for other in self.outgoing[seed.channel, seed.start]:
             witness = seed.decision(other)
-            if witness and other.complete:
+            if witness and not other.site.get('write_conflict') and (other.complete or other.ports or other.dispatch):
                 siblings.append(other)
                 admitted[other.id].setdefault(anchor, {'reason': '同一判断的其他出口', 'seed': seed.id, 'decision': witness})
         for other in siblings:
-            if not other.dispatch:
+            if not other.dispatch or not other.complete:
                 continue
             # Find nodes reachable inside this arm, then remove any node having
             # an external entry. Removing a join also cuts off its successors.

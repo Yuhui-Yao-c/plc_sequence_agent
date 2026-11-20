@@ -21,7 +21,7 @@ def fixed_path(value):
             all(re.fullmatch(r'-?\d+(?:,-?\d+)*', ix) for ix in re.findall(r'\[([^]]*)\]', value)))
 
 
-def isolate_counted_loops(code):
+def isolate_counted_loops(code, *, writer_locations=False):
     """Omit balanced assignment-only FORs, never transfers or calls. Keep original offsets.
 
     The caller ignores transitions of any root the omitted code may write.
@@ -36,12 +36,14 @@ def isolate_counted_loops(code):
             if depth == 0:
                 begin = start
             depth += 1
-        if depth and (upper in {'RETURN', 'EXIT', 'CONTINUE', 'JMP', 'GOTO', 'REF=', '^'} or '^' in token):
+        if depth and upper in {'RETURN','JMP','GOTO'}:
             return code, set()
-        if depth and token == '(' and i and re.fullmatch(IDENT, tokens[i-1][0]) and tokens[i-1][0].upper() not in {
+        if depth and not writer_locations and (upper in {'EXIT','CONTINUE','REF=','^'} or '^' in token):
+            return code, set()
+        if depth and not writer_locations and token == '(' and i and re.fullmatch(IDENT, tokens[i-1][0]) and tokens[i-1][0].upper() not in {
                 'IF', 'ELSIF', 'NOT', 'AND', 'OR', 'XOR', 'WHILE', 'DO', 'THEN'}:
             return code, set()
-        if depth and token == ':=':
+        if depth and token == ':=' and not writer_locations:
             lhs = symbol(tokens[i-1][0])
             if not re.fullmatch(IDENT, lhs):
                 return code, set()
@@ -331,7 +333,7 @@ def scope_index(inventory):
                'scheduled_writers': row.get('scheduled_writers', {}), 'evidence': examples}
 
 
-def discover_source_writes(source, dialect, on_transition, on_unresolved=None):
+def discover_source_writes(source, dialect, on_transition, on_unresolved=None, on_entry=None):
     """Use the capture adapters' typed instance binding and concrete write locations."""
     from plc_trace.capture.extract_step_variables import _SourceScan
     if dialect == 'plcopen':
@@ -340,4 +342,4 @@ def discover_source_writes(source, dialect, on_transition, on_unresolved=None):
         from plc_trace.capture.sysmac_discovery import discover
     scan = _SourceScan(None, dialect, False)
     scan.read(source)
-    return discover(source, scan, on_transition=on_transition, on_unresolved=on_unresolved)
+    return discover(source, scan, on_transition=on_transition, on_unresolved=on_unresolved, on_entry=on_entry)

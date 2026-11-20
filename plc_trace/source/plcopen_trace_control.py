@@ -470,6 +470,7 @@ class ControlIndex:
         self.types = types
         self.output_models = {}
         self.edges = []
+        self.external_writes = []
         self.state_writes = defaultdict(list)
         self.notes = defaultdict(list)
         self.commands = defaultdict(list)
@@ -491,6 +492,17 @@ class ControlIndex:
                     'source_line': site.line, 'st_line': site.st_line,
                     'reason': reason, 'detail': detail,
                 })
+
+    def _external_write(self, target, value, site, gate, matched):
+        if not matched or any(name==target for name,_ in matched):
+            return
+        if any(symbol(m[0]).casefold()==target for m in re.finditer(IDENT,gate.text())):
+            return
+        try:destination=integer(value)
+        except ValueError:return
+        if destination is not None:
+            self.external_writes.append((target,destination,{**site.evidence(gate),
+                'controllers':sorted(matched),'kind':'external_state_write','write_value':value}))
 
     def _state_write(self, state, destination, value, site, gate, grade, branch=None):
         if destination == state[1]:
@@ -600,6 +612,7 @@ class ControlIndex:
                 variable = write.casefold()
                 value = _bind_code(rhs, actuals)
                 bounds = self.types.bounds(variable, site.program)
+                self._external_write(variable,value,located,gate,matched)
                 for state in sorted(matched):
                     if state[0] != variable:
                         continue
@@ -709,6 +722,7 @@ class ControlIndex:
                 var = target.casefold()
                 bound_value = _bind_code(value, actuals)
                 if var in self.wanted:
+                    self._external_write(var,bound_value,site,gate,matched)
                     if bound_value.casefold() == var:
                         continue
                     bounds = self.types.bounds(var, program)

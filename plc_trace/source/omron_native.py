@@ -74,10 +74,20 @@ def binding_of(var,scope,pou):
 class NativeWireError(ValueError):
     pass
 
+def boolean_operand(value):
+    literal = value.strip().upper()
+    if literal in ('1', 'TRUE', 'BOOL#1', 'BOOL#TRUE'):
+        return TRUE
+    if literal in ('0', 'FALSE', 'BOOL#0', 'BOOL#FALSE'):
+        return FALSE
+    return parse(value)
+
+
 class NativeRung:
-    def __init__(self,rung,symbolic=False):
+    def __init__(self,rung,symbolic=False,contracts=None):
         from plc_trace.source.source_expressions import SourceConditions
         self.symbolic=symbolic;self.source_conditions=SourceConditions();self.temporal_conditions=[]
+        self.contracts=contracts or {}
         self.rung=rung;self.nodes=list(rung);self.ports={};self.duplicates=set()
         self.node_ids={id(n):f'node:{i};line:{n.sourceline or 0}' for i,n in enumerate(self.nodes)}
         self.memo={};self.active=set();self.visited=set()
@@ -138,20 +148,32 @@ class NativeRung:
             if k=='LeftPowerRail':e=TRUE
             elif k=='DataSource':
                 value=n.get('identifier','').strip()
-                e=TRUE if value=='1' else FALSE if value=='0' else parse(value)
+                e=boolean_operand(value)
             elif k in ('Contact','Coil'):
-                if n.get('edge','none').lower() not in ('','none'):
-                    raise NativeWireError('edge_sensitive_'+k.lower()+':'+ref)
                 e=self.gate(self.input_cp(n))
-                if k=='Contact':
-                    a=parse(n.get('operand',''))
+                edge=n.get('edge','none').lower()
+                if edge not in ('','none'):
+                    if not self.symbolic or k!='Contact' or edge not in ('rising','falling'):
+                        raise NativeWireError('edge_sensitive_'+k.lower()+':'+ref)
+                    operand=n.get('operand','')
+                    if not re.fullmatch(IDENT,operand) or n.get('negated','').lower()=='true':
+                        raise NativeWireError('unsupported_edge_operand:'+ref)
+                    signal=self.runtime_predicate('contact_edge',f'{edge}({operand})',n,[operand])
+                    e=combine('and',e,signal)
+                elif k=='Contact':
+                    a=boolean_operand(n.get('operand',''))
                     if n.get('negated','').lower()=='true':a=negate(a)
                     e=combine('and',e,a)
             elif k=='Block':
                 name=n.get('typeName','').upper()
                 if name.startswith('@'):raise NativeWireError('edge_instruction:'+name)
+                contract=self.contracts.get(name,{}).get(port.upper())
                 gate=pin(n,'EN')
-                if gate is None:gate=pin(n,'_EN')
+                if gate is None and name not in self.contracts:gate=pin(n,'_EN')
+                if self.symbolic and contract:
+                    # Project FB pins are ordinary formals. Only the actual output
+                    # definition proves which inputs must be true.
+                    gate=None
                 en=self.gate(gate) if gate is not None else TRUE
                 cmp=self.comparison(n)
                 if cmp is not None:
@@ -169,7 +191,12 @@ class NativeRung:
                     data=[p for p in params(n,'InputVariables') if port_name(p).upper() not in ('EN','_EN')]
                     if len(data)!=2:raise NativeWireError('relational_arity')
                     e=combine('and',en,self.source_conditions.relational(self.value(data[0]),name,self.value(data[1])))
-                elif self.symbolic and name=='TON' and port.upper()=='Q':
+                elif self.symbolic and name=='TIMER' and name not in self.contracts and port.upper() in ('','Q','OUT'):
+                    timer=self.value(pin(n,'TimerDat','InOutVariables'))
+                    preset=self.value(pin(n,'PT'))
+                    timed=self.runtime_predicate('timer_return',f'Timer({timer}, {preset}).Out',n,[timer,preset])
+                    e=combine('and',self.gate(pin(n,'In')),timed)
+                elif self.symbolic and name=='TON' and name not in self.contracts and port.upper()=='Q':
                     # Preserve temporal output, NEVER replace TON.Q by its input.
                     inst=n.get('instanceName','').strip()
                     if not inst or not re.fullmatch(IDENT,inst):raise NativeWireError('timer_instance_required')
@@ -180,6 +207,12 @@ class NativeRung:
                         'input':ingate.text(),'preset':pt,'source_line':n.sourceline,
                         'proof':'temporal_dependency_only_not_elapsed_time_proof'})
                     e=combine('and',ingate,Expr('signal',(inst+'.Q',)))
+                elif self.symbolic and contract:
+                    instance=n.get('instanceName','')
+                    if not re.fullmatch(IDENT,instance):raise NativeWireError('missing_FB_instance:'+ref)
+                    required=[self.gate(pin(n,p)) for p in contract['inputs']]
+                    result=self.runtime_predicate('fb_output',instance+'.'+port,n,[instance+'.'+port],contract)
+                    e=combine('and',*required,result)
                 else:
                     raise NativeWireError('opaque_control_output:'+name+':'+port)
             else:raise NativeWireError('unsupported_control_object:'+k)
@@ -187,29 +220,46 @@ class NativeRung:
             self.memo[ref]=e;return e
         finally:self.active.remove(ref)
     def symbolic_gate(self,p):
-        other=NativeRung(self.rung,symbolic=True)
+        other=NativeRung(self.rung,symbolic=True,contracts=self.contracts)
         guard=other.gate(p)
         return guard,other.source_conditions.definitions,other.temporal_conditions
 
+    def runtime_predicate(self,kind,expression,node,reads,definition=None):
+        item={'kind':kind,'expression':expression,'reads':reads,'source_line':node.sourceline}
+        if definition:item['definition']=definition
+        key='__source_predicate_'+hashlib.sha256(json.dumps(item,sort_keys=True).encode()).hexdigest()[:16]
+        self.source_conditions.definitions[key]={'id':key,**item,'not_a_plc_tag':True}
+        return Expr('signal',(key,))
+
     def selector_ports(self, control):
-        ports, seen = [], set()
-        inputs = refs(control)
-        while len(inputs) == 1:
-            ref = inputs[0]
-            if ref in seen or ref in self.duplicates or ref not in self.ports:
-                break
-            seen.add(ref)
-            node, port, _ = self.ports[ref]
-            selector = self.comparison(node)
-            if selector and selector.kind == 'eq' and port.upper() not in ('ENO', '_ENO'):
-                ports.append((*selector.args, self.node_id(node), port))
-            elif kind(node) != 'Contact':
-                break
-            try:
-                inputs = refs(self.input_gate(node))
-            except NativeWireError:
-                break
-        return ports
+        """Physical EQ outputs required on every power path to this pin."""
+        memo,active={},set()
+        def inputs(p):
+            arms=refs(p)
+            if not arms or p.get('negated')=='true':return set()
+            return set.intersection(*(via(r) for r in arms))
+        def via(ref):
+            if ref in memo:return memo[ref]
+            if ref in active or ref in self.duplicates or ref not in self.ports:return set()
+            active.add(ref)
+            node,port,cp=self.ports[ref];op=node.get('typeName','').upper()
+            found=set()
+            if cp.get('negated')!='true' and not (local(cp.getparent()) in ('OutputVariable','InOutVariable') and cp.getparent().get('negated')=='true'):
+                if kind(node) in ('Contact','Coil'):
+                    found=inputs(self.input_cp(node))
+                elif op in ('=','EQ','==','<','>','<=','>=','<>','!=','NE') and port.upper() not in ('ENO','_ENO'):
+                    found=inputs(pin(node,'EN'))
+                    selector=self.comparison(node)
+                    if selector and selector.kind=='eq':
+                        found=found|{(*selector.args,self.node_id(node),port)}
+                elif op=='MOVE' and port.upper()=='ENO':found=inputs(pin(node,'EN'))
+                elif op in ('TON','TIMER') and op not in self.contracts and (port.upper()=='Q' or (op=='TIMER' and port.upper() in ('','OUT'))):
+                    found=inputs(pin(node,'In'))
+                elif contract:=self.contracts.get(op,{}).get(port.upper()):
+                    found=set.union(*(inputs(pin(node,p)) for p in contract['inputs']))
+            active.remove(ref);memo[ref]=found
+            return found
+        return sorted(inputs(control))
 
     def ancestors(self,p):
         """Connectivity only: do not treat this traversal as a complete guard."""
@@ -261,12 +311,75 @@ class NativeRung:
         return ';'.join(result)
 
 
+def _output_contracts(source):
+    """Find necessary Boolean inputs of single, non-latched LD output coils."""
+    from plc_trace.source.source_expressions import required_atoms
+    contracts={}
+    tags=('{*}Program','{*}Function','{*}FunctionBlock')
+    for _,unit in etree.iterparse(str(source),events=('end',),tag=tags,huge_tree=True,resolve_entities=False,no_network=True):
+        if local(unit)=='FunctionBlock':
+            name=unit.get('name','').upper()
+            contracts[name]={} if name in contracts else _coil_contracts(unit,required_atoms)
+        unit.clear()
+        while unit.getprevious() is not None:del unit.getparent()[0]
+    return contracts
+
+
+def _coil_contracts(unit,required_atoms):
+    def formals(group):
+        return {v.get('name','').casefold():v.get('name','') for section in unit.iter('{*}'+group)
+                for v in direct(section,'Variable') if any(content(t).upper()=='BOOL' for t in v.iter('{*}TypeName'))}
+    inputs,outputs=formals('InputVars'),formals('OutputVars')
+    if not inputs or not outputs:return {}
+    writes=defaultdict(list)
+    texts=[]
+    for body in unit.iter('{*}BodyContent'):
+        for code in body.iter('{*}ST'):
+            if not list(code):texts.append(content(code))
+        for rung in body.iter('{*}Rung'):
+            wired=None
+            for node in rung:
+                k=kind(node)
+                if k in ('Jump','Return','Label') or node.get('typeName','').upper() in ('JMP','RETURN','RET','MC','MCR'):
+                    return {}
+                if k in ('Coil','DataSink'):
+                    writes[(node.get('operand') or node.get('identifier') or '').casefold()].append(node)
+                elif k=='Block' and (ports:=params(node,'InOutVariables')):
+                    if wired is None:wired=NativeRung(rung)
+                    for port in ports:
+                        try:writes[wired.value(port).casefold()].append(node)
+                        except NativeWireError:continue
+    st='\n'.join(texts)
+    if re.search(r'\b(?:RETURN|JMP|GOTO)\b',st,re.I):return {}
+    # A textual reference may be an assignment or a writable call actual.
+    # Restrict the summary to formals used only by the audited LD wiring.
+    def mentioned(formal):
+        return re.search(r'(?<![\w.])'+re.escape(formal)+r'(?!\w)',st,re.I)
+    result={}
+    for formal,spelling in outputs.items():
+        nodes=writes.get(formal,())
+        if len(nodes)!=1 or mentioned(formal):continue
+        coil=nodes[0]
+        if kind(coil)!='Coil' or coil.get('latch') or coil.get('negated')=='true' or coil.get('edge','none')!='none':continue
+        rung=coil.getparent()
+        wire=NativeRung(rung)
+        try:gate=wire.gate(wire.input_cp(coil))
+        except (NativeWireError,BoundarySyntaxError):continue
+        needed={atom.args[0].casefold() for atom in required_atoms(gate,{'signal'}).values()}
+        pins=sorted(inputs[p] for p in needed & inputs.keys() if p not in writes and not mentioned(p))
+        if pins:
+            result[spelling.upper()]={'type':unit.get('name'),'output':spelling,'inputs':pins,
+                'guard':gate.text(),'network':rung.get('evaluationOrder',''),'source_line':coil.sourceline}
+    return result
+
+
 def collect_native(source):
     """One streaming pass; every rung is indexed without using a name filter."""
     from plc_trace.analysis.successor_graph import STParser, WireError, st_tokens
     source=Path(source);states=[];transitions=[];blockers=[];partial=[];events=[];stages=[]
+    contracts=_output_contracts(source)
     command_records=[];diagnostics=[];warnings=[];inline_slices=[];source_predicates={};temporal_dependencies=[];stats=Counter();types=Counter();seen_states=set()
-    unsupported=[];discovery=[];units=set();state_bindings={};opaque_targets=[]
+    unsupported=[];discovery=[];units=set();state_bindings={};opaque_targets=[];range_writes=[]
     def observe(v,num,role,scope,network,node,line,comment,bscope='',operator='='):
         v=symbol(v);key=(v.casefold(),num,role,scope,str(network),node)
         if key in seen_states:return
@@ -393,7 +506,7 @@ def collect_native(source):
         if parent is not None and local(parent)=='BodyContent':rung_consumed.add(id(parent))
         line=rung.sourceline or 0;stats['rungs']+=1
         comment='\n'.join(content(c) for c in rung if kind(c)=='Comment')
-        wire=NativeRung(rung);cmps={};compared=defaultdict(set);commands=[]
+        wire=NativeRung(rung,contracts=contracts);cmps={};compared=defaultdict(set);commands=[]
         for n in wire.nodes:
             types[kind(n)]+=1;node=wire.node_id(n)
             cmp=wire.comparison(n)
@@ -405,6 +518,19 @@ def collect_native(source):
             if kind(n)=='Block' and n.get('typeName','').upper().lstrip('@')=='MOVE':stats['moves']+=1
         for n in wire.nodes:
             k=kind(n);node=wire.node_id(n);name=n.get('typeName','');upper=name.upper().lstrip('@')
+            if k=='Block' and name.upper()=='SETBLOCK' and name.upper() not in contracts:
+                try:
+                    array=wire.value(pin(n,'AryOut','InOutVariables'))
+                    size=integer(wire.value(pin(n,'Size')))
+                    value=integer(wire.value(pin(n,'In')))
+                    match=re.fullmatch(r'(.+)\[(-?\d+)\]',array)
+                    if match and size is not None and size>0 and value is not None:
+                        try:guard=wire.gate(wire.input_gate(n)).text()
+                        except (NativeWireError,BoundarySyntaxError):guard=''
+                        range_writes.append({'scope':scope,'network':str(network),'node':node,'source_line':n.sourceline,
+                            'base':symbol(match[1]),'first':int(match[2]),'count':size,'value':value,'guard':guard,
+                            'kind':'array_fill','guard_complete':bool(guard),'comment':comment})
+                except (NativeWireError,ValueError):pass
             if k=='Block' and upper=='MOVE':
                 targets=wire.targets(n)
                 if not targets:stats['moves_without_explicit_sink']+=1
@@ -413,7 +539,7 @@ def collect_native(source):
                 for v in targets:
                     bs=binding_of(v,scope,pou)
                     if val is not None:observe(v,val,'assignment',scope,network,node,n.sourceline or line,comment,bs)
-                    upstream=[];g=None
+                    upstream=[];g=None;control=None;issues=[]
                     try:
                         control=wire.input_gate(n);upstream,issues=wire.ancestors(control)
                         if name.startswith('@'):raise NativeWireError('edge_MOVE_instruction')
@@ -440,8 +566,23 @@ def collect_native(source):
                                 raise NativeWireError('symbolic_path_upstream_state_write')
                             source_predicates.update(defs);temporal_dependencies.extend(tm)
                             emit(v,val,sg,scope,network,node,n.sourceline or line,comment,bs,
-                                 [wire.node_id(x) for x in upstream]+[node],'omron_native_symbolic_guard')
-                        except (NativeWireError,BoundarySyntaxError):pass
+                                 [wire.node_id(x) for x in upstream]+[node],'omron_native_symbolic_guard',wire.selector_ports(control))
+                        except (NativeWireError,BoundarySyntaxError) as unresolved:
+                            # A predicate can be opaque while its controlling EQ
+                            # and the literal wired destination are both certain.
+                            ports=wire.selector_ports(control)
+                            roots={var.casefold() for var,_,_,_ in ports}|{v.casefold()}
+                            if (control is None or val is None or issues or name.startswith('@') or
+                                any(prev.get('typeName','').upper()=='MOVE' and
+                                    roots.intersection(t.casefold() for t in wire.targets(prev)) for prev in upstream)):
+                                continue
+                            if any(var.casefold()==v.casefold() for var,_,_,_ in ports):
+                                marker=wire.runtime_predicate('unresolved_control',f'@wired_output({node})',n,[],
+                                    {'reason':str(unresolved),'enable_ports':refs(control)})
+                                source_predicates.update(wire.source_conditions.definitions)
+                                gate=combine('and',marker,*(Expr('eq',(var,value)) for var,value,_,_ in ports))
+                                emit(v,val,gate,scope,network,node,n.sourceline or line,comment,bs,
+                                     [wire.node_id(x) for x in upstream]+[node],'omron_native_symbolic_guard',ports)
             elif k=='InlineST':
                 # The vendor wrapper smcext:ST may contain standard ST; only leaf ST text is read.
                 leaves=[x for x in n.iter() if local(x)=='ST' and not any(local(y)=='ST' for y in x)]
@@ -523,6 +664,7 @@ def collect_native(source):
         'stage_records':stages,'stage_events':[], 'native_events':events,'native_commands':command_records,
         'native_partial_transitions':partial,'native_inline_slices':inline_slices,
         'source_predicates':source_predicates,'temporal_dependencies':temporal_dependencies,'native_rung_inventory':discovery,
+        'range_writes':range_writes,
         'native_parse_audit':{'format':'omron_iec61131_10','counts':dict(stats),'object_types':dict(types),
             'bodycontent_audit':body_audit,
             'health':'parsed_with_explicit_limits','no_pattern_applied_during_parse':True,

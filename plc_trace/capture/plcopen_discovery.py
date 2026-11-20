@@ -7,12 +7,12 @@ from lxml import etree
 
 from plc_trace.analysis.boundary_logic import IDENT, integer, symbol
 from plc_trace.analysis.fb_transport import bindings, interface
-from plc_trace.analysis.successor_graph import STParser, WireBody, pins, tag, text
+from plc_trace.analysis.successor_graph import STParser, WireBody, pins, tag, text, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import _executable_text
 from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops
 from plc_trace.capture.station_scope import at_path, declaration, required_cursors
 from plc_trace.source.source_expressions import source_condition
-from plc_trace.source.plcopen_trace_control import ERRORS, _bodies, _scope, collect_root
+from plc_trace.source.plcopen_trace_control import ERRORS, _bodies, _program, _scope, collect_root
 
 _NUMBER = r'(?:[a-z]+#)?[-+]?\d+\b'
 _SELECTORS = [re.compile(p, re.I) for p in (
@@ -145,11 +145,42 @@ def _recover_st(code, parser, error):
     return prefix + [s for s in later.statements if s[3] > last and re.split(r'[.\[]', s[0], 1)[0].casefold() not in touched]
 
 
-def discover(source, scan, *, on_transition=None, on_unresolved=None):
+def _ordered_action_calls(root,pous):
+    """Only unconditional, uniquely resolved calls in the same straight-line ST dispatcher."""
+    actions=defaultdict(list)
+    for action in root.iter('{*}action'):
+        scope=_scope(action)
+        actions[_program(action,scope),action.get('name','').casefold()].append(scope)
+    result={}
+    for program,pou in pous.items():
+        bodies=_bodies(pou)
+        if pou.get('pouType','').casefold()!='program' or len(bodies)!=1 or tag(bodies[0])!='ST':continue
+        code=text(bodies[0])
+        tokens=list(_st_tokens_with_spans(code))
+        calls=[]
+        for pos in range(0,len(tokens),4):
+            group=tokens[pos:pos+4]
+            if (len(group)!=4 or not re.fullmatch(r'[^\W\d]\w*',group[0][0])
+                    or [t[0] for t in group[1:]]!=['(',')',';']):
+                break
+            calls.append((group[0][0].casefold(),group[0][1][0]))
+        else:
+            names=[n for n,_ in calls]
+            shadow={v.get('name','').casefold() for it in pou if tag(it)=='interface' for v in it.iter('{*}variable')}
+            for order,(name,offset) in enumerate(calls):
+                matches=actions[program,name]
+                if len(matches)==1 and name not in shadow and names.count(name)==1:
+                    result[matches[0]]={'program':program,'action':matches[0],'order':order,
+                        'source_line':bodies[0].sourceline,'st_line':1+code.count('\n',0,offset)}
+    return result
+
+
+def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=None):
     root = etree.parse(str(source), etree.XMLParser(huge_tree=True, no_network=True, resolve_entities=False)).getroot()
     names = _nominations(root)
     ci = collect_root(root, names, recover_st=_recover_st)
     pous = {_scope(p): p for p in root.iter('{*}pou')}
+    calls = _ordered_action_calls(root,pous) if on_transition else {}
     result = Discovery()
     result.visible.update(name for name, _, _ in scan.references.values())
     result.visible.update(scan.dynamic.values())
@@ -188,6 +219,10 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None):
             candidate.owners.add((owner, routine, call['source_line']))
         return candidate
 
+    if on_entry:
+        for key,value,item in ci.external_writes:
+            row=resolve(key,item)
+            if row.declared:on_entry(row.name,value,item)
     if on_unresolved:
         for (key, start), options in ci.state_writes.items():
             for item in options:
@@ -196,6 +231,8 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None):
     for key, item in ci.edges:
         candidate = resolve(key, item, writer=True)
         site = {**_site(item), 'program': item['program'], 'kind': item['grade']}
+        if item['scope'] in calls and not item['instance_path']:
+            site['invocation']=calls[item['scope']]
         others = (names.keys() & {n.casefold() for n in item['numeric_conditions']}) - {key}
         if others:
             required = required_cursors(source_condition(item['guard'])) & others

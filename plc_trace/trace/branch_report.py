@@ -91,6 +91,23 @@ def number(s):
         return float(s)
 
 
+def origin_columns(origin):
+    routes = origin['routes']
+    scope = list(dict.fromkeys(s for r in routes for s in r['scopes']))
+    entries = origin['entry_writers']
+    paths = list(dict.fromkeys(' → '.join(map(str,r['steps'])) for r in routes))
+    if origin['other_routes']:paths.append(f"另有 {origin['other_routes']} 条源码路径")
+    if origin['local_search_limited']:paths.append('搜索达到上限')
+    def writer(site):
+        return location(site)+' '+(site.get('guard') or '使能条件待核')
+    alternatives = [writer(s) for s in entries]
+    for block in origin['intermediate_writers']:
+        alternatives.extend(f"中间值 {block['value']} · {writer(s)}" for s in block['sites'])
+    return {'跳变来源':origin['kind'], '源码步序路径':' / '.join(paths),
+            '所属程序段':'、'.join(dict.fromkeys([*scope,*(s['scope'] for s in entries)])),
+            '其他写入来源':'\n'.join(alternatives)}
+
+
 def prepare(run, source, raw, jumps, source_index, sampled_names, reuse=None):
     from plc_trace.trace.trace_to_pairs import PAIR_FIELDS
     run = Path(run)
@@ -112,7 +129,11 @@ def prepare(run, source, raw, jumps, source_index, sampled_names, reuse=None):
         if name.casefold() in sampled or any(c.get('selector_ports') for c in site.get('binding', ())):
             names.setdefault(name.casefold(), name)
             writes.append(Write(name, start, end, site))
-    index = BranchIndex(writes, unresolved)
+    entries = defaultdict(list)
+    for name, value, site in cached['entries']:
+        if name.casefold() in sampled:
+            entries[name.casefold(),value].append(site)
+    index = BranchIndex(writes, unresolved, entries)
     admitted, outcomes = index.project(observations)
     links = {}
     event_counts = Counter()
@@ -169,6 +190,7 @@ def prepare(run, source, raw, jumps, source_index, sampled_names, reuse=None):
                              int(r['结束标签'].rsplit('=', 1)[1]), r['分支ID']))
     dump_rows(run / BRANCH_FILE, [*PAIR_FIELDS, *BRANCH_FIELDS], rows)
     comparison = []
+    origins = []
     for key, row in observations.items():
         outcome = outcomes[key]
         if event_counts[key] != row['发生次数']:
@@ -176,19 +198,24 @@ def prepare(run, source, raw, jumps, source_index, sampled_names, reuse=None):
         for ident in (*outcome['candidates'], *outcome['pending_exits']):
             edge = index.writes[ident]
             links[ident] = {'channel': names[edge.channel], 'from': edge.start, 'to': edge.end,
-                            'location': location(edge.site), 'guard': edge.site['guard']}
+                            'location': location(edge.site), 'guard': edge.site['guard'],
+                            **{k:edge.site[k] for k in ('scope','source_line','network','rung_order',
+                               'dependencies','invocation','binding','guard_complete') if k in edge.site}}
         detail = '、'.join(dict.fromkeys(location(s) + ' ' + s.get('write_value', '') for s in outcome['unresolved']))
         pending = [index.writes[i] for i in outcome['pending_exits']]
         modes = {index.writes[i].site.get('operating_guard', '') for i in outcome['candidates']}
         signals = sorted({v for mode in modes if mode and len(modes) > 1
                           for v in _conditions(source_condition(mode), key[0])})
-        comparison.append({**row, '待核写入': detail,
+        origins.append(dict(channel=names[key[0]],start=key[1],end=key[2],**outcome['origin']))
+        comparison.append({**row, **origin_columns(outcome['origin']), '待核写入': detail,
                            '待核出口': '、'.join(f"{e.start} → {e.end} {location(e.site)}" for e in pending),
                            '工况核对信号': '、'.join(signals), '分支判定': outcome['state'], '分支ID': outcome.get('branch', ''),
                            '候选写点': '、'.join(outcome['candidates'])})
-    dump_rows(run / OBSERVATIONS_FILE, [*PAIR_FIELDS, '分支判定', '分支ID', '候选写点', '待核写入', '待核出口', '工况核对信号'], comparison)
-    (run / EVIDENCE_FILE).write_text(json.dumps({'schema': 1, 'branches': evidence, 'candidates': links},
+    dump_rows(run / OBSERVATIONS_FILE, [*PAIR_FIELDS, '分支判定', '分支ID', '候选写点', '待核写入', '待核出口', '工况核对信号',
+              '跳变来源','源码步序路径','所属程序段','其他写入来源'], comparison)
+    (run / EVIDENCE_FILE).write_text(json.dumps({'schema': 2, 'branches': evidence, 'candidates': links,'observations':origins},
                                                ensure_ascii=False, indent=1), encoding='utf-8')
     return {'rows': len(rows), 'states': dict(states), 'observed_pairs': len(observations),
+            'origins':dict(Counter(o['kind'] for o in origins)),
             'observations_by_state': dict(Counter(v['state'] for v in outcomes.values())),
             'review_pairs': sum(v['state'] != '分支已观测' or bool(v['pending_exits']) for v in outcomes.values())}

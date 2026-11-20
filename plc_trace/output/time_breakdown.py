@@ -375,14 +375,14 @@ def _observation_sheets(book, run):
     fields = ('构成要素', '开始标签', '结束标签', '发生次数', '有效计时次数', '中位数时长ms',
               '分支判定', '样例采集ID', '样例跳变索引', '分支ID')
     for title, selected, headers in (
-            ('实测跳变', rows, fields),
+            ('实测跳变', rows, (*fields, '跳变来源', '源码步序路径', '所属程序段', '其他写入来源')),
             ('分支待核', (r for r in rows if r['分支判定'] != '分支已观测' or r['待核出口']),
-             (*fields[:7], '候选写点及位置', '待核出口', '工况核对信号'))):
+             (*fields[:7], '跳变来源','源码步序路径','所属程序段','候选写点及位置', '待核出口', '工况核对信号','其他写入来源'))):
         ws = book.create_sheet(title)
         for col, name in enumerate(headers, 1):
             c = _cell(ws, 1, col, name)
             c.fill = FILLS['表头']
-            ws.column_dimensions[c.column_letter].width = 68 if name == '候选写点及位置' else 30 if col in (2, 3, 7) else 21
+            ws.column_dimensions[c.column_letter].width = 68 if name in ('候选写点及位置','源码步序路径','其他写入来源','所属程序段') else 30 if col in (2, 3, 7) else 21
         for i, row in enumerate(selected, 2):
             for col, name in enumerate(headers, 1):
                 value = row.get(name, '')
@@ -392,7 +392,7 @@ def _observation_sheets(book, run):
                 elif name in ('发生次数', '有效计时次数', '中位数时长ms', '样例跳变索引') and value:
                     value = float(value)
                 cell = _cell(ws, i, col, value if value != '' else None)
-                if name == '候选写点及位置':
+                if name in ('候选写点及位置','其他写入来源','源码步序路径','所属程序段'):
                     cell.alignment = Alignment(vertical='top', wrap_text=True)
         ws.freeze_panes = 'D2'
         ws.auto_filter.ref = ws.dimensions

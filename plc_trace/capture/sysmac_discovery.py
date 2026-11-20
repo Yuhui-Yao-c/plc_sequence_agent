@@ -168,7 +168,7 @@ def _numbered_network_notes(transitions):
     return {ident: note for ident, (key, note) in notes.items() if len(owners[key]) == 1}
 
 
-def discover(source, scan, *, on_transition=None, on_unresolved=None):
+def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=None):
     grid = scan.source_format == 'smc2'
     model = collect_smc2(source) if grid else collect_native(source)
     slices = model.get('native_inline_slices', [])
@@ -233,13 +233,18 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None):
                 network = re.match(r'network:(\d+)', rel['body']) if grid else None
                 raw = bound['guard']
                 predicates = model.get('source_predicates', {})
+                dependencies=[]
                 for token in re.findall(r'__source_predicate_[0-9a-f]+', raw):
                     if token in predicates:
+                        if predicates[token] not in dependencies:dependencies.append(predicates[token])
                         raw = raw.replace(token, '(' + predicates[token]['expression'] + ')')
                 fragment, _, node = rel['body'].partition(';line:')
                 node = node.partition(';')[2]
                 location = dict(bound, guard=raw, locator=rel['body'], network=fragment, node=node,
                                 selector=var, selector_ports=rel.get('selector_ports', ()))
+                if not grid and not any(str(p).startswith('token:') for p in rel['path']):
+                    location['rung_order']=int(fragment) if fragment.isdigit() else None
+                if dependencies:location['dependencies']=dependencies
                 if rel['id'] in network_notes:
                     location['comment'] = network_notes[rel['id']]
                 if network:
@@ -274,6 +279,32 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None):
         intact_prefix = next((span[0] for word, span in original if word.upper() in unsupported), 0)
         regions = _case_regions(code)
         outer = source_condition(block['external_guard'])
+        def external_writer(lhs,rhs,gate,scope_site):
+            if not on_entry or not fixed_path(lhs):return
+            try:number=integer(rhs)
+            except ValueError:return
+            if number is None or any(symbol(m[0]).casefold()==lhs.casefold() for m in re.finditer(IDENT,gate.text())):return
+            controls=sorted(_states(gate,required_cursors(gate)))
+            if controls:
+                for row,bound in records(lhs,block['scope'],scope_site):
+                    if row.declared and row.declared.upper() in INTEGER_BOUNDS:
+                        on_entry(row.name,number,{**bound,'kind':'external_state_write',
+                            'controllers':controls,'write_value':rhs})
+        # A source location after a loop can explain who writes a child even
+        # when loop effects preclude a local state edge or timing attribution.
+        if on_entry and block.get('issue','').startswith('ST unsupported flow FOR'):
+            masked,_=isolate_counted_loops(code,writer_locations=True)
+            if masked!=available:
+                locations=STParser(masked,condition_parser=source_condition,strict=False,retain_source=True)
+                try:locations.seq()
+                except ERRORS:pass
+                known={s[3] for s in parser.statements}
+                for lhs,rhs,condition,offset,_ in locations.statements:
+                    if offset not in known:
+                        gate=combine('and',outer,condition)
+                        external_writer(lhs,rhs,gate,{'source_line':block['source_line'],'st_line':1+code.count('\n',0,offset),
+                            'network':str(block['network']),'node':block['node'],'offset':offset,
+                            'guard':gate.text(),'guard_complete':False,'limit':'前序循环的效果未经求值'})
         states = defaultdict(set)
         entries = []
         unit = binding.unit(block['scope'])
@@ -331,6 +362,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None):
                     row.edge(step, destination, bound)
             if number is not None and (unit := binding.unit(block['scope'])) and unit[0] == 'program':
                 target = scan.sysmac_channel(lhs, unit)[0]
+                if lhs.casefold() not in anchors:external_writer(lhs,rhs,gate,site)
                 for other, value in src:
                     if other == lhs.casefold() or _root(other) in loop_writes:
                         continue
@@ -352,6 +384,16 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None):
 
     for args in native_st.values():
         on_transition(*args)
+
+    if on_entry:
+        watched={r['variable'] for r in model['transitions'] if fixed_path(r['variable'])}
+        for site in model.get('range_writes',()):
+            for var in sorted(watched):
+                sub=re.fullmatch(re.escape(site['base'])+r'\[(-?\d+)\]',var,re.I)
+                if sub and site['first']<=int(sub[1])<site['first']+site['count']:
+                    for row,bound in records(var,site['scope'],site):
+                        if row.declared and row.declared.upper() in INTEGER_BOUNDS:
+                            on_entry(row.name,site['value'],bound)
 
     for item in model.get('native_commands', []):
         if not item['guard_complete'] or not item.get('start'):

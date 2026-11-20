@@ -277,7 +277,7 @@ class STParser:
     def case_label(self):
         j=self.i;parts=[]
         while j<len(self.ts) and self.ts[j] not in (':',';'):
-            if self.ts[j].upper() in ('IF','END_CASE','ELSE'):return None
+            if self.ts[j].upper() in ('IF','CASE','END_CASE','ELSE'):return None
             parts.append(self.ts[j]);j+=1
         if j==len(self.ts) or self.ts[j]!=':':return None
         vals=[]
