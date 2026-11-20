@@ -54,7 +54,7 @@ _ST_OPERATOR = re.compile(r'\(|\)|:=|=>')
 _OUTPUT_END = re.compile(r'\s*[,)]')
 
 
-def _executable_text(text):
+def _executable_text(text, *, keep_positions=False):
     """Keep tokens separated when removing PLC comments and string literals."""
     position = 0
     while match := _IGNORED.search(text, position):
@@ -69,6 +69,8 @@ def _executable_text(text):
                     break
             else:
                 return
+        if keep_positions:
+            yield " " * (position - match.start())
     yield text[position:]
 
 
@@ -372,6 +374,8 @@ class _SourceScan:
             return None, '声明缺失或冲突'
         value, = values
         seen = set()
+        if '[' in _SUBSCRIPT.sub('', part):
+            return None, '下标包含运行时表达式'
         indexes = iter(_SUBSCRIPT.findall(part))
         pending = next(indexes, None)
         while True:
@@ -394,7 +398,10 @@ class _SourceScan:
             for dimension, index in zip(dimensions, supplied):
                 low, sep, high = dimension.partition('..')
                 lower, upper = _constant(low), _constant(high) if sep else None
-                if lower is not None and upper is not None and not lower <= int(index) <= upper:
+                position = _constant(index)
+                if position is None:
+                    return None, '下标包含运行时表达式'
+                if lower is not None and upper is not None and not lower <= position <= upper:
                     return None, '下标超出声明范围'
             pending = next(indexes, None)
 

@@ -84,7 +84,8 @@ def _site(item):
             if item.get(k) or k == 'guard_complete'}
     if item.get('instance_path'):
         site['binding'] = [{'scope': c['scope'], 'instance': c['instance'], 'type': c['type'], 'source_line': c['source_line'],
-                            'reference_actuals': {k: c['actuals'][k] for k in c['reference_formals']}}
+                            'reference_actuals': {k: c['actuals'][k] for k in c['reference_formals']},
+                            **{k: c[k] for k in ('node', 'body', 'network', 'guard', 'selector_ports')}}
                            for c in item['instance_path']]
     return site
 
@@ -144,7 +145,7 @@ def _recover_st(code, parser, error):
     return prefix + [s for s in later.statements if s[3] > last and re.split(r'[.\[]', s[0], 1)[0].casefold() not in touched]
 
 
-def discover(source, scan):
+def discover(source, scan, *, on_transition=None, on_unresolved=None):
     root = etree.parse(str(source), etree.XMLParser(huge_tree=True, no_network=True, resolve_entities=False)).getroot()
     names = _nominations(root)
     ci = collect_root(root, names, recover_st=_recover_st)
@@ -187,6 +188,11 @@ def discover(source, scan):
             candidate.owners.add((owner, routine, call['source_line']))
         return candidate
 
+    if on_unresolved:
+        for (key, start), options in ci.state_writes.items():
+            for item in options:
+                if item['to'] is None:
+                    on_unresolved(resolve(key, item).name, start, item)
     for key, item in ci.edges:
         candidate = resolve(key, item, writer=True)
         site = {**_site(item), 'program': item['program'], 'kind': item['grade']}
@@ -194,6 +200,10 @@ def discover(source, scan):
         if others:
             required = required_cursors(source_condition(item['guard'])) & others
             site['co_cursors'] = sorted({resolve(peer, item).name.casefold() for peer in required})
+        if on_transition is not None:
+            on_transition(candidate.name, item['from'], item['to'], {
+                **site, 'selector': names[key], 'source_id': item['source_id'], **{k: item[k] for k in ('body', 'network', 'node', 'write_value',
+                                                 'condition_symbols', 'output_dependencies', 'offset', 'frames', 'selector_ports', 'operating_guard', 'commit', 'selectors')}})
         candidate.edge(item['from'], item['to'], site)
         for other, conditions in item['numeric_conditions'].items():
             if other.casefold() not in names or other.casefold() == key:

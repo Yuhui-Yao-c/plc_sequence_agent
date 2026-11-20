@@ -4,6 +4,8 @@
 
 ## 开发约定
 
+- 步序采集工作流的实现、回归修复和发布提交统一落到 `trace-only`。提交前核对当前分支及其远端头。
+
 - 从项目根目录运行 `python plc_cli.py`。内部模块使用 `plc_trace` 包的显式导入，工具命令使用 `python -m <完整模块名>`。
 - 按功能维护 `source`、`analysis`、`trace`、`description`、`output`、`capture` 和 `runtime`。共享资源位于 `plc_trace/resources/`，通过 `plc_trace.paths` 定位。
 - 源码和实测记录是只读输入。保留源码证据、中间台账、分支条件、待核项和稳定的引用关系。

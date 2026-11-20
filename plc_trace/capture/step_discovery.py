@@ -329,3 +329,15 @@ def scope_index(inventory):
         yield {'name': row['name'], 'family': row['family'], 'declarations': row['declarations'],
                'type_issue': row['type_issue'],
                'scheduled_writers': row.get('scheduled_writers', {}), 'evidence': examples}
+
+
+def discover_source_writes(source, dialect, on_transition, on_unresolved=None):
+    """Use the capture adapters' typed instance binding and concrete write locations."""
+    from plc_trace.capture.extract_step_variables import _SourceScan
+    if dialect == 'plcopen':
+        from plc_trace.capture.plcopen_discovery import discover
+    else:
+        from plc_trace.capture.sysmac_discovery import discover
+    scan = _SourceScan(None, dialect, False)
+    scan.read(source)
+    return discover(source, scan, on_transition=on_transition, on_unresolved=on_unresolved)

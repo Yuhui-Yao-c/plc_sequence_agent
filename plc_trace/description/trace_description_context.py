@@ -180,13 +180,13 @@ class DescriptionContext:
                   'naming_examples': entries, 'annotated_commands': annotated}
         (self.run / MEMORY_FILE).write_text(json.dumps(memory, ensure_ascii=False, indent=1), encoding='utf-8')
 
-    def packet(self, start, end, relation, direct, path, commands, notes, issues=(), *, writes=(), blockers=()):
+    def packet(self, start, end, relation, direct, path, commands, notes, issues=(), *, writes=(), blockers=(), branch=None):
         variable, number = start
         evidence, seen = [], set()
 
         def add(kind, data, *, local=False, **extra):
             item = {'category': kind, 'local': local, 'data': data, **extra}
-            if self.control and local:
+            if (self.control or branch) and local:
                 subjects = []
                 for name in _subject_symbols(kind, data):
                     if name.casefold() in _EXPRESSION_WORDS or name.casefold() == variable:
@@ -210,7 +210,10 @@ class DescriptionContext:
                 seen.add(item['id']); evidence.append(item)
             return item['id']
 
-        add('observed_pair', {'variable': variable, 'from': number, 'to': end[1]}, local=True)
+        if branch:
+            add('source_branch', {**branch, 'variable': variable, 'from': number, 'to': end[1]}, local=True)
+        else:
+            add('observed_pair', {'variable': variable, 'from': number, 'to': end[1]}, local=True)
         command_refs, action_keys, required = {}, set(), []
         for command in commands:
             c = _compact_command(command)
@@ -273,10 +276,10 @@ class DescriptionContext:
             add('candidate_path', edge, local=edge['from'] == number,
                 caveat='静态候选路径，不证明本次采样间实际逐条执行')
         neighbors = []
-        for (scope, binding), graph in self.index.graphs.get(variable, {}).items():
+        for graph in (() if branch else self.index.graphs.get(variable, {}).values()):
             neighbors.extend(graph.get(number, []))
             neighbors.extend(edge for edges in graph.values() for edge in edges if edge['to'] == number)
-        if self.control and local:
+        if (self.control or branch) and local:
             # A real outgoing source guard belongs to this step even when the
             # next sample spans multiple source transitions. Later path edges
             # cannot authorize a clause about the observed starting step.
@@ -292,7 +295,7 @@ class DescriptionContext:
             neighbor = edge['to'] if edge['from'] == number else edge['from']
             for note in self.index.notes.get((variable, neighbor), [])[:2]:
                 add('neighbor_comment', note, caveat='相邻源码状态的注释，不能当成本步注释')
-        for call in self.calls.get(start, [])[:12]:
+        for call in (() if branch else self.calls.get(start, [])[:12]):
             add('guarded_call', call, local=True,
                 caveat='保留原始门控和调用实参，门控中的否定和分支必须由LLM检查')
 
@@ -451,7 +454,7 @@ def _validate_action_clauses(result, context):
         if kind not in _KINDS:
             return None, '须回传行性质和基于引用的推断说明reasoning'
 
-    observed = next(item['data'] for item in catalog.values() if item['category'] == 'observed_pair')
+    observed = next(item['data'] for item in catalog.values() if item['category'] in ('observed_pair', 'source_branch'))
     # A free clause may describe another source effect, but may not rewrite
     # the instruction already covered by a deterministic anchor.
     anchored = {(catalog[ref]['data']['call_ref'], catalog[ref]['data']['actual'].casefold())

@@ -191,6 +191,26 @@ class NativeRung:
         guard=other.gate(p)
         return guard,other.source_conditions.definitions,other.temporal_conditions
 
+    def selector_ports(self, control):
+        ports, seen = [], set()
+        inputs = refs(control)
+        while len(inputs) == 1:
+            ref = inputs[0]
+            if ref in seen or ref in self.duplicates or ref not in self.ports:
+                break
+            seen.add(ref)
+            node, port, _ = self.ports[ref]
+            selector = self.comparison(node)
+            if selector and selector.kind == 'eq' and port.upper() not in ('ENO', '_ENO'):
+                ports.append((*selector.args, self.node_id(node), port))
+            elif kind(node) != 'Contact':
+                break
+            try:
+                inputs = refs(self.input_gate(node))
+            except NativeWireError:
+                break
+        return ports
+
     def ancestors(self,p):
         """Connectivity only: do not treat this traversal as a complete guard."""
         todo=list(refs(p));seen=set();objects={};issues=[]
@@ -268,7 +288,7 @@ def collect_native(source):
         stages.append(row)
         events.append(['omron_iec61131_10',scope,str(network),label,'state_wait' if wait else 'state_transition',
             f'{v}:={dest}',guard,end,'local_state_stage' if complete else 'connected_state_stage_unverified',evidence,comment])
-    def emit(v,dest,g,scope,network,node,line,comment,bscope,path,evidence='omron_native_wired_guard'):
+    def emit(v,dest,g,scope,network,node,line,comment,bscope,path,evidence='omron_native_wired_guard',selector_ports=()):
         vals={a.args[1] for a in comparisons(g) if a.args[0].casefold()==v.casefold()}
         froms=sorted({a.args[1] for a in comparisons(g) if a.kind=='eq' and a.args[0].casefold()==v.casefold() and compatible(g,v,a.args[1])})
         if dest is None:block(v,scope,network,node,'dynamic_state_assignment',bscope,froms);return
@@ -277,7 +297,7 @@ def collect_native(source):
             tid=f'T{len(transitions)+1:07d}'
             transitions.append({'id':tid,'scope':scope,'binding_scope':bscope,'body':f'{network};line:{line};{node}',
                 'variable':v,'from':src,'to':dest,'guard':g.text(),'guard_complete':evidence!='omron_native_symbolic_guard','evidence':evidence,
-                'path':path,'timing_proof':'local_port_guard_only; scan visibility and physical completion unproved'})
+                'path':path,'selector_ports':selector_ports,'network_comment':comment,'timing_proof':'local_port_guard_only; scan visibility and physical completion unproved'})
             add_stage(v,src,dest,g.text(),evidence!='omron_native_symbolic_guard',scope,network,tid,line,comment,bscope,path,evidence)
     def parse_st(code,scope,network,node,line,comment,pou,external=TRUE,external_issue=None,
                  connected_seeds=(),symbolic_external=False,temporal=(),strict=True):
@@ -402,7 +422,7 @@ def collect_native(source):
                         for prev in upstream:
                             if prev.get('typeName','').upper()=='MOVE' and any(t.casefold() in depended for t in wire.targets(prev)):
                                 raise NativeWireError('upstream_state_write_requires_scan_order')
-                        emit(v,val,g,scope,network,node,n.sourceline or line,comment,bs,[wire.node_id(x) for x in upstream]+[node])
+                        emit(v,val,g,scope,network,node,n.sourceline or line,comment,bs,[wire.node_id(x) for x in upstream]+[node],selector_ports=wire.selector_ports(control))
                         stats['move_guards_complete']+=1
                     except (NativeWireError,BoundarySyntaxError) as ex:
                         stats['move_guards_incomplete']+=1;reason=str(ex)
