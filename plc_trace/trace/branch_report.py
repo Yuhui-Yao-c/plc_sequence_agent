@@ -30,6 +30,15 @@ def row_key(row):
     return row.get('分支ID') or f"{row['开始标签']}|||{row['结束标签']}"
 
 
+def observation_display_rows(observations):
+    """Keep each measured pair once. An assigned branch already carries that measurement."""
+    fields = ('构成要素', '控制器', '证据POU', '开始标签', '结束标签', '分支判定', '跳变来源',
+              '源码步序路径', '所属程序段', '其他写入来源', *TIME_FIELDS)
+    for row in observations:
+        if not row['分支ID']:
+            yield {**{key: row[key] for key in fields}, '状态': 'trace_observation', '本次状态': '实测跳变'}
+
+
 def delivery_evidence(run):
     path = Path(run) / EVIDENCE_FILE
     if path.is_file():

@@ -239,6 +239,27 @@ class PlcopenTraceControlTests(unittest.TestCase):
         self.assertEqual(info['relation'], 'direct')
         self.assertEqual(info['linked_commands'][0]['arguments'], 'Drive.PositionRequest')
 
+    def test_ld_commands_follow_the_state_write_outputs_that_can_energize_them(self):
+        name = 'Line.Phase'
+        nodes = network(100, '流向选择') + operand(1, name) + operand(2, '20') + compare(3, 1, 2)
+        for n, end in enumerate((100, 200, 300)):
+            contact_id = 10 + n
+            nodes += contact(contact_id, [3], f'Ready{n}') + operand(20 + n, str(end))
+            nodes += move(30 + n, contact_id, 20 + n, name).replace(
+                '<outputVariables>', '<outputVariables><variable formalParameter="ENO"><connectionPointOut/></variable>')
+        def coil(node, symbol, *feeds):
+            wires = ''.join(f'<connection refLocalId="{ref}" formalParameter="{port}"/>' for ref, port in feeds)
+            return (f'<coil localId="{node}" storage="set"><connectionPointIn>{wires}</connectionPointIn>'
+                    f'<variable>{symbol}</variable></coil>')
+        nodes += coil(40, 'LoadPermit', (30, 'ENO'))
+        nodes += coil(41, 'EitherPermit', (30, 'ENO'), (31, 'ENO'))
+        nodes += coil(42, 'Shared', (30, 'ENO'), (3, ''))
+        idx = self.index(program('Transfer', ladder(nodes)), (name,))
+        for end, expected in [(100, {'LoadPermit', 'EitherPermit', 'Shared'}),
+                              (200, {'EitherPermit', 'Shared'}), (300, {'Shared'})]:
+            info = idx.lookup(f'{name}=20', f'{name}={end}')
+            self.assertEqual({c['arguments'] for c in info['linked_commands']}, expected)
+
     def test_custom_bool_output_follows_declared_input_through_implicit_port(self):
         name = 'Sequence[0]'
         template = (

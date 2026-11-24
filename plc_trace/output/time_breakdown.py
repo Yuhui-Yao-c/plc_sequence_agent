@@ -1,5 +1,4 @@
 """Render the entry-one time breakdown. All row facts are keyed by both Trace labels."""
-import csv
 import json
 import re
 from collections import Counter, defaultdict
@@ -16,7 +15,7 @@ from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.hyperlink import Hyperlink
 
 from plc_trace.description.trace_description_report import annotation_evidence_text, annotation_supplement, waiting_role
-from plc_trace.trace.branch_report import OBSERVATIONS_FILE, EVIDENCE_FILE as BRANCH_EVIDENCE
+from plc_trace.trace.branch_report import EVIDENCE_FILE as BRANCH_EVIDENCE
 from plc_trace.trace.sample_continuity import GAP_FILE
 from plc_trace.trace.trace_source_evidence import EVIDENCE_FILE, RELATION_TEXT
 
@@ -154,6 +153,10 @@ def _evidence(pair, desc, info, audits):
     if 'trace_jumps.csv' in audits and pair.get('样例跳变索引') not in (None, ''):
         capture = pair.get('样例采集ID')
         audit += '，首个跳变' + (f'采集 {capture}，' if capture else '') + f'样本索引 {pair["样例跳变索引"]}'
+    if pair.get('状态') == 'trace_observation':
+        details = [f'{field}　{pair[field]}' for field in ('分支判定', '跳变来源', '源码步序路径', '所属程序段', '其他写入来源')
+                   if pair.get(field)]
+        return '\n'.join(filter(None, [obs, audit, *details]))
     relation = RELATION_TEXT.get(pair.get('源码关系'), '源码关系待核')
     loc = '，'.join(s for s in (pair.get('证据POU'), pair.get('证据节点')) if s)
     parts = [obs, audit or '观测依据仅有状态对 CSV，跳变和稳定段台账缺失', relation + (f'〔{loc}〕' if loc else '')]
@@ -284,6 +287,11 @@ def _component_blocks(groups, row_owners):
 
 def _remark(pair, desc, info, owner, role):
     notes = []
+    observation = pair.get('状态') == 'trace_observation'
+    if observation:
+        notes.append(pair['分支判定'] + '。')
+        if path := pair.get('源码步序路径'):
+            notes.append(f'源码路径 {path}。')
     if supplement := desc.get('注释补充'):
         if owner and supplement != '例程归属待核':
             program, routine = owner
@@ -304,7 +312,7 @@ def _remark(pair, desc, info, owner, role):
         notes.append('多个源码位置都可能控制本步，需确认归属。')
     elif relation == 'unresolved':
         notes.append('源码中尚未找到与这次跳变对应的路径。')
-    if not desc.get('动作描述'):
+    if not observation and not desc.get('动作描述'):
         status = desc.get('描述状态')
         notes.append({'B档待处理': '动作描述待补写。', 'B档待修订': '动作描述需重新核对。'}.get(
             status, '动作描述缺少可核对的依据。'))
@@ -367,11 +375,8 @@ def _write_sampling_gaps(book, run):
     ws.auto_filter.ref = f'A2:K{ws.max_row}'
 
 
-def _observation_sheets(book, run):
-    path = Path(run) / OBSERVATIONS_FILE
+def _observation_sheets(book, run, rows):
     candidates = json.loads((Path(run) / BRANCH_EVIDENCE).read_text(encoding='utf-8'))['candidates']
-    with path.open(encoding='utf-8-sig', newline='') as stream:
-        rows = list(csv.DictReader(stream))
     fields = ('构成要素', '开始标签', '结束标签', '发生次数', '有效计时次数', '中位数时长ms',
               '分支判定', '样例采集ID', '样例跳变索引', '分支ID')
     for title, selected, headers in (
@@ -398,13 +403,16 @@ def _observation_sheets(book, run):
         ws.auto_filter.ref = ws.dimensions
 
 
-def write_breakdown(groups, descriptions, out, proc, digest, run, evidence, *, branch_mode=False):
+def write_breakdown(groups, descriptions, out, proc, digest, run, evidence, *, observations=None):
     book = Workbook()
     sheet = book.active
     _header(sheet, proc, digest)
+    branch_mode = observations is not None
     columns = COLUMNS
     if branch_mode:
-        columns += (('本次状态', 27), ('转移条件', 52), ('关联实测跳变', 30), ('源码位置', 52), ('适用工况', 45))
+        sheet['A1'].comment = Comment(f'{proc}。源码分支文件 SHA256 前16位 {digest}。实测次数和时长可逐行核对「实测跳变」。', 'PLC Trace')
+        columns += (('本次状态', 27), ('转移条件', 52), ('关联实测跳变', 30), ('源码位置', 52), ('适用工况', 45),
+                    ('发生次数', 14), ('有效计时次数', 16))
         for col, (heading, width) in enumerate(columns[len(COLUMNS):], len(COLUMNS) + 1):
             cell = _cell(sheet, 2, col, heading)
             cell.fill = FILLS['表头']
@@ -419,6 +427,11 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence, *, b
     for key, info in evidence.items():
         pair_key = key if branch_mode else tuple(key.split('|||', 1))
         owners[pair_key], annotation_owners[pair_key] = _row_owners(info, native_source)
+    for row in observations or ():
+        if not row['分支ID'] and row['候选写点'] and not row['其他写入来源']:
+            choices = {owners.get(ident) for ident in row['候选写点'].split('、')}
+            if len(choices) == 1:
+                owners[row['开始标签'], row['结束标签']] = choices.pop()
     station_blocks, components = _component_blocks(groups, owners)
     review_rows = b_rows = measured = 0
     waits = Counter()
@@ -445,6 +458,9 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence, *, b
                 if text and source.startswith('B档') and status in ('', 'LLM推断待核验'):
                     origin = 'LLM'
                     b_rows += 1
+                if pair.get('状态') == 'trace_observation':
+                    text = f"实测跳变 {start.rsplit('=', 1)[-1]} → {end.rsplit('=', 1)[-1]}"
+                    origin = 'Trace'
                 role = desc.get('等待判定') if origin and desc.get('等待依据') else ''
                 if role:
                     waits[role] += 1
@@ -462,7 +478,11 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence, *, b
                           14: _remark(pair, desc, info, annotation_owners.get(key), role),
                           15: _evidence(pair, desc, info, audits)}
                 if branch_mode:
-                    values.update({16: pair['本次状态'], 17: pair['原始条件'], 18: pair['关联实测'], 19: pair['源码位置'], 20: pair['适用工况']})
+                    values.update({16: pair['本次状态'], 17: pair['原始条件'], 18: pair['关联实测'],
+                                   19: pair['源码位置'], 20: pair['适用工况']})
+                    for col, field in ((21, '发生次数'), (22, '有效计时次数')):
+                        if pair[field] != '':
+                            values[col] = int(pair[field])
                 for col, (heading, width) in enumerate(columns, 1):
                     value = values.get(col)
                     cell = _cell(sheet, r, col, value)
@@ -509,7 +529,7 @@ def write_breakdown(groups, descriptions, out, proc, digest, run, evidence, *, b
         sheet.row_dimensions[r].height = 13.8
         r += 1
     if branch_mode:
-        _observation_sheets(book, run)
+        _observation_sheets(book, run, observations)
     _write_sampling_gaps(book, run)
     book.save(out)
     return {'trace_review_rows': review_rows, 'b_desc_rows': b_rows,

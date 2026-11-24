@@ -184,6 +184,9 @@ class ActionBranchTests(unittest.TestCase):
         book = load_workbook(next(out.glob('*.xlsx')))
         sheet = book['时序拆解']
         rows = {(r[7],r[8]):r for r in sheet.values if r[7] and r[8]}
+        self.assertEqual(rows['Phase=99','Phase=100'][15], '实测跳变')
+        self.assertEqual(rows['Phase=99','Phase=100'][20:22], (1, 0))
+        self.assertIsNone(rows['Phase=99','Phase=100'][5])
         self.assertEqual(rows['Phase=100','Phase=110'][5],20)
         self.assertIsNone(rows['Phase=100','Phase=120'][5])
         self.assertEqual(rows['Phase=200','Phase=205'][15],'本次未观测')
@@ -205,3 +208,41 @@ class ActionBranchTests(unittest.TestCase):
         cached.write_text(json.dumps(data))
         with self.assertRaisesRegex(ValueError,'校验'):
             write_index(self.source,copy,cached)
+
+    def test_main_sheet_keeps_sampled_path_and_same_endpoint_competition_once(self):
+        self.st("""CASE Phase OF
+            10: Phase:=20;
+            20: IF Take THEN Phase:=100; ELSE Phase:=200; END_IF;
+            100: Phase:=110;
+            110: Phase:=120;
+            120: IF Retry THEN Phase:=130; ELSE Phase:=140; END_IF;
+            130: Phase:=140;
+            300: Phase:=310;
+            END_CASE;""")
+        trace = self.root / '20260101080000_00001.csv'
+        base = 1700000000000000000
+        values = (0, 10, 10, 110, 120, 120, 120, 140)
+        trace.write_text('TraceType,Continuous\nSampleTimingType,interval\nStartRawTime,' + str(base)
+                         + '\nIndex,RawTime,Phase:INT\n' + ''.join(
+                             f'{i},{base + i * 10**7},{step}\n' for i, step in enumerate(values)))
+        out = self.root / 'run'
+        with patch('sys.argv', ['plc_cli.py', 'trace', '--source', str(self.source), '--trace', str(trace),
+                                '--out', str(out)]), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            main()
+        book = load_workbook(next(out.glob('*.xlsx')), read_only=True)
+        self.addCleanup(book.close)
+        data = [r for r in list(book['时序拆解'].values)[2:] if r[7] and r[8]]
+        def pair(a, b):
+            return [r for r in data if (r[7], r[8]) == (f'Phase={a}', f'Phase={b}')]
+        measured = [r for r in data if r[20]]
+        self.assertEqual(len(measured), 4)
+        self.assertEqual({(r[7], r[8], r[5], r[20], r[21]) for r in measured}, {
+            ('Phase=0', 'Phase=10', None, 1, 0), ('Phase=10', 'Phase=110', 20, 1, 1),
+            ('Phase=110', 'Phase=120', 10, 1, 1), ('Phase=120', 'Phase=140', 30, 1, 1)})
+        self.assertEqual(len(pair(110, 120)), 1)
+        self.assertIn('10 → 20 → 100 → 110', pair(10, 110)[0][13])
+        self.assertEqual(pair(10, 110)[0][4], 'Trace')
+        for a, b in ((10, 20), (20, 100), (20, 200), (100, 110)):
+            self.assertEqual([r[5] for r in pair(a, b)], [None])
+        self.assertEqual([r[5] for r in pair(120, 140)], [30, None])
+        self.assertFalse(pair(300, 310))

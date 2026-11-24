@@ -16,13 +16,13 @@ SHA256戳与分组方式；排序仅为展示查找便利，不代表执行顺�
 步序/标签内容完全来自同一行预测记录与源码证据文件，无推断文本；
 该xlsx仅供人阅读，评价仍直接读CSV。finish(workflow.validate)成功后自动生成本表。
 """
-import argparse, hashlib, json, re, os
+import argparse, csv, hashlib, json, re, os
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from plc_trace.output.time_breakdown import restore_annotation_details, write_breakdown
-from plc_trace.trace.branch_report import BRANCH_FILE, delivery_evidence
+from plc_trace.trace.branch_report import BRANCH_FILE, OBSERVATIONS_FILE, delivery_evidence, observation_display_rows
 from plc_trace.trace.trace_source_evidence import read_trace_evidence
 from plc_trace.output.station_identity import source_station_displays
 from plc_trace.output.utils import load_station_identity, infer_proc_name
@@ -406,6 +406,13 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
             }
         desc_stats = dd['描述来源'].value_counts().to_dict()
     df = pd.read_csv(prediction, dtype=str, encoding='utf-8-sig')
+    observations = None
+    if branch_mode:
+        with open(os.path.join(run, OBSERVATIONS_FILE), encoding='utf-8-sig', newline='') as stream:
+            observations = list(csv.DictReader(stream))
+        measured = pd.DataFrame.from_records(observation_display_rows(observations))
+        if not measured.empty:
+            df = pd.concat([measured, df], ignore_index=True)
     for col in ('开始标签', '结束标签'):
         if col not in df.columns:
             raise ValueError(f'prediction file lacks column: {col}')
@@ -463,7 +470,7 @@ def generate(prediction, out=None, group_by='auto', proc_name=None, run=None, sh
         if needs_annotation_details and not branch_mode:
             restore_annotation_details(evidence, desc_map)
             desc_stats = pd.Series([d.get('描述来源', '') for d in desc_map.values()], dtype=str).value_counts().to_dict()
-        rendered = write_breakdown(workstations, desc_map, out, proc_name, sha16, run, evidence, branch_mode=branch_mode)
+        rendered = write_breakdown(workstations, desc_map, out, proc_name, sha16, run, evidence, observations=observations)
         return {'proc_name': proc_name, 'rows': len(df), 'action_variable_rows': hits,
                 'workstation_groups': workstations.ngroups, 'group_by': group_by,
                 'desc_sources': desc_stats, 'source_sha16': sha16, 'amap_keys': 0, 'out': out,

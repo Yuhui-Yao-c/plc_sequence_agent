@@ -206,6 +206,20 @@ class EvidenceWire(WireBody):
         self.templates = templates
         self.output_models = output_models
         self.output_provenance = {}
+        self.enable_outputs = {}
+
+    def exit_sources(self, expression, state_writers):
+        """State writes on whose ENO the command is wired, within this LD body and call."""
+        if expression.kind == 'opaque_cmp':
+            writer = state_writers.get(self.enable_outputs.get(expression.args[0]))
+            return {writer} if writer else set()
+        if expression.kind not in ('and', 'or'):
+            return set()
+        arms = [self.exit_sources(child, state_writers) for child in expression.args]
+        # A parallel feed bypassing all state writes can energize the command independently.
+        if expression.kind == 'or' and not all(arms):
+            return set()
+        return set().union(*arms)
 
     def _template_output(self, node, port, kind):
         options = self.templates.get(kind.casefold(), ())
@@ -334,6 +348,8 @@ class EvidenceWire(WireBody):
                 label = node.get('instanceName') or kind
                 output = port.upper() or (template[1].upper() if template else ('Q' if timer else 'ENO'))
                 opaque = f'{_UNKNOWN}{label}#{ref}.{output})'
+                if output == 'ENO':
+                    self.enable_outputs[opaque] = ref
                 if template:
                     gate = self._bound_output(node, gate, template, opaque)
                 result = combine_wiring('and', gate, Expr('opaque_cmp', (opaque,)))
@@ -481,6 +497,7 @@ class ControlIndex:
         self.partial = set()
         self.bindings_found = set()
         self.branch_guards = {}
+        self.command_exits = {}
 
     def _issue(self, reason, targets, site=None, detail=''):
         self.issues[reason] += 1
@@ -531,7 +548,7 @@ class ControlIndex:
                     'st_line': site.note_st_line, 'origin': grade, 'instance_path': site.chain}
             if note not in self.notes[state]:
                 self.notes[state].append(note)
-        return True
+        return item['source_id']
 
     def _write(self, state, target, value, site, gate, command, branch=None):
         evidence = site.evidence(gate)
@@ -544,9 +561,13 @@ class ControlIndex:
             self.commands[state].append(item)
         if branch:
             self.branch_guards[item['id']] = branch
+        return item['id']
 
     def compatible_write(self, state, command, edges):
-        """Separate exclusive ST arms within one fragment evaluation."""
+        """Check physical LD enable paths and exclusive ST arms for this exit."""
+        exits = self.command_exits.get(command['id'])
+        if exits and edges and not any(edge['source_id'] in exits for edge in edges):
+            return False
         source = self.branch_guards.get(command['id'])
         if source is None:
             return True
@@ -650,6 +671,7 @@ class ControlIndex:
             return
         wire = EvidenceWire(body, self.templates, self.output_models)
         known = defaultdict(set)
+        state_writers = defaultdict(dict)
         writes = []
         for node, network, raw, note_line in _networks(body):
             kind = tag(node)
@@ -730,17 +752,21 @@ class ControlIndex:
                         if state[0] == var:
                             destination = state_write_value(bound_value, var, state[1], bounds)
                             grade = 'plcopen_wired_expression' if operator else 'plcopen_wired_move'
-                            if self._state_write(state, destination, bound_value, site, gate, grade):
+                            source_id = self._state_write(state, destination, bound_value, site, gate, grade)
+                            if source_id:
+                                state_writers[state][site.node] = source_id
                                 known[site.network].add(state)
                 elif value:
-                    writes.append((site, gate, target, bound_value, matched, command))
+                    writes.append((site, gate, target, bound_value, matched, command, wired))
         # Only the executable state network admits local writes. An
         # independent comparison network that logs the same step is excluded.
         # A command can precede its exit feedback during the step's dwell.
         # Its LD gate and the exit gate need not hold at the same instant.
-        for site, gate, target, value, matched, command in writes:
+        for site, gate, target, value, matched, command, wired in writes:
             for state in sorted(known[site.network] & matched):
-                self._write(state, target, value, site, gate, command)
+                ident = self._write(state, target, value, site, gate, command)
+                if exits := wire.exit_sources(wired, state_writers[state]):
+                    self.command_exits[ident] = exits
 
     def _call(self, node, wire, site, parent, read_only, outer, active, options):
         actuals, ambiguous = bindings(node, wire)
