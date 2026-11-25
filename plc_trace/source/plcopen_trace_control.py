@@ -498,8 +498,10 @@ class Site:
 class ControlIndex:
     policy = 'plcopen_control'
 
-    def __init__(self, wanted, templates, types, recover_st=None):
+    def __init__(self, wanted, templates, types, recover_st=None, collect_dispatch=False):
         self.recover_st = recover_st
+        self.collect_dispatch = collect_dispatch
+        self.dispatches = {}
         self.wanted = wanted
         self.templates = templates
         self.types = types
@@ -530,7 +532,7 @@ class ControlIndex:
                 })
 
     def _external_write(self, target, value, site, gate, matched):
-        if not matched or any(name==target for name,_ in matched):
+        if gate == FALSE or (not matched and not self.collect_dispatch) or any(name==target for name,_ in matched):
             return
         if any(symbol(m[0]).casefold()==target for m in re.finditer(IDENT,gate.text())):
             return
@@ -539,6 +541,13 @@ class ControlIndex:
         if destination is not None:
             self.external_writes.append((target,destination,{**site.evidence(gate),
                 'controllers':sorted(matched),'kind':'external_state_write','write_value':value}))
+
+    def _dispatch(self, matched, target, value, site, gate):
+        if self.collect_dispatch and value.upper() in {'TRUE', 'FALSE'}:
+            for var, step in matched:
+                key = var, step, site.program, site.scope, target, gate.text()
+                if key not in self.dispatches:
+                    self.dispatches[key] = {**site.evidence(gate), 'target': target}
 
     def _state_write(self, state, destination, value, site, gate, grade, branch=None):
         if destination == state[1]:
@@ -608,7 +617,7 @@ class ControlIndex:
         # has no state writer and cannot contribute either notes or effects.
         candidates = {target(m[1]).casefold() for m in _ASSIGN.finditer(code)}
         candidates &= self.wanted
-        if not candidates:
+        if not candidates and not self.collect_dispatch:
             return set()
         parser = STParser(code, condition_parser=source_condition, strict=False, retain_source=True)
         grade = 'plcopen_structured_st'
@@ -677,6 +686,7 @@ class ControlIndex:
             if any(symbol(m[1]).casefold() in self.wanted
                    for m in _COMPARE_READ.finditer(_QUOTED.sub('', value))):
                 continue
+            self._dispatch(matched, write, value, located, gate)
             for state in sorted(states & matched):
                 self._write(state, write, value, located, gate, 'st_write', (fragment, condition))
         return states
@@ -735,7 +745,7 @@ class ControlIndex:
                         known[site.network].update(self._st(child.text, site, gate, actuals, read_only))
                 continue
             matched = set(_states(gate, self.wanted))
-            if not matched:
+            if not matched and not self.collect_dispatch:
                 continue
             if kind == 'coil':
                 storage = node.get('storage', '').casefold()
@@ -782,6 +792,7 @@ class ControlIndex:
         # A command can precede its exit feedback during the step's dwell.
         # Its LD gate and the exit gate need not hold at the same instant.
         for site, gate, target, value, matched, command, wired in writes:
+            self._dispatch(matched, target, value, site, gate)
             for state in sorted(known[site.network] & matched):
                 ident = self._write(state, target, value, site, gate, command)
                 if exits := wire.exit_sources(wired, state_writers[state]):
@@ -852,7 +863,7 @@ def collect(source, variables):
     return collect_root(root, variables)
 
 
-def collect_root(root, variables, *, recover_st=None):
+def collect_root(root, variables, *, recover_st=None, collect_dispatch=False):
     """Index controls on an already parsed project, including concrete FB actuals."""
     wanted = {symbol(name).casefold() for name in variables if re.fullmatch(IDENT, name)}
     templates = defaultdict(list)
@@ -862,7 +873,7 @@ def collect_root(root, variables, *, recover_st=None):
             templates[unit.get('name', '').casefold()].append((unit, interface(unit)))
         elif not any(a.get('pouType', '').casefold() == 'functionblock' for a in unit.iterancestors()):
             units.append(unit)
-    result = ControlIndex(wanted, templates, StateTypes(root, root.iter('{*}pou')), recover_st)
+    result = ControlIndex(wanted, templates, StateTypes(root, root.iter('{*}pou')), recover_st, collect_dispatch)
     if not wanted:
         return result
     roots = '|'.join(re.escape(value) for value in sorted({_root(v) for v in wanted}))

@@ -9,6 +9,8 @@ from plc_trace.analysis.boundary_logic import IDENT, integer, symbol
 from plc_trace.analysis.fb_transport import bindings, interface
 from plc_trace.analysis.successor_graph import STParser, WireBody, pins, tag, text, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import _executable_text
+from plc_trace.capture.coverage import service_isolation
+from plc_trace.capture.capture_use import _guard_signals
 from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops, loop_may_write
 from plc_trace.capture.station_scope import at_path, declaration, required_cursors
 from plc_trace.source.source_expressions import source_condition
@@ -155,7 +157,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
     names = _nominations(root)
     def recover(code, parser, error):
         return _recover_st(code, parser, error, allow_early_exit=on_transition is None)
-    ci = collect_root(root, names, recover_st=recover)
+    ci = collect_root(root, names, recover_st=recover, collect_dispatch=on_transition is None)
     pous = {_scope(p): p for p in root.iter('{*}pou')}
     calls = _ordered_action_calls(root,pous) if on_transition else {}
     result = Discovery()
@@ -187,7 +189,9 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
         candidate = result.candidate(name)
         if local and (unit is None or unit.get('pouType', '').casefold() != 'program'):
             candidate.reasons.add('local_without_program_instance')
-        candidate.declared, candidate.declarations = declared_type(key, program)
+        candidate.declared, declarations = declared_type(key, program)
+        candidate.declarations = ([{**d, 'path': f'{owner}.{d["path"]}'} for d in declarations]
+                                  if local else declarations)
         if not candidate.declared:
             candidate.type_issue = '缺少唯一且受支持的整数叶类型或数组声明'
         if writer:
@@ -208,6 +212,8 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
     for key, item in ci.edges:
         candidate = resolve(key, item, writer=True)
         site = {**_site(item), 'program': item['program'], 'kind': item['grade']}
+        if on_transition is None:
+            site['selector'] = names[key]
         if item['scope'] in calls and not item['instance_path']:
             site['invocation']=calls[item['scope']]
         others = (names.keys() & {n.casefold() for n in item['numeric_conditions']}) - {key}
@@ -224,6 +230,10 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                 break
         if item['operating_guard']:
             site['operating_guard'] = item['operating_guard']
+            if on_transition is None:
+                # Resolve unqualified mode flags in the actual writer's program.
+                site['global_reads'] = sorted(s for s in _guard_signals(item['operating_guard'])
+                                              if re.split(r'[.\[]', s, 1)[0] not in ci.types.locals.get(item['program'], {}))
         candidate.edge(item['from'], item['to'], site)
         for other, conditions in item['numeric_conditions'].items():
             if other.casefold() not in names or other.casefold() == key:
@@ -238,6 +248,15 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             candidate = resolve(key, item)
             candidate.effect(step, {**_site(item), 'kind': item['command'], 'target': item['arguments'],
                                     'value': item['write_value']})
+    for (key, step, *_), item in ci.dispatches.items():
+        candidate = resolve(key, item)
+        if not candidate.edges:
+            candidate.dispatch(step, {**_site(item), 'target': item['target']}, key)
+    if on_transition is None:
+        for key, value, item in ci.external_writes:
+            candidate = resolve(key, item)
+            if value in candidate.dispatches or (len(candidate.edges) == 1 and any(a == value for a, _ in candidate.edges)):
+                resolve(key, item, writer=True).external_write(value, _site(item))
     # Use only witnessed control writes for automatic routing. Initialisation,
     # display copies and uncalled program bodies do not establish scheduling.
     programs = scan.program_writes
@@ -257,7 +276,16 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             for name, witness in task['channel_writes'].items():
                 result.candidates[name.casefold()].scheduled[task['name']] = witness
         for row in result.candidates.values():
-            if row.edges and not row.scheduled:
+            if (row.edges or row.external_writes) and not row.scheduled:
                 row.reasons.add('no_reachable_control_writer_in_exported_schedule')
+    if on_transition is None:
+        for row in result.candidates.values():
+            if row.sites:
+                program = next(iter(row.sites.values()))['program']
+                row.service_isolation = service_isolation(row, lambda path: declared_type(path, program)[1])
     result.issues = dict(sorted(ci.issues.items()))
+    if on_transition is None:
+        dynamic = sorted(name for name in names.values() if not fixed_path(name))
+        if dynamic:
+            result.issues['unresolved_selectors'] = dynamic
     return result

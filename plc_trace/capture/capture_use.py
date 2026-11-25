@@ -118,7 +118,7 @@ def capture_lists(inventory, decisions, slots):
         key = row['identity']
         decision = by_name.get(key, {})
         admission = decision.get('admission')
-        if admission == 'captured':
+        if admission in ('captured', 'retained'):
             primary[key] = row
         elif key in slots:
             slot = slots[key]
@@ -126,7 +126,8 @@ def capture_lists(inventory, decisions, slots):
                              '同一专用步序数组有固定引用，尚缺本下标控制生产动作的写步', slot['array_example']))
         elif admission != 'excluded' and (decision or row['eligibility'] == 'scope_required'):
             basis = set(decision.get('basis', ()))
-            t = next((t for t in row['transitions'] if t['id'] in basis), row['transitions'][0])
+            t = (next((t for t in row['transitions'] if t['id'] in basis), row['transitions'][0])
+                 if row['transitions'] else row['dispatch_writes'][0]['write'])
             optional.append((row['name'], USES[decision.get('use', 'unresolved')], row['type'] or '',
                              t['scope'], t['source_line'], decision.get('reason', '待核对本实例的生产动作边界'), ''))
     return primary, optional
@@ -148,6 +149,22 @@ def _support_text(via, write, references):
 
 def capture_context(primary, decisions):
     for decision in decisions:
+        if decision['admission'] == 'retained':
+            row = primary[decision['name'].casefold()]
+            if row.get('dispatch_writes'):
+                for pair in row['dispatch_writes']:
+                    site, read = pair['write'], pair['dispatch']
+                    evidence = f"{decision['retention_reason']}。分派读取位于 {read['scope']}，XML {read['source_line']}"
+                    if read.get('st_line'):
+                        evidence += f"，段内 ST {read['st_line']}"
+                    yield (row['name'], '待核，先采', site['scope'], site.get('operating_guard', ''),
+                           '', pair['value'], site.get('guard', ''), site.get('guard_complete', False),
+                           site['source_line'], site.get('st_line', ''), '', 'distributed_write', evidence)
+                continue
+            site = row['transitions'][0]
+            yield (row['name'], '待核，先采', site['scope'], site.get('operating_guard', ''),
+                   site['from'], site['to'], site.get('guard', ''), site.get('guard_complete', False),
+                   site['source_line'], site.get('st_line', ''), site['id'], 'retained', decision['retention_reason'])
         if decision['admission'] != 'captured':
             continue
         row = primary[decision['name'].casefold()]

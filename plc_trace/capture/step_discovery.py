@@ -9,7 +9,9 @@ from plc_trace.analysis.boundary_logic import IDENT, symbol
 from plc_trace.analysis.candidate_filter import glob_regex
 from plc_trace.analysis.successor_graph import _st_tokens_with_spans
 from plc_trace.capture.capture_use import timing_use
-from plc_trace.capture.station_scope import dependent_writes, family, same_station_array, writer_context
+from plc_trace.capture.coverage import protect_channels
+from plc_trace.capture.station_scope import dependent_writes, family, required_cursors, same_station_array, writer_context
+from plc_trace.source.source_expressions import source_condition
 
 
 def digest(value):
@@ -104,6 +106,10 @@ def isolate_counted_loops(code, *, writer_locations=False, allow_early_exit=True
     return ''.join(pieces) + code[last:], touched
 
 
+def gated_write(site):
+    return site.get('guard_complete') and site.get('guard', '').upper() not in ('', 'TRUE', 'FALSE')
+
+
 @dataclass
 class Candidate:
     name: str
@@ -117,6 +123,27 @@ class Candidate:
     declarations: list = field(default_factory=list)
     declared: str = ''
     type_issue: str = ''
+    request_inputs: set = field(default_factory=set)
+    other_outputs: set = field(default_factory=set)
+    service_isolation: dict | None = None
+    dispatches: dict = field(default_factory=dict)
+    external_writes: dict = field(default_factory=dict)
+
+    def external_write(self, value, site):
+        known = self.external_writes.get(value)
+        if known is None or (gated_write(site) and not gated_write(known)):
+            self.external_writes[value] = site
+
+    def dispatch(self, step, site, selector, source=None):
+        """A read selecting an action, independent of whether that action writes this cursor."""
+        source = source or site
+        cases = [frame[3].casefold() for frame in source.get('frames', ()) if frame[0] == 'case']
+        if cases:
+            if cases[-1] != selector:
+                return
+        elif required_cursors(source_condition(source.get('guard', ''))) != {selector}:
+            return
+        self.dispatches.setdefault(step, site)
 
     def edge(self, a, b, site):
         if a is None or b is None or a == b:
@@ -160,13 +187,30 @@ class Candidate:
         links = [{**self.links[key], 'id': f'l{n}'} for n, key in enumerate(sorted(self.links, key=repr), 1)]
         eligibility = ('single_write' if self.reasons == {'isolated_write_without_controlled_effect'}
                        else 'review' if self.reasons else 'scope_required')
+        separate = self.dispatches.keys() & self.external_writes.keys()
+        split = (not sites and len(separate) >= 2 and fixed_path(self.name)
+                 and not (self.reasons - {'no_constrained_state_change', 'reference_only'}))
+        if split:
+            eligibility = 'distributed_write'
+            self.reasons.discard('no_constrained_state_change')
+        entries = [{'value': n, **self.external_writes[n]} for n in sorted(starts & self.external_writes.keys())
+                   if gated_write(self.external_writes[n])]
+        scopes = {s['scope'] for s in sites}
+        if split:
+            scopes.update(s['scope'] for n in separate for s in (self.dispatches[n], self.external_writes[n]))
         return {'name': self.name, 'identity': self.name.casefold(), 'type': self.declared or None,
                 'family': family(self.name),
                 'declarations': [{**d, 'id': f'd{i}'} for i, d in enumerate(self.declarations, 1)],
                 'type_issue': self.type_issue, 'eligibility': eligibility,
-                'reasons': sorted(self.reasons), 'edges': len(self.edges), 'scopes': sorted({s['scope'] for s in sites}),
+                'reasons': sorted(self.reasons), 'edges': len(self.edges), 'scopes': sorted(scopes),
                 'transitions': sites, 'effects': effects, 'control_links': links,
+                **({'entry_writes': entries} if eligibility == 'single_write' and entries else {}),
+                **({'dispatch_writes': [{'value': n, 'dispatch': self.dispatches[n], 'write': self.external_writes[n]}
+                                        for n in sorted(separate)]} if split else {}),
                 'sequence_witness': _sequence_witness(sites),
+                **({'request_inputs': sorted(self.request_inputs)} if self.request_inputs else {}),
+                **({'other_outputs': sorted(self.other_outputs)} if self.other_outputs else {}),
+                **({'service_isolation': self.service_isolation} if self.service_isolation else {}),
                 **({'scheduled_writers': self.scheduled} if self.scheduled else {})}
 
 
@@ -224,7 +268,7 @@ class Discovery:
             for site in row['transitions']:
                 if 'co_cursors' in site:
                     site['co_cursors'] = sorted(controllers.intersection(site['co_cursors']) - {row['identity']})
-        data = {'schema': 'plc.step_discovery.v4', 'scope_policy': 'production_timing', 'source_sha256': source_sha, 'adapter': adapter,
+        data = {'schema': 'plc.step_discovery.v5', 'scope_policy': 'production_timing', 'source_sha256': source_sha, 'adapter': adapter,
                 'candidates': records, 'parse_limits': self.issues}
         data['inventory_sha256'] = digest(data)
         return data
@@ -249,7 +293,7 @@ def _station_evidence(candidate, row, citations):
         raise ValueError(f'工位归属缺独立佐证，请补充本例程证据或标为待核：{candidate["name"]}')
 
 
-def scope_selection(inventory, decisions):
+def scope_selection(inventory, decisions, required_channels=()):
     """Separate source evidence of progression from the channel's role in the machine."""
     eligible = {r['identity']: r for r in inventory['candidates'] if r['eligibility'] in {'scope_required', 'single_write'}}
     required = {key for key, row in eligible.items() if row['eligibility'] == 'scope_required'}
@@ -273,10 +317,15 @@ def scope_selection(inventory, decisions):
             raise ValueError(f'重复声明工位变量族：{group}')
         families[group] = key
     reviewed = {}
+    distributed = {r['identity'] for r in inventory['candidates'] if r['eligibility'] == 'distributed_write'}
+    replayed = set()
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get('name'), str):
             raise ValueError('用途判断缺少变量名')
         key = row['name'].casefold()
+        if key in distributed and key not in replayed and row.get('role') == 'uncertain':
+            replayed.add(key)
+            continue  # Reconstruct this source-only finding from the inventory.
         if key not in eligible or key in reviewed:
             raise ValueError(f'重复或无独立迁移证据的变量：{key}')
         candidate = eligible[key]
@@ -348,7 +397,13 @@ def scope_selection(inventory, decisions):
             raise ValueError(f'无法证明该槽位与工位主实例的声明地址及生产程序一致：{key}')
     for key, parents in dependent_writes(selected).items():
         reviewed[key]['gated_by'] = parents
-    return selected, [reviewed[k] for k in sorted(reviewed)]
+    roles = list(reviewed.values())
+    protect_channels(inventory, roles, required_channels)
+    for decision in roles:
+        key = decision['name'].casefold()
+        if decision['admission'] == 'retained' and key in eligible:
+            selected[key] = eligible[key]
+    return selected, sorted(roles, key=lambda d: d['name'].casefold())
 
 
 def array_coverage(inventory, selected, decisions, references):
@@ -400,6 +455,9 @@ def replay_selectors(names, visible, explicit=None):
 def scope_index(inventory):
     """One line per eligible channel for bounded agent reads; full evidence stays in the ledger."""
     for row in inventory['candidates']:
+        if row['eligibility'] == 'distributed_write':
+            yield {k: row[k] for k in ('name', 'eligibility', 'dispatch_writes', 'declarations')}
+            continue
         if row['eligibility'] not in {'scope_required', 'single_write'}:
             continue
         examples = []

@@ -6,7 +6,9 @@ from functools import lru_cache
 from plc_trace.analysis.boundary_logic import FALSE, IDENT, TRUE, combine, comparisons, integer, symbol
 from plc_trace.analysis.successor_graph import STParser, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import INSTANCE_STORAGE, _executable_text
-from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops, loop_may_write
+from plc_trace.capture.capture_use import _guard_signals
+from plc_trace.capture.coverage import service_isolation
+from plc_trace.capture.step_discovery import Discovery, fixed_path, gated_write, isolate_counted_loops, loop_may_write
 from plc_trace.capture.station_scope import required_cursors
 from plc_trace.source.omron_native import collect_native
 from plc_trace.source.plcopen_trace_control import ERRORS, _bound_guard, _conditions, _states, step_comment_text
@@ -129,6 +131,23 @@ class Bindings:
             kind, _ = self.scan._peel_type(self.scan.member(kind, _root(part))[0], part)
         return kind
 
+    def global_port(self, path, unit, calls):
+        """Only a declared global or a chain of writable actuals can connect two different POUs."""
+        if not fixed_path(path):
+            return None
+        for call in reversed(calls):
+            root = _root(path)
+            actual = call['reference_actuals'].get(root)
+            if actual:
+                path = actual + path[len(re.split(r'[.\[]', path, 1)[0]):]
+            elif (unit, root) in self.scan.declarations:
+                return None
+            unit = self.unit(call['scope'])
+        root = _root(path)
+        if (unit, root) not in self.scan.declarations and (None, root) in self.scan.declarations:
+            return path.casefold()
+        return None
+
     @lru_cache(maxsize=None)
     def paths(self, var, unit, active=()):
         if unit is None or unit in active:
@@ -214,6 +233,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
         if unit and unit[0] == 'program' and (unit, _root(name)) in scan.declarations:
             result.visible.add(f'{unit[1]}.{name}')
     limits = Counter()
+    unresolved_selectors = set()
 
     def records(var, scope, site, co_names=()):
         paths = ([(f'{scope}::{var}', None, 'SMC2 中缺少可核实的作用域及整数声明', [])] if grid
@@ -247,6 +267,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
     # Either adapter may see the same ST instruction. Match its actual token within
     # the original XML fragment. Distinct instructions on one line keep separate IDs.
     native_st = {}
+    separate_writes = {}
     network_notes = _numbered_network_notes(model['transitions']) if on_transition is not None and not grid else {}
     # Native weak connectivity can be enough for an audit but never proves an
     # input state when another arm bypasses its comparison.
@@ -317,6 +338,8 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
         unsupported = {'FOR', 'WHILE', 'REPEAT', 'JMP', 'RETURN', 'EXIT', 'CONTINUE', 'GOTO'}
         intact_prefix = next((span[0] for word, span in original if word.upper() in unsupported), 0)
         regions = _case_regions(code)
+        if on_transition is None:
+            unresolved_selectors.update(f"{block['scope']}::{name}" for name in regions if not fixed_path(name))
         outer = source_condition(block['external_guard'])
         def external_writer(lhs,rhs,gate,scope_site):
             if not on_entry or not fixed_path(lhs):return
@@ -351,14 +374,24 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             kind = binding.type_of(lhs, unit) if unit else None
             return bool(kind and kind.upper() in INTEGER_BOUNDS and kind == binding.type_of(rhs, unit))
         statements = parser.staged_writes(parser.statements, same_type) if block['flow_complete'] else parser.statements
+        # A request is consumed by this body if it reads a Boolean input and explicitly
+        # clears it. Look at parsed expressions, including edge-trigger input assignments.
+        reset_inputs = {lhs.casefold() for lhs, rhs, *_ in statements
+                        if on_transition is None and unit and unit[0] == 'functionblock' and rhs.upper() == 'FALSE'
+                        and scan.directions.get((unit, _root(lhs))) == {'inoutvars'}}
+        if reset_inputs:
+            read_inputs = set()
+            for _, rhs, guard, *_ in statements:
+                read_inputs.update(_guard_signals(guard.text()))
+                if any(path in rhs.casefold() for path in reset_inputs):
+                    read_inputs.update(_guard_signals(rhs))
+            reset_inputs.intersection_update(read_inputs)
         for lhs, rhs, condition, offset, note in statements:
             if not fixed_path(lhs) or (offset >= first_omitted and loop_may_write(lhs, loop_writes)):
                 continue
             gate = combine('and', outer, condition)
             anchors = {a.args[0].casefold() for a in comparisons(gate) if a.kind == 'eq'}
-            if not anchors:
-                continue
-            src = list(_states(gate, anchors))
+            src = list(_states(gate, anchors)) if anchors else []
             operating = combine('and', outer, parser.operating_condition(offset, lhs))
             site = {'operating_guard': '' if operating == TRUE else operating.text(),
                     'commit': getattr(parser, 'commit_sites', {}).get(offset, {}),
@@ -373,6 +406,13 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                 number = integer(rhs)
             except ValueError:
                 number = None
+            if (not grid and on_transition is None and number is not None and gate != FALSE
+                    and not any(symbol(m[0]).casefold() == lhs.casefold() for m in re.finditer(IDENT, gate.text()))):
+                key = block['scope'], lhs, number
+                if key not in separate_writes or (gated_write(site) and not gated_write(separate_writes[key])):
+                    separate_writes[key] = site
+            if not anchors:
+                continue
             if any(start <= offset < end for start, end in regions.get(lhs.casefold(), ())):
                 site['case_selector'] = lhs
                 site['other_condition'] = bool(_conditions(gate, lhs.casefold()))
@@ -390,6 +430,20 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                         continue
                     current.append((key, step))
                     states[key].add(step)
+                    if on_transition is None:
+                        chain = bound.get('binding', ())
+                        for port in reset_inputs:
+                            actual = binding.global_port(port, unit, chain)
+                            if actual:
+                                row.request_inputs.add(actual)
+                        # Store identities as seen at the original site; two program
+                        # locals with identical spelling cannot satisfy a cross-reference.
+                        inputs = {binding.global_port(port, unit, chain)
+                                  for port in _guard_signals(site['guard'])}
+                        for i, call in enumerate(chain):
+                            inputs.update(binding.global_port(port, binding.unit(call['scope']), chain[:i])
+                                          for port in _guard_signals(call['guard']))
+                        bound['global_reads'] = sorted(inputs - {None})
                     if on_transition is not None:
                         identity = (row.name.casefold(), block['scope'], str(block['network']), block['node'],
                                     token_at.get(offset), step, destination,
@@ -410,16 +464,35 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                     result.possible_links.append((reference, value, target, number, 'starts_child', location))
                     for _, step in current:
                         result.possible_links.append((target, step, reference, value, 'waits_for_child', location))
-            if not current and rhs.strip().upper() in ('TRUE', 'FALSE'):
+            if not current and (reset_inputs or rhs.strip().upper() in ('TRUE', 'FALSE')):
                 entries.append((src, lhs, rhs, site))
         for src, lhs, rhs, site in entries:
             for var, step in src:
-                if step in states.get(var, ()):
+                local_edge = step in states.get(var, ())
+                if local_edge or (on_transition is None and not grid):
                     # Preserve the source spelling, especially a program-local reference.
                     key = next((a.args[0] for a in comparisons(source_condition(site['guard']))
                                 if a.args[0].casefold() == var), var)
                     for row, bound in records(key, block['scope'], site):
-                        row.effect(step, {**bound, 'target': lhs, 'value': rhs})
+                        port = binding.global_port(lhs, unit, bound.get('binding', ())) if on_transition is None else None
+                        if rhs.strip().upper() not in ('TRUE', 'FALSE'):
+                            if port:
+                                row.other_outputs.add(port)
+                            continue
+                        if not local_edge:
+                            row.dispatch(step, {**bound, 'target': lhs}, var, site)
+                            continue
+                        row.effect(step, {**bound, 'target': lhs, 'value': rhs,
+                                          **({'global_target': port} if port else {})})
+
+    if separate_writes:
+        wanted = {r.name.casefold() for r in result.candidates.values() if (r.dispatches and not r.edges) or len(r.edges) == 1}
+        for (scope, lhs, value), site in separate_writes.items():
+            unit = binding.unit(scope)
+            if unit and not wanted.isdisjoint(name.casefold() for name, *_ in binding.paths(lhs, unit)):
+                for row, bound in records(lhs, scope, site):
+                    if row.name.casefold() in wanted and (value in row.dispatches or any(a == value for a, _ in row.edges)):
+                        row.external_write(value, bound)
 
     for args in native_st.values():
         on_transition(*args)
@@ -450,9 +523,13 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                      'unbound_references': [{'scope': scope, 'reference': name, 'reason': reason}
                                             for scope, name, reason in sorted(binding.unbound)],
                      'adapter_counts': model.get('native_parse_audit', {}).get('counts', model['summary'])}
+    if unresolved_selectors:
+        result.issues['unresolved_selectors'] = sorted(unresolved_selectors)
     if not grid:
         for row in result.candidates.values():
             row.declarations = scan.channel_declarations(row.name)
+            if on_transition is None:
+                row.service_isolation = service_isolation(row, scan.channel_declarations)
     binding.paths.cache_clear()
     binding.members_at.cache_clear()
     return result

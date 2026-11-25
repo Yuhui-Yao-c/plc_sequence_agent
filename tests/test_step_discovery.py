@@ -364,7 +364,9 @@ class StepDiscoveryTests(unittest.TestCase):
         rows = {r['name']:r for r in inv['candidates']}
         self.assertEqual([d['text'] for d in rows['Head.Mark']['declarations']], ['装配单元', '位置'])
         self.assertEqual([d['text'] for d in rows['Drive.Mark']['declarations']], ['移送元件', '位置'])
-        self.assertEqual({c['name'] for c in self.finish(inv, {'Head.Mark'})['channels']}, {'Head.Mark'})
+        result = self.finish(inv, {'Head.Mark'})
+        self.assertEqual({c['name'] for c in result['channels']}, {'Head.Mark', 'Drive.Mark'})
+        self.assertEqual(result['retained_variables'], ['Drive.Mark'])
 
     def test_registered_slot_in_own_unit_with_foreign_array_and_program(self):
         var = '<Variable name="{}"><Type><TypeName>ARRAY[0..5] OF INT</TypeName></Type></Variable>'
@@ -415,10 +417,13 @@ class StepDiscoveryTests(unittest.TestCase):
         def variable(name, kind):
             return f'<Variable name="{name}"><Type><TypeName>{kind}</TypeName></Type></Variable>'
         xml = ('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+variable('A','Unit')+
-               variable('B','Unit')+variable('Pack','INT')+variable('Warm','INT')+variable('Reply','INT')+'</GlobalVars>'+control+
+               variable('B','Unit')+variable('Pack','INT')+variable('Warm','INT')+
+               '<Variable name="Reply"><Documentation>通信应答码</Documentation><Type><TypeName>INT</TypeName></Type></Variable>'+
+               '<Variable name="Service"><Documentation>维护模式</Documentation><Type><TypeName>BOOL</TypeName></Type></Variable>'+
+               '</GlobalVars>'+control+
                '<Program name="P"><LocalVars>'+variable('drive1','Worker')+variable('drive2','Worker')+
                '</LocalVars><BodyContent name="Cycle"><ST>drive1(part:=A); drive2(part:=B); '
-               'CASE Warm OF 0: Warm:=5; 5: Warm:=0; END_CASE; '
+               'IF Service THEN CASE Warm OF 0: Warm:=5; 5: Warm:=0; END_CASE; END_IF; '
                'CASE Pack OF 0: IF Done THEN Pack:=5; END_IF; 5: Pack:=0; END_CASE; '
                'IF Reply=1 THEN Ack:=TRUE; Reply:=0; END_IF;</ST></BodyContent></Program></Project>')
         first, inv = self.prepare(xml)
@@ -441,7 +446,7 @@ class StepDiscoveryTests(unittest.TestCase):
         result = generate(self.source, self.out, scope_results=path)
         self.assertEqual(set((self.out/'static_variables.txt').read_text().splitlines()), expected)
         self.assertEqual((result['configured_variables'], result['configuration_complete'], result['status']),
-                         (1, False, 'done_with_review'))
+                         (1, False, 'needs_review'))
         self.assertEqual(set(result['unresolved_types']), {'A.Position','B.Position'})
         config = Path(result['configuration'])
         self.assertTrue(config.name.endswith('_partial.csv'))
@@ -488,7 +493,9 @@ class StepDiscoveryTests(unittest.TestCase):
     def test_same_fb_type_can_serve_production_or_maintenance_in_distinct_instances(self):
         def var(name, typ):
             return f'<Variable name="{name}"><Type><TypeName>{typ}</TypeName></Type></Variable>'
-        xml = ('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><FunctionBlock name="Unit"><Vars>'+
+        xml = ('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars><Variable name="SetupMode">'+
+               '<Documentation>设备维护模式</Documentation><Type><TypeName>BOOL</TypeName></Type></Variable></GlobalVars>'+
+               '<FunctionBlock name="Unit"><Vars>'+
                var('Cursor','INT')+'</Vars><BodyContent><ST>CASE Cursor OF 2: IF Ready THEN Cursor:=5; '
                'END_IF; 5: Cursor:=2; END_CASE;</ST></BodyContent></FunctionBlock><Program name="P"><Vars>'+
                var('Cell','Unit')+var('Bench','Unit')+'</Vars><BodyContent><ST>IF Making THEN Cell(); '

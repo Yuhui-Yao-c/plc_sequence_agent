@@ -74,9 +74,10 @@ def verify_files(out, status):
         required.update(('step_variable_discovery.json', 'scope_candidates.jsonl'))
         if status.get('scope_policy') == 'production_timing':
             required.update(('optional_variables.csv', 'capture_context.csv'))
-        if state != 'scope_review_pending' and (status.get('scope_candidates') or status.get('single_write_candidates')):
+        if state != 'scope_review_pending' and any(status.get(k) for k in
+                ('scope_candidates', 'single_write_candidates', 'distributed_write_candidates')):
             required.add('scope_results.json')
-    if state in {'done', 'done_with_review'}:
+    if status.get('configuration') or state in {'done', 'done_with_review'}:
         config = Path(status.get('configuration') or '')
         if config.parent != out:
             raise ValueError('已有采集配置的交付路径无效，请核对后显式重建')

@@ -8,7 +8,7 @@ compatibility: opencode
 
 ## 输入与发现
 
-从[主 Agent](../../agents/plc-sequence.md)收到工程和采集选项后运行 `python plc_cli.py "工程.xml" --trace-setup`，保存返回的 `out`。自动发现只使用本次源码。历史 Trace、人工表和配置用于结果产生后的独立核验。
+从[主 Agent](../../agents/plc-sequence.md)收到工程和采集选项后运行 `python plc_cli.py "工程.xml" --trace-setup`，保存返回的 `out`。候选从本次源码发现。有人工起止表、已确认的地址清单或 Sysmac 通道表时，两轮都可传入同一 `--reference`。用它核对默认清单和最终配置，可按精确地址补齐已知类型。
 
 1. 在 `scope_review_pending` 阶段读取 `scope_candidates.jsonl` 和 `step_variable_discovery.json`。首轮默认清单为空。沿调度、调用、实参和固定下标查实际可写的地址。按实例核对工位主步、命令、工作区、并行子步和辅助流程。
 2. 为每个 `scope_required` 给出一项判断，再检查 `single_write` 中只写过一个出口的短流程，尤其是由调用方启动或收尾的子步。用该实例的写点和声明用途或步骤注释补录。保留未绑定、动态下标和未定位写点等证据缺口。
@@ -23,7 +23,7 @@ compatibility: opencode
 - `via` 可取 `comment`（本写点的步骤注释）、`signal:完整信号名`（该出口条件中的命名反馈）、同阶段受控写出 `eN`、本通道有用途说明的声明或精确元素注释 `dN`、同一具体实例启动或等待子步的关系 `lN`。阅读写点、调用方和佐证原文，核实它们合起来能解释所填动作。通用的“初始”“等待”字样、步骤命名、数值递增、单次调用或家族中的另一成员，均不足以判断生产用途。
 - `detail` 表示步骤解释已有动作的内部实现，例如业务步已涵盖扫码触发到结果返回，扫码器建连和收发握手可备查。子步实际区分夹胶、拉胶或另一段需要量时的操作时，保留该子步并指明对应写点。
 - `service` 表示本实例只服务于初始化、调试、维护、诊断或设备后台通信。复用同一个功能块的其他实例分别核对。用于生产动作的通信反馈或模式信号可以出现在计时条件中。
-- `unresolved` 表示目前不足以判定生产计时用途。填写现场可复核的缺口。已确认的设备服务、内部细节和待核项各自在备选表列明原因。每个非数据候选都应填写 `use`，缺省按待核处理。
+- `unresolved` 表示目前不足以判定生产计时用途。填写现场可复核的缺口。提交用途判断后由程序检查排除证据。单向写步、完整分派或父子步有独立依据时，证据不足以排除的地址标为“待核，先采”。确认服务要核实每一写点的维护门控。排除通信细节要找到父动作发出的请求、接收的结果及具体子实例。每个非数据候选都应填写 `use`，缺省按待核处理。
 
 将判断保存到本轮 `scope_results.json`。证据编号均在各自地址内查找。以下为格式示例。
 
@@ -41,8 +41,8 @@ compatibility: opencode
 
 ## 输出与验收
 
-- `static_variables.txt` 和采集配置使用默认生产地址。`capture_context.csv` 记录每个已核实边界的动作、步值、命令/工况、完整导出条件及其解析情况、出处。表中写步示例是源码证据，现场 Trace 才提供实测时长。复现条件时可加采其中的命令、模式和反馈。
+- `static_variables.txt` 包含已确认生产步与待核先采地址。写入和分派分散时查看 `dispatch_writes` 的两处位置，写前值留空。`capture_context.csv` 记录每个已核实边界的动作、步值、命令/工况、完整导出条件及其解析情况、出处。表中写步示例是源码证据，现场 Trace 才提供实测时长。复现条件时可加采其中的命令、模式和反馈。
 - `optional_variables.csv` 给出备选地址、用途、理由、类型及出处。`step_array_coverage.csv` 给出专用数组边界。全量候选、其他出口、数据排除和解析范围保存在发现台账。
 - 核对 `workflow_status.json` 的 `static_variables`、`optional_variables`、`configured_variables` 和 `configuration_complete`。Sysmac 按声明类型生成配置，缺失的生产地址类型在 `unresolved_types.csv`。可写入部分配置时文件名含 `_partial`。已确认以 REAL/LREAL 存离散步值的通道沿用原类型。
-- 汇川按源码任务、调度和可定位写点选择采样设置。`needs_review` 表示当前没有可交付配置，查看具体缺口。`done_with_review` 应同时交付配置和待核范围。采集配置样本数为 0。
+- 汇川按源码任务、调度和可定位写点选择采样设置。`needs_review` 表示缺配置、部分配置或独立核验有缺口，查看 `coverage` 的逐地址差集、未核实条件与源码解析缺口。区分 `configuration_complete`（全部入选地址已实际写入）与 `coverage_complete`（本次输入可核验范围内没有剩余缺口）。`done_with_review` 应同时交付配置和待核范围。采集配置样本数为 0。
 - 显式指定地址、通配或 `re:` 模式时仍按用户的选择生成配置。多模式取并集。Sysmac 显式模式可用已核实的 `--default-type` 补齐缺失的根变量类型。
