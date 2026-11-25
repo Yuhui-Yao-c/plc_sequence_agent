@@ -29,7 +29,17 @@ def declaration(node):
         if address and any(texts):
             elements.setdefault(address, []).append(
                 {'line': item.sourceline, 'text': ' / '.join(t for t in texts if t)})
-    return {'name': node.get('name'), 'line': node.sourceline, 'text': note}, elements
+    site = {'name': node.get('name'), 'line': node.sourceline, 'text': note}
+    dims = node.findall('{*}type/{*}array/{*}dimension')
+    if len(dims) == 1:
+        bounds = dims[0].get('lower', ''), dims[0].get('upper', '')
+    else:
+        typename = node.findtext('{*}Type/{*}TypeName', '')
+        match = re.match(r'^\s*ARRAY\s*\[\s*(-?\d+)\s*\.\.\s*(-?\d+)\s*\]\s*OF\b', typename, re.I)
+        bounds = match.groups() if match else ()
+    if bounds and all(re.fullmatch(r'-?\d+', b) for b in bounds) and int(bounds[0]) <= int(bounds[1]):
+        site['array_bounds'] = [int(b) for b in bounds]
+    return site, elements
 
 
 def at_path(definition, parts, index):
@@ -56,7 +66,8 @@ def required_cursors(expr):
 
 
 def writer_context(site):
-    calls = tuple((c['scope'], c['instance'], c['source_line']) for c in site.get('binding', ()))
+    calls = tuple((c['scope'], c['instance'], c['source_line'], c.get('node'), c.get('offset'))
+                  for c in site.get('binding', ()))
     return site['scope'], calls
 
 
@@ -85,17 +96,13 @@ def same_station_array(row, decision, peer, reference):
 
 
 def dependent_writes(selected):
-    """Withhold a cursor whose every recorded write is subordinate to another selected cursor.
-
-    Require the peer to have an independent write in that very source routine.
-    A mere read, inter-station handshake or one shared transition cannot veto a channel.
-    """
+    """Identify parents with independent writes in the same concrete writer context."""
     independent = set()
     for key, row in selected.items():
         for site in row['transitions']:
             if selected.keys().isdisjoint(site.get('co_cursors', ())):
                 independent.add((key, writer_context(site)))
-    withheld = {}
+    parents = {}
     for key, row in selected.items():
         peers = set()
         for site in row['transitions']:
@@ -104,5 +111,5 @@ def dependent_writes(selected):
                 break
             peers.update(gates)
         else:
-            withheld[key] = sorted(peers)
-    return withheld
+            parents[key] = sorted(peers)
+    return parents

@@ -3,9 +3,9 @@ import re
 from collections import Counter, defaultdict
 from functools import lru_cache
 
-from plc_trace.analysis.boundary_logic import IDENT, TRUE, combine, comparisons, integer, symbol
+from plc_trace.analysis.boundary_logic import FALSE, IDENT, TRUE, combine, comparisons, integer, symbol
 from plc_trace.analysis.successor_graph import STParser, _st_tokens_with_spans
-from plc_trace.capture.extract_step_variables import _executable_text
+from plc_trace.capture.extract_step_variables import INSTANCE_STORAGE, _executable_text
 from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops
 from plc_trace.capture.station_scope import required_cursors
 from plc_trace.source.omron_native import collect_native
@@ -44,10 +44,22 @@ _PUNCT = re.compile(r'[()\[\],]')
 
 
 class Bindings:
-    def __init__(self, scan, slices):
+    def __init__(self, scan, slices, wired_calls=()):
         self.scan = scan
         self.incoming = defaultdict(list)
         self.limits = Counter()
+        self.unbound = set()
+        self.instance_members = defaultdict(dict)
+        for (unit, name), directions in scan.directions.items():
+            if len(directions) == 1 and directions <= INSTANCE_STORAGE:
+                declared = scan.declaration_sites.get(('variable', unit, name))
+                if declared:
+                    self.instance_members[unit][name] = declared[0]['name']
+        for site in wired_calls:
+            caller = self.unit(site['scope'])
+            typ = self.type_of(site['instance'], caller)
+            if caller and (typ or '').casefold() == site['type'].casefold() and fixed_path(site['instance']):
+                self._register(caller, self.unit(typ), site['pins'], {k:v for k,v in site.items() if k != 'pins'})
         for block in slices:
             caller = self.unit(block['scope'])
             if not caller:
@@ -65,20 +77,8 @@ class Bindings:
                 callee, = options
                 if callee[0] != 'functionblock':
                     continue
-                mapping, seen = {}, set()
-                for arg in _args(code, match.end()):
-                    token = _PIN.fullmatch(arg)
-                    if not token:
-                        continue
-                    formal, operator, actual = token[1].casefold(), token[2], symbol(token[3])
-                    if formal in seen:
-                        mapping.pop(formal, None)
-                        continue
-                    seen.add(formal)
-                    if (operator == ':=' and scan.directions.get((callee, formal)) == {'inoutvars'}
-                            and fixed_path(actual) and self.type_of(actual, caller)
-                            and self.type_of(actual, caller) == self.type_of(formal, callee)):
-                        mapping[formal] = actual
+                pins = [(m[1], symbol(m[3])) for arg in _args(code, match.end())
+                        if (m := _PIN.fullmatch(arg)) and m[2] == ':=']
                 if gates is None:
                     parser = STParser(block['code'], condition_parser=source_condition, strict=False, retain_source=True)
                     try:
@@ -87,12 +87,32 @@ class Bindings:
                         pass  # Only call sites actually reached by structured parsing have a known enable.
                     gates = parser.call_guards
                 inner = gates.get(match.start())
-                complete = inner is not None and not block.get('external_issue') and not block.get('symbolic_external')
-                gate = combine('and', source_condition(block['external_guard']), inner if inner is not None else TRUE)
-                self.incoming[callee].append((caller, mapping, {'scope': block['scope'], 'instance': instance,
+                if inner is None:
+                    self.unbound.add((block['scope'], instance, 'unresolved_call_control'))
+                    continue
+                complete = not block.get('external_issue') and not block.get('symbolic_external')
+                gate = combine('and', source_condition(block['external_guard']), inner)
+                self._register(caller, callee, pins, {'scope': block['scope'], 'instance': instance,
                     'node': block['node'], 'network': block['network'], 'offset': match.start(),
                     'guard': gate.text(), 'guard_complete': complete,
-                    'type': callee[1], 'source_line': block['source_line'], 'reference_actuals': mapping}))
+                    'type': callee[1], 'source_line': block['source_line']})
+
+    def _register(self, caller, callee, pins, site):
+        if not callee or callee[0] != 'functionblock' or source_condition(site['guard']) == FALSE:
+            return
+        mapping = {}
+        counts = Counter(formal.casefold() for formal, _ in pins)
+        for formal, actual in pins:
+            key = formal.casefold()
+            if (counts[key] == 1 and self.scan.directions.get((callee, key)) == {'inoutvars'}
+                    and fixed_path(actual) and self.type_of(actual, caller)
+                    and self.type_of(actual, caller) == self.type_of(formal, callee)):
+                mapping[key] = actual
+        self.incoming[callee].append((caller, {**site, 'reference_actuals': mapping}))
+
+    @lru_cache(maxsize=None)
+    def members_at(self, typename, instance):
+        return {key: f'{instance}.{name}' for key, name in self.instance_members[self.unit(typename)].items()}
 
     def unit(self, scope):
         options = self.scan.units.get(scope.split('::')[0].casefold(), set())
@@ -106,7 +126,7 @@ class Bindings:
         for part in parts[1:]:
             if not kind:
                 break
-            kind, _ = self.scan._peel_type(self.scan.members.get((kind.casefold(), _root(part)), ()), part)
+            kind, _ = self.scan._peel_type(self.scan.member(kind, _root(part))[0], part)
         return kind
 
     @lru_cache(maxsize=None)
@@ -119,20 +139,34 @@ class Bindings:
             if issue and '.' in var:
                 prefix, field = var.rsplit('.', 1)
                 container = self.type_of(prefix, unit)
-                if container and not self.scan.members.get((container.casefold(), _root(field))):
+                if container and not self.scan.member(container, _root(field))[0]:
                     issue = f'缺少 {container}.{field} 的叶声明'
             return [(name, kind, issue, [])]
         root = _root(var)
-        if unit[0] != 'functionblock' or self.scan.directions.get((unit, root)) != {'inoutvars'}:
+        persistent = root in self.instance_members[unit]
+        reference = self.scan.directions.get((unit, root)) == {'inoutvars'}
+        global_address = (unit, root) not in self.scan.declarations and (None, root) in self.scan.declarations
+        if unit[0] != 'functionblock' or not (persistent or reference or global_address):
             self.limits['template_local_or_nonreference_parameter'] += 1
             return []
         result = []
-        for caller, mapping, call in self.incoming[unit]:
-            if actual := mapping.get(root):
-                for name, kind, issue, chain in self.paths(actual + var[len(root):], caller, active + (unit,)):
+        for caller, call in self.incoming[unit]:
+            if global_address:
+                name, kind, issue, _ = self.scan.sysmac_channel(var, None)
+                for _, _, _, chain in self.paths(call['instance'], caller, active + (unit,)):
                     result.append((name, kind, issue, [*chain, call]))
+                continue
+            elif persistent:
+                actual = call['instance'] + '.' + var
+            elif root in call['reference_actuals']:
+                actual = call['reference_actuals'][root] + var[len(root):]
+            else:
+                continue
+            for name, kind, issue, chain in self.paths(actual, caller, active + (unit,)):
+                result.append((name, kind, issue, [*chain, call]))
         if not result:
             self.limits['no_bound_writable_instance'] += 1
+            self.unbound.add((unit[1], var, 'no_bound_writable_instance'))
         return result
 
 
@@ -170,9 +204,9 @@ def _numbered_network_notes(transitions):
 
 def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=None):
     grid = scan.source_format == 'smc2'
-    model = collect_smc2(source) if grid else collect_native(source)
+    model = collect_smc2(source) if grid else collect_native(source, instance_types=scan.units.keys())
     slices = model.get('native_inline_slices', [])
-    binding = Bindings(scan, slices)
+    binding = Bindings(scan, slices, model.get('native_fb_calls', ()))
     result = Discovery()
     result.visible.update(name for name, _, _ in scan.references.values())
     result.visible.update(scan.dynamic.values())
@@ -193,8 +227,9 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                 operating = source_condition(site.get('operating_guard') or 'TRUE')
                 for call in reversed(chain):
                     invoke = source_condition(call['guard'])
-                    gate = combine('and', invoke, _bound_guard(gate, call['reference_actuals']))
-                    operating = combine('and', invoke, _bound_guard(operating, call['reference_actuals']))
+                    aliases = binding.members_at(call['type'], call['instance']) | call['reference_actuals']
+                    gate = combine('and', invoke, _bound_guard(gate, aliases))
+                    operating = combine('and', invoke, _bound_guard(operating, aliases))
                 bound.update(guard=gate.text(), operating_guard='' if operating == TRUE else operating.text(),
                              guard_complete=site.get('guard_complete', False) and all(c['guard_complete'] for c in chain))
             host = binding.unit(chain[0]['scope'] if chain else scope)
@@ -408,9 +443,12 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                                   'guard': item['guard'], 'kind': item['command'], 'comment': item['comment']}):
             row.effect(step, {**site, 'target': item['arguments']})
     result.issues = {'unsupported': dict(limits), 'binding': dict(binding.limits),
+                     'unbound_references': [{'scope': scope, 'reference': name, 'reason': reason}
+                                            for scope, name, reason in sorted(binding.unbound)],
                      'adapter_counts': model.get('native_parse_audit', {}).get('counts', model['summary'])}
     if not grid:
         for row in result.candidates.values():
             row.declarations = scan.channel_declarations(row.name)
     binding.paths.cache_clear()
+    binding.members_at.cache_clear()
     return result

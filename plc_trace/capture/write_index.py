@@ -12,7 +12,7 @@ INDEX_FILE = 'source_branch_index.json'
 
 def write_index(source, run, reuse=None):
     source = Path(source)
-    stamp = {'schema': 2, 'source': fingerprint(source), 'pipeline': pipeline_fingerprint()}
+    stamp = {'schema': 3, 'source': fingerprint(source), 'pipeline': pipeline_fingerprint()}
     def digest(records):
         data = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
         return hashlib.sha256(data.encode('utf-8')).hexdigest()
@@ -22,11 +22,18 @@ def write_index(source, run, reuse=None):
             raise ValueError('源码写点索引与本次源码、解析程序或内容校验不一致')
     else:
         writes, unknown, entries = [], [], []
-        discover_source_writes(source, detect_source_format(source),
-                               lambda *args: writes.append(args), lambda *args: unknown.append(args),
-                               lambda *args: entries.append(args))
+        discovery = discover_source_writes(source, detect_source_format(source),
+                                           lambda *args: writes.append(args), lambda *args: unknown.append(args),
+                                           lambda *args: entries.append(args))
+        from plc_trace.trace.trace_to_pairs import REAL_TYPES
+        real_steps = []
+        for key, candidate in discovery.candidates.items():
+            if candidate.declared in REAL_TYPES:
+                row = candidate.record()
+                if row['eligibility'] == 'scope_required' and row['sequence_witness']:
+                    real_steps.append(key)
         channels={row[0].casefold() for row in writes}
-        records = {'writes': writes, 'unresolved': unknown,
+        records = {'writes': writes, 'unresolved': unknown, 'real_step_channels': sorted(real_steps),
                    'entries':[row for row in entries if row[0].casefold() in channels]}
         cached = {'identity': stamp, 'sha256': digest(records), 'records': records}
     target = Path(run) / INDEX_FILE

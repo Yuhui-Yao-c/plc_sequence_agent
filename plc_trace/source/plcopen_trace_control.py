@@ -17,6 +17,7 @@ from plc_trace.source.source_expressions import (DECIMAL, INTEGER_BOUNDS, INTEGE
 from plc_trace.analysis.successor_graph import STParser, WireBody, WireError, connections, own_expr, owner, pin, pins, tag, text
 
 ERRORS = (WireError, BoundarySyntaxError)
+INSTANCE_STORAGE = {'localVars', 'outputVars', 'retainVars'}
 _COMPARATORS = {'EQ': '=', 'NE': '<>', 'GE': '>=', 'GT': '>', 'LE': '<=', 'LT': '<',
                 '=': '=', '==': '=', '<>': '<>', '!=': '<>', '>=': '>=', '>': '>', '<=': '<=', '<': '<'}
 _TIMER_OUTPUTS = {'TON', 'TOF', 'TP', 'UP', 'DOWN', 'R_TRIG', 'F_TRIG'}
@@ -96,6 +97,7 @@ class StateTypes:
 
     def __init__(self, root, pous):
         self.aliases = defaultdict(list)
+        self.block_types = defaultdict(list)
         self.globals = defaultdict(list)
         self.locals = {}
         self.cache = {}
@@ -111,6 +113,8 @@ class StateTypes:
             for name, types in self._declarations(group).items():
                 self.globals[name].extend(types)
         for pou in pous:
+            if pou.get('pouType', '').casefold() == 'functionblock':
+                self.block_types[pou.get('name', '').casefold()].append(pou)
             scope = _scope(pou)
             local = self.locals.setdefault(scope, defaultdict(list))
             for group in pou.findall('{*}interface/*'):
@@ -130,7 +134,8 @@ class StateTypes:
     def bounds(self, variable, scope):
         key = (variable, scope)
         if key not in self.cache:
-            self.cache[key] = self._bounds(variable, scope)
+            typ, _ = self.resolve(variable, scope)
+            self.cache[key] = INTEGER_BOUNDS.get(tag(typ).upper()) if typ is not None else None
         return self.cache[key]
 
     def _unaliased(self, nodes):
@@ -140,29 +145,43 @@ class StateTypes:
             if name in visited:
                 return None
             visited.add(name)
-            nodes = self.aliases.get(name, ())
+            nodes = [*self.aliases.get(name, ()), *self.block_types.get(name, ())]
         return nodes[0] if len(nodes) == 1 else None
 
-    def _bounds(self, variable, scope):
-        fields = [_MEMBER.fullmatch(part) for part in variable.split('.')]
+    def resolve(self, variable, scope):
+        """Follow concrete storage through arrays, structs and declared FB instances."""
+        fields = [_MEMBER.fullmatch(part) for part in variable.casefold().split('.')]
+        declarations = []
         if not all(fields):
-            return None
-        name = fields[0][1]
-        nodes = self.locals.get(scope, {}).get(name, self.globals.get(name, ()))
-        for index, field in enumerate(fields):
+            return None, declarations
+        root = fields[0][1]
+        nodes = self.locals.get(scope, {}).get(root, self.globals.get(root, ()))
+        for pos, field in enumerate(fields):
+            if len(nodes) == 1:
+                declarations.append((pos, nodes[0].getparent().getparent()))
             typ = self._unaliased(nodes)
-            if field[2]:
+            for group in re.findall(r'\[([^]]+)\]', field[2]):
                 if typ is None or tag(typ) != 'array':
-                    return None
+                    return None, declarations
+                indices, dimensions = group.split(','), typ.findall('{*}dimension')
+                try:
+                    if len(indices) != len(dimensions) or any(not int(d.get('lower')) <= int(i) <= int(d.get('upper'))
+                                                               for i, d in zip(indices, dimensions)):
+                        return None, declarations
+                except (TypeError, ValueError):
+                    return None, declarations
                 base = typ.find('{*}baseType')
                 typ = self._unaliased(list(base) if base is not None else ())
-            if typ is None:
-                return None
-            if index == len(fields) - 1:
-                return INTEGER_BOUNDS.get(tag(typ).upper())
-            if tag(typ) != 'struct':
-                return None
-            nodes = self._declarations(typ).get(fields[index + 1][1], ())
+            if typ is None or pos == len(fields) - 1:
+                return typ, declarations
+            member = fields[pos + 1][1]
+            if tag(typ) == 'struct':
+                nodes = self._declarations(typ).get(member, ())
+            elif tag(typ) == 'pou':
+                nodes = [node for group in typ.findall('{*}interface/*') if tag(group) in INSTANCE_STORAGE
+                         for node in self._declarations(group).get(member, ())]
+            else:
+                return None, declarations
 
 
 def _networks(body):
@@ -774,7 +793,12 @@ class ControlIndex:
                    if _root(value) not in read_only}
         linked = {key: {v for v in self.wanted if _prefix(v, value.casefold())}
                   for key, value in actuals.items() if re.fullmatch(IDENT, value)}
-        targets = set().union(*linked.values())
+        instance = node.get('instanceName', '')
+        address = bound_expr(instance, parent)
+        block_type, _ = self.types.resolve(address, site.program)
+        internal = ({v for v in self.wanted if _prefix(v, address.casefold())}
+                    if block_type is not None and any(block_type is unit for unit, _ in options) else set())
+        targets = set().union(internal, *linked.values())
         if not targets:
             return
         if len(options) != 1:
@@ -782,7 +806,7 @@ class ControlIndex:
             return
         unit, formals = options[0]
         writable = {key for key, param in formals.items() if param['direction'] == 'inOutVars'}
-        state_targets = set().union(*(linked[key] for key in writable & linked.keys()))
+        state_targets = set().union(internal, *(linked[key] for key in writable & linked.keys()))
         if not state_targets:
             return
         if unit in active or ambiguous & writable:
@@ -794,20 +818,22 @@ class ControlIndex:
         except ERRORS as exc:
             self._issue('unresolved_fb_enable', state_targets, site, str(exc))
             return
-        instance = node.get('instanceName')
         if not instance:
             self._issue('unresolved_fb_instance', state_targets)
             return
         alias = {key: value for key, value in actuals.items() if key in formals}
-        ro = {key for key, param in formals.items()
-              if param['direction'] != 'inOutVars' or key not in alias}
+        refs = sorted(writable.intersection(alias))
+        stored = {key: f'{address}.{p["name"]}' for key, p in formals.items()
+                  if internal and p['direction'] in INSTANCE_STORAGE}
+        alias.update(stored)
+        ro = formals.keys() - set(refs) - stored.keys()
         call = {'scope': site.scope, 'node': site.node, 'source_line': site.line, 'body': site.body,
                 'network': site.network, 'guard': gate.text(), 'selector_ports': wire.selector_ports(en, parent),
                 'instance': instance, 'type': unit.get('name'),
                 'actuals': alias,
                 'formal_documentation': {key: formals[key]['documentation'] for key in alias
                                          if formals[key]['documentation']},
-                'reference_formals': sorted(key for key in alias if key not in ro)}
+                'reference_formals': refs}
         self.bindings_found.update(state_targets)
         scope = f'{site.scope}::{instance}@{site.line}'
         for body in _bodies(unit):
@@ -845,7 +871,8 @@ def collect_root(root, variables, *, recover_st=None):
         for body in _bodies(unit):
             nodes = body.iter('{*}expression', '{*}variable', '{*}STCode')
             if (relevant.search(text(body)) if tag(body) == 'ST'
-                    else any(relevant.search(node.text or '') for node in nodes)):
+                    else (any(relevant.search(node.text or '') for node in nodes) or
+                          any(relevant.match(block.get('instanceName', '')) for block in body.iter('{*}block')))):
                 scope = _scope(unit)
                 result.body(body, scope, _program(unit, scope))
     return result

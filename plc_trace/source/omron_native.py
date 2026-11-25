@@ -373,13 +373,13 @@ def _coil_contracts(unit,required_atoms):
     return result
 
 
-def collect_native(source):
+def collect_native(source, *, instance_types=()):
     """One streaming pass; every rung is indexed without using a name filter."""
     from plc_trace.analysis.successor_graph import STParser, WireError, st_tokens
     source=Path(source);states=[];transitions=[];blockers=[];partial=[];events=[];stages=[]
     contracts=_output_contracts(source)
     command_records=[];diagnostics=[];warnings=[];inline_slices=[];source_predicates={};temporal_dependencies=[];stats=Counter();types=Counter();seen_states=set()
-    unsupported=[];discovery=[];units=set();state_bindings={};opaque_targets=[];range_writes=[]
+    unsupported=[];discovery=[];units=set();state_bindings={};opaque_targets=[];range_writes=[];instance_calls=[]
     def observe(v,num,role,scope,network,node,line,comment,bscope='',operator='='):
         v=symbol(v);key=(v.casefold(),num,role,scope,str(network),node)
         if key in seen_states:return
@@ -518,6 +518,21 @@ def collect_native(source):
             if kind(n)=='Block' and n.get('typeName','').upper().lstrip('@')=='MOVE':stats['moves']+=1
         for n in wire.nodes:
             k=kind(n);node=wire.node_id(n);name=n.get('typeName','');upper=name.upper().lstrip('@')
+            if k == 'Block' and name.casefold() in instance_types and n.get('instanceName'):
+                actuals = []
+                for port in params(n, 'InOutVariables'):
+                    try:
+                        actuals.append((port_name(port), wire.value(port)))
+                    except NativeWireError:
+                        continue
+                try:
+                    gate = wire.gate(wire.input_gate(n)).text()
+                    complete = True
+                except (NativeWireError, BoundarySyntaxError):
+                    gate, complete = 'TRUE', False
+                instance_calls.append({'scope': scope, 'instance': n.get('instanceName'), 'type': name,
+                    'source_line': n.sourceline, 'network': str(network), 'node': node,
+                    'guard': gate, 'guard_complete': complete, 'pins': actuals})
             if k=='Block' and name.upper()=='SETBLOCK' and name.upper() not in contracts:
                 try:
                     array=wire.value(pin(n,'AryOut','InOutVariables'))
@@ -664,7 +679,7 @@ def collect_native(source):
         'stage_records':stages,'stage_events':[], 'native_events':events,'native_commands':command_records,
         'native_partial_transitions':partial,'native_inline_slices':inline_slices,
         'source_predicates':source_predicates,'temporal_dependencies':temporal_dependencies,'native_rung_inventory':discovery,
-        'range_writes':range_writes,
+        'range_writes':range_writes, 'native_fb_calls':instance_calls,
         'native_parse_audit':{'format':'omron_iec61131_10','counts':dict(stats),'object_types':dict(types),
             'bodycontent_audit':body_audit,
             'health':'parsed_with_explicit_limits','no_pattern_applied_during_parse':True,

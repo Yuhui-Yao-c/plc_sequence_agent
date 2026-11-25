@@ -72,7 +72,7 @@ def verify_files(out, status):
         raise ValueError('已有采集配置的工作流状态无效，请核对后显式重建')
     if status.get('selection_mode') == 'automatic':
         required.update(('step_variable_discovery.json', 'scope_candidates.jsonl'))
-        if state != 'scope_review_pending' and status.get('scope_candidates'):
+        if state != 'scope_review_pending' and (status.get('scope_candidates') or status.get('single_write_candidates')):
             required.add('scope_results.json')
     if state in {'done', 'done_with_review'}:
         config = Path(status.get('configuration') or '')
@@ -100,8 +100,16 @@ def publish(out, files, *, force, completing):
             backup.mkdir()
             changed = []
             owned = {'static_variables.txt', 'scope_candidates.jsonl', 'step_variable_discovery.json',
-                     'workflow_status.json', 'scope_results.json'}
+                     'workflow_status.json', 'scope_results.json', 'capture_context.csv',
+                     'step_array_coverage.csv', 'unresolved_types.csv'}
             try:
+                old_files = read_status(out).get('artifact_sha256', {})
+                for name in (old_files.keys() & owned) - files.keys():
+                    old = out / name
+                    if old.is_symlink() or not old.is_file() or fingerprint(old) != old_files[name]:
+                        raise ValueError(f'待更新的采集产物缺失或已修改：{old}')
+                    old.replace(backup / name)
+                    changed.append(name)
                 for name in files:
                     target = out / name
                     if target.is_symlink() or (target.exists() and not target.is_file()):
@@ -110,6 +118,8 @@ def publish(out, files, *, force, completing):
                         if fingerprint(target) == fingerprint(stage / name):
                             continue
                         if name not in owned:
+                            raise ValueError(f'目标位置已有其他文件，请核对：{target}')
+                        if name in {'capture_context.csv', 'step_array_coverage.csv', 'unresolved_types.csv'} and name not in old_files:
                             raise ValueError(f'目标位置已有其他文件，请核对：{target}')
                         shutil.copy2(target, backup / name)
                     (stage / name).replace(target)

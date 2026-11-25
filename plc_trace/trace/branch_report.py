@@ -117,7 +117,7 @@ def origin_columns(origin):
             '其他写入来源':'\n'.join(alternatives)}
 
 
-def prepare(run, source, raw, jumps, source_index, sampled_names, reuse=None):
+def prepare(run, source, raw, jumps, source_index, sampled_names, reuse=None, source_writes=None):
     from plc_trace.trace.trace_to_pairs import PAIR_FIELDS
     run = Path(run)
     observations = {}
@@ -130,7 +130,7 @@ def prepare(run, source, raw, jumps, source_index, sampled_names, reuse=None):
         observations[channel, number(a), number(b)] = row
     writes = []
     unresolved = defaultdict(list)
-    cached = write_index(source, run, reuse)
+    cached = source_writes if source_writes is not None else write_index(source, run, reuse)
     for name, start, site in cached['unresolved']:
         if name.casefold() in sampled:
             unresolved[name.casefold(), start].append(site)

@@ -12,7 +12,7 @@ from plc_trace.capture.extract_step_variables import _executable_text
 from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops
 from plc_trace.capture.station_scope import at_path, declaration, required_cursors
 from plc_trace.source.source_expressions import source_condition
-from plc_trace.source.plcopen_trace_control import ERRORS, _bodies, _program, _scope, collect_root
+from plc_trace.source.plcopen_trace_control import ERRORS, INSTANCE_STORAGE, _bodies, _program, _scope, collect_root
 
 _NUMBER = r'(?:[a-z]+#)?[-+]?\d+\b'
 _SELECTORS = [re.compile(p, re.I) for p in (
@@ -55,7 +55,7 @@ def _nominations(root):
                             continue
                     if len(templates.get(name, ())) == 1 and node.get('instanceName'):
                         actuals, _ = bindings(node, wire)
-                        calls[key].append((name, actuals))
+                        calls[key].append((name, node.get('instanceName'), actuals))
             for code in codes:
                 clean = ' '.join(_executable_text(code))
                 for pattern in _SELECTORS:
@@ -65,16 +65,20 @@ def _nominations(root):
     @lru_cache(maxsize=None)
     def expand(key, active):
         result = members[key].copy()
-        for callee, args in calls[key]:
+        for callee, instance, args in calls[key]:
             if callee in active:
                 continue
             for item in expand(callee, active | {callee}).values():
                 formal = re.split(r'[.\[]', item, 1)[0]
                 param = interfaces[callee].get(formal.casefold(), {})
                 actual = args.get(formal.casefold(), '')
-                if param.get('direction') == 'inOutVars' and fixed_path(actual):
+                if param.get('direction') in INSTANCE_STORAGE and fixed_path(instance):
+                    name = instance + '.' + item
+                elif param.get('direction') == 'inOutVars' and fixed_path(actual):
                     name = actual + item[len(formal):]
-                    result.setdefault(name.casefold(), name)
+                else:
+                    continue
+                result.setdefault(name.casefold(), name)
         return result
     return expand('', frozenset())
 
@@ -91,39 +95,10 @@ def _site(item):
 
 
 def _channel_declaration(types, variable, program):
-    """Validate every static subscript against the declared dimensions."""
-    facts = []
+    typ, declarations = types.resolve(variable, program)
     parts = variable.split('.')
-    root = re.split(r'\[', parts[0], 1)[0]
-    nodes = types.locals.get(program, {}).get(root, types.globals.get(root, ()))
-    for pos, part in enumerate(parts):
-        if len(nodes) == 1:
-            variable_node = nodes[0].getparent().getparent()
-            facts.extend(at_path(declaration(variable_node), parts, pos))
-        typ = types._unaliased(nodes)
-        for indexes in re.findall(r'\[([^]]*)\]', part):
-            if typ is None or tag(typ) != 'array':
-                return None, facts
-            dims = typ.findall('{*}dimension')
-            if len(dims) != len(indexes.split(',')):
-                return None, facts
-            for dim, ix in zip(dims, indexes.split(',')):
-                try:
-                    if not int(dim.get('lower')) <= int(ix) <= int(dim.get('upper')):
-                        return None, facts
-                except (TypeError, ValueError):
-                    return None, facts
-            base = typ.find('{*}baseType')
-            typ = types._unaliased(list(base) if base is not None else ())
-        if typ is None:
-            return None, facts
-        if pos == len(parts) - 1:
-            return (tag(typ).upper() if types.bounds(variable, program) else None), facts
-        if tag(typ) != 'struct':
-            return None, facts
-        field = parts[pos + 1].split('[')[0]
-        nodes = types._declarations(typ).get(field, ())
-    return None, facts
+    facts = [fact for pos, node in declarations for fact in at_path(declaration(node), parts, pos)]
+    return (tag(typ).upper() if typ is not None and types.bounds(variable, program) else None), facts
 
 
 def _recover_st(code, parser, error):
@@ -241,6 +216,12 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             on_transition(candidate.name, item['from'], item['to'], {
                 **site, 'selector': names[key], 'source_id': item['source_id'], **{k: item[k] for k in ('body', 'network', 'node', 'write_value',
                                                  'condition_symbols', 'output_dependencies', 'offset', 'frames', 'selector_ports', 'operating_guard', 'commit', 'selectors')}})
+        for kind, decision, _, selector in item['frames']:
+            if kind == 'case' and decision in item['selectors']:
+                site['case_selector'] = selector
+                break
+        if item['operating_guard']:
+            site['operating_guard'] = item['operating_guard']
         candidate.edge(item['from'], item['to'], site)
         for other, conditions in item['numeric_conditions'].items():
             if other.casefold() not in names or other.casefold() == key:

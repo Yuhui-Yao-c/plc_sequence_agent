@@ -31,7 +31,7 @@ from plc_trace.capture.setup_output import (
 )
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
-from plc_trace.trace.trace_to_pairs import INTEGER_TYPES
+from plc_trace.trace.trace_to_pairs import INTEGER_TYPES, REAL_TYPES
 from plc_trace.runtime.workflow import fingerprint, lock_run_dir, pipeline_fingerprint
 
 
@@ -40,6 +40,7 @@ _ROOT = re.compile(rf'(?<![\w.#]){_NAME}')
 _MEMBER_NAME = re.compile(rf'{_NAME}|\d+')
 _SUFFIX = re.compile(rf'\s*(?:\.\s*(?:{_NAME}|\d+)|(?P<index>\[))')
 _CONTINUATION = re.compile(r'\s*(?:\[|\.(?!\.)|\()')
+INSTANCE_STORAGE = {'vars', 'localvars', 'outputvars', 'retainvars'}
 _INDEX_EDGE = re.compile(r'[\[\];]')
 _SUBSCRIPT = re.compile(r'\[([^\[\]]+)\]')
 _ARRAY_TYPE = re.compile(r'ARRAY\s*\[([^\[\]]+)\]\s*OF\s+(.+)', re.I)
@@ -405,6 +406,19 @@ class _SourceScan:
                     return None, '下标超出声明范围'
             pending = next(indexes, None)
 
+    def member(self, kind, field):
+        key = kind.casefold(), field.casefold()
+        values = self.members.get(key, ())
+        matches = self.units.get(key[0], ())
+        if len(matches) == 1 and key[0] not in self.ambiguous_units:
+            owner, = matches
+            directions = self.directions.get((owner, key[1]), set())
+            if owner[0] == 'functionblock' and len(directions) == 1 and directions <= INSTANCE_STORAGE:
+                if values:
+                    return (), None
+                return self.declarations[owner, key[1]], self.declaration_sites.get(('variable', owner, key[1]))
+        return values, self.declaration_sites.get(('member', *key))
+
     def channel_declarations(self, name):
         parts = name.split('.')
         unit = self.programs.get(parts[0].casefold()) if len(parts) > 1 else None
@@ -419,9 +433,8 @@ class _SourceScan:
             kind, _ = self._peel_type(values, parts[i-1])
             if not kind:
                 break
-            key = kind.casefold(), parts[i].split('[')[0].casefold()
-            result.extend(at_path(self.declaration_sites.get(('member', *key)), parts, i))
-            values = self.members.get(key, ())
+            values, site = self.member(kind, parts[i].split('[')[0])
+            result.extend(at_path(site, parts, i))
         return result
 
     def sysmac_channel(self, name, unit):
@@ -443,8 +456,8 @@ class _SourceScan:
             if not kind:
                 break
             member = _MEMBER_NAME.match(part)[0].casefold()
-            kind, problem = self._peel_type(self.members.get((kind.casefold(), member), ()), part)
-        if kind in INTEGER_TYPES:
+            kind, problem = self._peel_type(self.member(kind, member)[0], part)
+        if kind in INTEGER_TYPES or (self.matcher is None and kind in REAL_TYPES):
             return channel, kind, '', False
         return channel, None, problem or f'采集分析不支持声明类型 {kind}', False
 
@@ -473,6 +486,26 @@ def _sysmac_config(channels, task):
     writer.writerow(['Index', 'Date', 'ClockTime', 'RawTime', 'TraceSampID',
                      *(f"{c['name']}:{c['type']}" for c in channels)])
     return stream.getvalue().encode('utf-8-sig')
+
+
+def _csv_bytes(header, rows):
+    stream = io.StringIO(newline='')
+    writer = csv.writer(stream)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return stream.getvalue().encode('utf-8-sig')
+
+
+def _capture_context(channels):
+    """Keep each distinct enclosing operating condition with a write in that branch."""
+    for row in sorted(channels.values(), key=lambda item: _sort_key(item['name'])):
+        seen = set()
+        for site in row['transitions']:
+            guard = site.get('operating_guard')
+            source = site['scope'], guard
+            if guard and source not in seen:
+                seen.add(source)
+                yield row['name'], site['scope'], guard, site['source_line'], site.get('st_line', ''), site['id']
 
 
 def _inovance_config(root, channels, task, source_digest):
@@ -576,7 +609,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         channels, unresolved = {}, {}
         inventory, discovery_status = None, None
         if automatic:
-            from plc_trace.capture.step_discovery import Discovery, replay_selectors, scope_index, scope_selection
+            from plc_trace.capture.step_discovery import Discovery, array_coverage, replay_selectors, scope_index, scope_selection
             if source_format == 'plcopen':
                 from plc_trace.capture.plcopen_discovery import discover
             else:
@@ -596,14 +629,17 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 raise ValueError('用途判断 JSON 为空')
             chosen, roles = scope_selection(inventory, decisions)
             inventory['decisions'] = roles
-            families = decisions['station_families'] if decisions is not None else []
+            families = decisions.get('station_families', []) if decisions is not None else []
             inventory['station_families'] = families
             inventory['reference_sites'] = discovered.reference_sites
-            inventory['selector_replay'] = replay_selectors([r['name'] for r in chosen.values()],
+            slots, arrays = array_coverage(inventory, chosen, roles, discovered.reference_sites)
+            inventory['step_arrays'] = arrays
+            inventory['selector_replay'] = replay_selectors([r['name'] for r in (*chosen.values(), *slots.values())],
                                                            discovered.visible | set(discovered.candidates),
                                                            (n for n, _, _ in scan.references.values()))
             eligible = sum(r['eligibility'] == 'scope_required' for r in inventory['candidates'])
-            if decisions is None and eligible:
+            single_writes = sum(r['eligibility'] == 'single_write' for r in inventory['candidates'])
+            if decisions is None and (eligible or single_writes):
                 discovery_status = 'scope_review_pending'
             for key, record in chosen.items():
                 row = discovered.candidates[key]
@@ -613,6 +649,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                     channels[key].update(type=row.declared, type_source='声明' if row.declared else '')
                 if row.type_issue:
                     unresolved[name] = row.type_issue
+            for key, slot in slots.items():
+                channels[key] = {**slot, 'type_source': '同一实例数组的元素声明'}
             if not channels and not discovery_status:
                 discovery_status = 'needs_review'
         else:
@@ -647,30 +685,48 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                                  task_name=task_name, every_n_cycles=every_n_cycles)
         config = None
         files = {'static_variables.txt': ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
-        if not discovery_status and task['task_name'] and not unresolved and not scan.parse_issues:
+        configurable = ordered
+        if unresolved:
+            configurable = ([c for c in ordered if c['name'] not in unresolved]
+                            if automatic and capture_format == 'sysmac' else [])
+            if automatic:
+                files['unresolved_types.csv'] = _csv_bytes(('变量', '类型问题'), sorted(unresolved.items()))
+        if configurable and not discovery_status and task['task_name'] and not scan.parse_issues:
             extension = 'csv' if capture_format == 'sysmac' else 'trace'
-            config = source.stem + '_trace_config.' + extension
-            files[config] = (_sysmac_config(ordered, task['task_name']) if capture_format == 'sysmac'
-                             else _inovance_config(template, ordered, task, digest))
+            suffix = '_partial' if len(configurable) < len(ordered) else ''
+            config = f'{source.stem}_trace_config{suffix}.{extension}'
+            files[config] = (_sysmac_config(configurable, task['task_name']) if capture_format == 'sysmac'
+                             else _inovance_config(template, configurable, task, digest))
         report = {
             'version': __version__, 'mode': 'trace_setup', 'status': discovery_status or ('done' if config else 'needs_review'),
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,
             'pattern': matcher.single_pattern if matcher else None,
             'patterns': matcher.patterns if matcher else [], 'capture_format': capture_format, **task,
             'static_variables': len(ordered), 'channels': ordered,
+            'configured_variables': len(configurable) if config else 0,
+            'configuration_complete': bool(config) and len(configurable) == len(ordered),
             'dynamic_variables': sorted(scan.dynamic.values(), key=_sort_key),
             'unresolved_types': unresolved, 'parse_issues': scan.parse_issues,
             'sample_count': 0, 'out': str(out), 'configuration': str(out / config) if config else None,
         }
         if automatic:
             report.update(selection_mode='automatic', discovery='step_variable_discovery.json',
-                          scope_candidates=eligible, inventory_sha256=inventory['inventory_sha256'],
+                          sequence_variables=len(chosen), referenced_step_slots=len(slots),
+                          scope_candidates=eligible, single_write_candidates=single_writes, inventory_sha256=inventory['inventory_sha256'],
                           scope_policy=inventory['scope_policy'], station_family_count=len(families),
                           scope_excluded=sum(r['admission'] == 'excluded' for r in roles),
                           scope_uncertain=sum(r['admission'] == 'review' for r in roles))
-            report['unproven_candidates'] = len(inventory['candidates']) - eligible
-            if (report['scope_uncertain'] or report['unproven_candidates']) and config:
+            resolved = {d['name'].casefold() for d in roles if d['admission'] != 'review'}
+            resolved_singles = sum(r['eligibility'] == 'single_write' and r['identity'] in resolved
+                                   for r in inventory['candidates'])
+            report['unproven_candidates'] = len(inventory['candidates']) - eligible - resolved_singles
+            files['step_array_coverage.csv'] = _csv_bytes(
+                ('具体数组', '声明下界', '声明上界', '声明行', '执行步实例', '有引用无独立跳步的槽位'),
+                ((g['array'], *g['bounds'], g['declaration_line'], g['example'], ' | '.join(g['referenced_slots'])) for g in arrays))
+            if (unresolved or report['scope_uncertain'] or report['unproven_candidates']) and config:
                 report['status'] = 'done_with_review'
+            files['capture_context.csv'] = _csv_bytes(('步序变量', '所属例程', '外层执行条件', 'XML行', 'ST行', '写点引用'),
+                                                       _capture_context(chosen))
             files['scope_candidates.jsonl'] = ''.join(json.dumps(r, ensure_ascii=False) + '\n'
                                                        for r in scope_index(inventory)).encode('utf-8')
             if decisions is not None:

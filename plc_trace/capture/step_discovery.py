@@ -21,6 +21,19 @@ def fixed_path(value):
             all(re.fullmatch(r'-?\d+(?:,-?\d+)*', ix) for ix in re.findall(r'\[([^]]*)\]', value)))
 
 
+def _sequence_witness(sites):
+    """Locate an own CASE arm or two successive dispatches at the same concrete writer."""
+    for site in sites:
+        if site.get('case_selector'):
+            return {'kind': 'case_dispatch', 'basis': [site['id']]}
+    starts = {(writer_context(site), site['from']): site for site in reversed(sites)}
+    for site in sites:
+        successor = starts.get((writer_context(site), site['to']))
+        if successor:
+            return {'kind': 'successive_dispatch', 'basis': [site['id'], successor['id']]}
+    return None
+
+
 def isolate_counted_loops(code, *, writer_locations=False):
     """Omit balanced assignment-only FORs, never transfers or calls. Keep original offsets.
 
@@ -90,20 +103,19 @@ class Candidate:
 
     def effect(self, step, site):
         if site.get('target') and site['target'].casefold() != self.name.casefold():
-            self.effects.setdefault((site['scope'], step, site['target']), {**site, 'step': step})
+            self.effects.setdefault((writer_context(site), step, site['target']), {**site, 'step': step})
 
     def record(self):
         starts = {a for a, _ in self.edges}
         ends = {b for _, b in self.edges}
-        scoped_steps = {(site['scope'], site['from']) for site in self.sites.values()}
-        effects = [site for (scope, step, _), site in self.effects.items() if (scope, step) in scoped_steps]
+        scoped_steps = {(writer_context(site), site['from']) for site in self.sites.values()}
+        effects = [site for (writer, step, _), site in self.effects.items() if (writer, step) in scoped_steps]
         # A one-way scalar reset (timer wrap, range clamp, recipe default) is not
         # a sequence. A short sequence can qualify through a real controlled output.
         chain = bool(starts & ends)
         if not self.edges:
             self.reasons.add('no_constrained_state_change')
-        elif (not chain and not effects and not self.links and not
-              any(s.get('case_selector') and s.get('other_condition') for s in self.sites.values())):
+        elif not (chain or effects or self.links or any(s.get('case_selector') for s in self.sites.values())):
             self.reasons.add('isolated_write_without_controlled_effect')
         if not fixed_path(self.name):
             self.reasons.add('nonconstant_or_unaddressable_reference')
@@ -117,12 +129,15 @@ class Candidate:
         for n, site in enumerate(effects, 1):
             site['id'] = f'e{n}'
         links = [{**self.links[key], 'id': f'l{n}'} for n, key in enumerate(sorted(self.links), 1)]
+        eligibility = ('single_write' if self.reasons == {'isolated_write_without_controlled_effect'}
+                       else 'review' if self.reasons else 'scope_required')
         return {'name': self.name, 'identity': self.name.casefold(), 'type': self.declared or None,
                 'family': family(self.name),
                 'declarations': [{**d, 'id': f'd{i}'} for i, d in enumerate(self.declarations, 1)],
-                'type_issue': self.type_issue, 'eligibility': 'review' if self.reasons else 'scope_required',
+                'type_issue': self.type_issue, 'eligibility': eligibility,
                 'reasons': sorted(self.reasons), 'edges': len(self.edges), 'scopes': sorted({s['scope'] for s in sites}),
                 'transitions': sites, 'effects': effects, 'control_links': links,
+                'sequence_witness': _sequence_witness(sites),
                 **({'scheduled_writers': self.scheduled} if self.scheduled else {})}
 
 
@@ -180,13 +195,13 @@ class Discovery:
             for site in row['transitions']:
                 if 'co_cursors' in site:
                     site['co_cursors'] = sorted(controllers.intersection(site['co_cursors']) - {row['identity']})
-        data = {'schema': 'plc.step_discovery.v2', 'scope_policy': 'station_automatic_steps', 'source_sha256': source_sha, 'adapter': adapter,
+        data = {'schema': 'plc.step_discovery.v3', 'scope_policy': 'all_sequence_levels', 'source_sha256': source_sha, 'adapter': adapter,
                 'candidates': records, 'parse_limits': self.issues}
         data['inventory_sha256'] = digest(data)
         return data
 
 
-_ROLES = {'station_auto', 'station_slot', 'component_sequence', 'auxiliary', 'uncertain'}
+_ROLES = {'station_auto', 'station_slot', 'component_sequence', 'auxiliary_sequence', 'auxiliary', 'non_sequence', 'uncertain'}
 
 
 def _station_evidence(candidate, row, citations):
@@ -206,13 +221,15 @@ def _station_evidence(candidate, row, citations):
 
 
 def scope_selection(inventory, decisions):
-    """Require a project-local station interface and individual, scoped source proof."""
-    eligible = {r['identity']: r for r in inventory['candidates'] if r['eligibility'] == 'scope_required'}
+    """Separate source evidence of progression from the channel's role in the machine."""
+    eligible = {r['identity']: r for r in inventory['candidates'] if r['eligibility'] in {'scope_required', 'single_write'}}
+    required = {key for key, row in eligible.items() if row['eligibility'] == 'scope_required'}
+    selected = {key: row for key, row in eligible.items() if row['sequence_witness']}
     if decisions is None:
-        return {}, []
+        return selected, []
     if not isinstance(decisions, dict) or decisions.get('inventory_sha256') != inventory['inventory_sha256']:
-        raise ValueError('用途判断与本轮源码证据指纹不一致，请重新判断工位自动步范围')
-    rows, examples = decisions.get('decisions'), decisions.get('station_families')
+        raise ValueError('用途判断与本轮源码证据指纹不一致，请重新核对步序变量')
+    rows, examples = decisions.get('decisions'), decisions.get('station_families', [])
     if not isinstance(rows, list) or not isinstance(examples, list):
         raise ValueError('工位范围判断须包含 station_families 与 decisions 数组')
     families = {}
@@ -226,7 +243,7 @@ def scope_selection(inventory, decisions):
         if group in families:
             raise ValueError(f'重复声明工位变量族：{group}')
         families[group] = key
-    selected, reviewed = {}, {}
+    reviewed = {}
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get('name'), str):
             raise ValueError('用途判断缺少变量名')
@@ -243,23 +260,50 @@ def scope_selection(inventory, decisions):
                 or not all(isinstance(i, str) and i in refs for i in citations)):
             raise ValueError(f'用途、理由或本变量源码证据引用无效：{key}')
         # Recompute the output disposition even if the user replays a previous result.
-        item = {k: row[k] for k in ('name', 'role', 'basis', 'reason')}
-        item['admission'] = 'review' if row['role'] == 'uncertain' else 'excluded'
+        item = {k: row[k] for k in ('role', 'basis', 'reason')}
+        item['name'] = candidate['name']
+        transition_ids = {site['id'] for site in candidate['transitions']}
+        if row['role'] in {'component_sequence', 'auxiliary_sequence', 'non_sequence'} and transition_ids.isdisjoint(citations):
+            raise ValueError(f'确认执行步或排除数据通道须引用本实例的写步位置：{key}')
+        if candidate['eligibility'] == 'single_write' and row['role'] in {'component_sequence', 'auxiliary_sequence'}:
+            documented = any(d['id'] in citations and d.get('text') for d in candidate['declarations'])
+            annotated = any(t['id'] in citations and t.get('comment') for t in candidate['transitions'])
+            if not (documented or annotated):
+                raise ValueError(f'单向写回须补充该实例的用途声明或写点注释：{key}')
+        if row['role'] == 'non_sequence':
+            # Both data codes and sequence cursors can have the same numeric graph.
+            # Require source evidence of the alternative use beyond the candidate write.
+            support = {site['id'] for site in candidate['effects'] + candidate['control_links']}
+            support.update(d['id'] for d in candidate['declarations'] if d.get('text'))
+            if support.isdisjoint(citations) and len(transition_ids.intersection(citations)) < 2:
+                raise ValueError(f'排除非步序数据须补充声明说明、受控读写或另一写点：{key}')
+            selected.pop(key, None)
+        elif row['role'] in {'component_sequence', 'auxiliary_sequence'}:
+            selected[key] = candidate
         if row['role'] in {'station_auto', 'station_slot'}:
             if candidate['family'] not in families:
                 raise ValueError(f'该通道尚未证明所属工位自动步接口：{key}')
             _station_evidence(candidate, row, set(citations))
             selected[key] = candidate
-            item.update(owner_scope=row['owner_scope'], admission='captured')
+            item['owner_scope'] = row['owner_scope']
             if row['role'] == 'station_slot':
                 peer = row.get('interface_peer')
                 if not isinstance(peer, str) or peer.casefold() == key:
                     raise ValueError(f'工位槽位须指向同一接口的另一已核实实例：{key}')
                 item['interface_peer'] = peer
+        item['admission'] = ('captured' if key in selected else
+                             'excluded' if row['role'] == 'non_sequence' else 'review')
+        if row.get('dedicated_step_array'):
+            declarations = [s for s in candidate['declarations'] if s.get('array_bounds') and s.get('text')
+                            and s['path'].casefold() == key and s['id'] in citations]
+            if (key not in selected or len(declarations) != 1 or not re.search(r'\[-?\d+\]$', key)
+                    or transition_ids.isdisjoint(citations)):
+                raise ValueError(f'步序专用数组须核实本实例的叶数组声明、边界及写点：{key}')
+            item['dedicated_step_array'] = True
         reviewed[key] = item
-    if reviewed.keys() != eligible.keys():
-        raise ValueError(f'本轮仍有 {len(eligible.keys() - reviewed.keys())} 个候选缺用途判断')
-    if any(reviewed[key]['role'] != 'station_auto' for key in families.values()):
+    if missing := required - reviewed.keys():
+        raise ValueError(f'本轮仍有 {len(missing)} 个候选缺用途判断')
+    if any(reviewed.get(key, {}).get('role') != 'station_auto' for key in families.values()):
         raise ValueError('工位变量族的代表实例也须有逐通道生产例程证据')
     for key, row in selected.items():
         decision = reviewed[key]
@@ -269,23 +313,34 @@ def scope_selection(inventory, decisions):
         if (peer not in selected or reviewed[peer]['role'] != 'station_auto'
                 or not same_station_array(row, decision, selected[peer], reviewed[peer])):
             raise ValueError(f'无法证明该槽位与工位主实例的声明地址及生产程序一致：{key}')
-    withheld = dependent_writes(selected)
-    for key, candidate in selected.items():
-        decision = reviewed[key]
-        peer = decision.get('interface_peer', '').casefold()
-        example = families[candidate['family']]
-        if gates := withheld.get(key):
-            decision['gated_by'] = gates
-            # A commissioned slot may run wholly inside its own station's step.
-            # The exception requires the same concrete storage, host and independent peer.
-            if not peer or peer in withheld or any(
-                    not same_station_array(candidate, decision, selected[p], reviewed[p]) for p in gates):
-                decision['admission'] = 'review'
-        if decision['admission'] == 'captured' and (example in withheld or peer in withheld):
-            anchor = peer if peer in withheld else example
-            decision.update(admission='review', interface_under_review=eligible[anchor]['name'])
-    chosen = {key: r for key, r in selected.items() if reviewed[key]['admission'] == 'captured'}
-    return chosen, [reviewed[k] for k in sorted(reviewed)]
+    for key, parents in dependent_writes(selected).items():
+        reviewed[key]['gated_by'] = parents
+    return selected, [reviewed[k] for k in sorted(reviewed)]
+
+
+def array_coverage(inventory, selected, decisions, references):
+    """Find concrete read/reset-only slots in a reviewed, bounded step array."""
+    arrays, slots = {}, {}
+    for decision in decisions:
+        if not decision.get('dedicated_step_array'):
+            continue
+        row = selected[decision['name'].casefold()]
+        base = row['name'].rsplit('[', 1)[0]
+        decl = next(d for d in row['declarations'] if d.get('array_bounds') and d['path'].casefold() == row['identity'])
+        arrays[base.casefold()] = {'array': base, 'bounds': decl['array_bounds'], 'declaration_line': decl['line'],
+                                   'example': row['name'], 'type': row['type'], 'referenced_slots': []}
+    for row in inventory['candidates']:
+        key = row['identity']
+        if key not in references or set(row['reasons']) != {'no_constrained_state_change', 'reference_only'}:
+            continue
+        match = re.fullmatch(r'(.+)\[(-?\d+)\]', key)
+        group = arrays.get(match[1]) if match else None
+        if group and group['bounds'][0] <= int(match[2]) <= group['bounds'][1] and group['type']:
+            name = row['name']
+            slots[key] = {'name': name, 'type': group['type'], 'source_line': references[key]['source_line'],
+                          'evidence': 'referenced_step_slot', 'array_example': group['example']}
+            group['referenced_slots'].append(name)
+    return slots, list(arrays.values())
 
 
 def replay_selectors(names, visible, explicit=None):
@@ -312,7 +367,7 @@ def replay_selectors(names, visible, explicit=None):
 def scope_index(inventory):
     """One line per eligible channel for bounded agent reads; full evidence stays in the ledger."""
     for row in inventory['candidates']:
-        if row['eligibility'] != 'scope_required':
+        if row['eligibility'] not in {'scope_required', 'single_write'}:
             continue
         examples = []
         for field in ('transitions', 'effects', 'control_links'):
@@ -328,8 +383,8 @@ def scope_index(inventory):
                     if site.get('binding'):
                         brief['call'] = [{k: x[k] for k in ('scope', 'instance', 'source_line')} for x in site['binding']]
                     examples.append(brief)
-        yield {'name': row['name'], 'family': row['family'], 'declarations': row['declarations'],
-               'type_issue': row['type_issue'],
+        yield {'name': row['name'], 'family': row['family'], 'eligibility': row['eligibility'], 'declarations': row['declarations'],
+               'type_issue': row['type_issue'], 'sequence_witness': row['sequence_witness'],
                'scheduled_writers': row.get('scheduled_writers', {}), 'evidence': examples}
 
 

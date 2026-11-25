@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。
 
-当前简化版为 **15.2.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **16.0.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -27,7 +27,7 @@ opencode
 
 两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。入口二的候选、范围判断、最终配置和通道清单都在同一个工序子目录。同一源码、程序及采集选项重复提交时，校验已有文件后返回当前阶段。不同采集任务或原位置已被其他数据占用时才另选编号。入口一新建独立运行的目录规则见下文。
 
-入口二省略模式时，根据源码中的状态分支、写回和功能块实参发现具体通道。OpenCode 按实际控制层级确认工位或独立作业单元的自动周期。同一正式工位数组中承载局部动作的生产槽位可逐项核实。设备内部另设的执行步、许可和通信状态保留在审计里。多个独立步序接口可同时入选。单独使用 CLI 时，首次返回 `scope_review_pending`，需提供本轮用途判断才能完成选择。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
+入口二省略模式时，根据源码中的状态分支、写回和功能块实参发现具体通道。默认清单覆盖工位主步、命令执行步、工作区、并行子流程以及有写步依据的辅助流程。首轮从具体实例的 CASE 写回或同一写入上下文的接续迁移给出初选清单。OpenCode 核实短序列、数据字段及所属层级，保留父步门控和命令、模式等外层执行条件。单独使用 CLI 时，`scope_review_pending` 表示仍有源码用途需要核对。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
 
 也可连续输入多个独立模式，每个模式用引号包住。命中任一模式的变量进入同一清单，完整变量名去重后自然排序。可混用完整名称、通配符和 `re:` 正则；单模式写法继续有效。
 
@@ -73,7 +73,7 @@ Trace 分析支持 TwinCAT Scope `.trace` 和 Sysmac 导出表、分卷目录，
 
 入口一简写遇到已占用目录时另开编号。`prepared_b_tier_pending` 时完成本轮 `batches_desc/*.result.json`，再以相同参数加 `--resume`。`done_with_review` 表示已出表且有待核项。
 
-入口二的配置在客户端导入并完成现场采集后，可将实测导出交给入口一。类型或解析问题由 `needs_review` 状态报告。
+入口二的配置在客户端导入并完成现场采集后，可将实测导出交给入口一。`static_variables.txt` 列出所有入选地址。自动 Sysmac 配置缺少部分叶类型时，已核实的地址写入 `*_trace_config_partial.csv`，其余地址及原因见 `unresolved_types.csv`。状态字段 `configured_variables` 和 `configuration_complete` 分别表示已配置数和是否覆盖全部入选地址。Sysmac 也支持用 REAL 或 LREAL 存储整数步值的离散序列。入口一依据源码确认步序，逐样本核对整数值，小数样点记为该通道缺口。对于已核实的专用步序数组，清单可补入源码实际引用的固定槽位，状态文件区分独立执行步与仅有引用的槽位。其他预留槽位可按 `step_array_coverage.csv` 的声明边界复查。外层执行条件及 XML 写点见 `capture_context.csv`。
 
 ## 目录与职责
 

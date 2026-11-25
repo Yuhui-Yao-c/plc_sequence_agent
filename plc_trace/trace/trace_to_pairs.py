@@ -64,6 +64,7 @@ INTEGER_TYPES = {
     'SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT',
     'BYTE', 'WORD', 'DWORD', 'LWORD',
 }
+REAL_TYPES = {'REAL', 'LREAL'}
 NS_PER_MS = 1_000_000
 CAPTURE_SETTINGS = ('tracetype', 'sampletimingtype', 'taskname', 'samplinginterval', 'samplerate')
 SYSMAC_PART_NAME = re.compile(r'([0-9]{14})_([0-9]{5})')
@@ -160,7 +161,7 @@ def trace_input_digest(path):
     return digest.hexdigest()
 
 
-def _read_header(reader, path):
+def _read_header(reader, path, is_real_step=None):
     metadata = {}
     for row in reader:
         fields = [cell.strip().casefold() for cell in row]
@@ -172,7 +173,8 @@ def _read_header(reader, path):
                 name, data_type = name.strip(), data_type.strip().upper()
                 if name and data_type:
                     recorded_columns.append(column)
-                if not name or data_type not in INTEGER_TYPES:
+                if not name or (data_type not in INTEGER_TYPES and not
+                                (data_type in REAL_TYPES and is_real_step and is_real_step(name))):
                     continue
                 if name in channels:
                     raise ValueError(f'{path}:{reader.line_num}: 重复变量列 {name}')
@@ -214,10 +216,10 @@ def _sample_rows(reader, path, index_column, time_column):
         yield index, raw_time, row
 
 
-def _scan_part(path, encoding, delimiter, specified_ns=None):
+def _scan_part(path, encoding, delimiter, specified_ns=None, is_real_step=None):
     with path.open(encoding=encoding, newline='') as stream:
         reader = csv.reader(stream, delimiter=delimiter)
-        index_column, time_column, channels, metadata, _ = _read_header(reader, path)
+        index_column, time_column, channels, metadata, _ = _read_header(reader, path, is_real_step)
         first_index = last_index = first_time = last_time = None
         count = 0
         precise = True
@@ -321,12 +323,12 @@ def _validate_recording(recording, duplicates):
     return Recording(recording.recording_id, recording.grouping_source, accepted)
 
 
-def _prepare_parts(tables, specified_ns=None):
+def _prepare_parts(tables, specified_ns=None, is_real_step=None):
     """Identify the recording before validating or ordering its sample ranges."""
     named = defaultdict(list)
     unnamed = []
     for path, fmt in tables:
-        part = _scan_part(path, *fmt, specified_ns=specified_ns)
+        part = _scan_part(path, *fmt, specified_ns=specified_ns, is_real_step=is_real_step)
         match = SYSMAC_PART_NAME.fullmatch(path.stem)
         if match:
             named[match[1]].append(part)
@@ -380,7 +382,7 @@ def _estimate_time(index, left, right, interval_ns, first_index):
     return anchor_ns + (index - anchor_idx) * interval_ns
 
 
-def _parse_one_recording(parts, channels, interval_ns):
+def _parse_one_recording(parts, channels, interval_ns, non_integer):
     """Parse one recording in its own time and sample-index coordinate system."""
     right_anchors = [None] * len(parts)
     next_anchor = None
@@ -403,8 +405,8 @@ def _parse_one_recording(parts, channels, interval_ns):
         estimated = part.raw_range is None
         with part.path.open(encoding=part.encoding, newline='') as stream:
             reader = csv.reader(stream, delimiter=part.delimiter)
-            index_column, time_column, columns, _, recorded_columns = _read_header(reader, part.path)
-            selected = [(name, columns[name][0], channel) for name, channel in channels.items()]
+            index_column, time_column, columns, _, recorded_columns = _read_header(reader, part.path, channels.__contains__)
+            selected = [(name, *columns[name], channel) for name, channel in channels.items()]
             count = 0
             for index, raw_time, row in _sample_rows(reader, part.path, index_column, time_column):
                 if count == 0 and index != part.first_index:
@@ -427,11 +429,19 @@ def _parse_one_recording(parts, channels, interval_ns):
                 ts = (ns - origin + NS_PER_MS // 2) // NS_PER_MS
                 populated = any(c < len(row) and row[c].strip() for c in recorded_columns)
                 row_clock.append(index, 1 if populated else None, ts, break_reason=reason)
-                for name, column, channel in selected:
+                for name, column, kind, channel in selected:
                     try:
                         cell = row[column].strip()
-                        value = int(cell) if cell else None
-                    except (IndexError, ValueError) as exc:
+                        if cell and kind in REAL_TYPES:
+                            real = Decimal(cell)
+                            if real.is_finite() and real.adjusted() <= 308 and real == real.to_integral_value():
+                                value = int(real)
+                            else:
+                                non_integer[name] = non_integer.get(name, 0) + 1
+                                value = None
+                        else:
+                            value = int(cell) if cell else None
+                    except (IndexError, InvalidOperation, ValueError) as exc:
                         raise ValueError(f'{part.path}:{reader.line_num}: {name} 的整型值无效') from exc
                     channel.append(index, value, ts, estimated, reason)
                 previous_index, previous_ns = index, ns
@@ -446,12 +456,12 @@ def _parse_one_recording(parts, channels, interval_ns):
     return {name: channel.finish() for name, channel in channels.items()}, gaps, common, ts
 
 
-def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
+def parse_omron_trace(path, *, sample_interval_ms=None, matches=None, is_real_step=None):
     """Parse recordings independently and aggregate the selected channel union."""
     path = Path(path)
     tables, ignored = _find_tables(path)
     specified_ns = _specified_period(sample_interval_ms)
-    recordings, duplicates = _prepare_parts(tables, specified_ns)
+    recordings, duplicates = _prepare_parts(tables, specified_ns, is_real_step)
 
     channel_names = {name for rec in recordings for name in rec.parts[0].channels
                      if matches is None or matches(name)}
@@ -493,7 +503,10 @@ def parse_omron_trace(path, *, sample_interval_ms=None, matches=None):
             if interval_ns is None:
                 raise ValueError(f'采集 {rec.recording_id}: RawTime 精度不足。请加入本次采集的精确时间分卷，'
                                  '或指定 --sample-interval-ms')
-        ch_results, gaps, row_gaps, end_ts = _parse_one_recording(parts, channels, interval_ns)
+        non_integer = {}
+        ch_results, gaps, row_gaps, end_ts = _parse_one_recording(parts, channels, interval_ns, non_integer)
+        if non_integer:
+            detail['non_integer_step_samples'] = non_integer
         periods = {p.path.name: p.clock_period_ns / NS_PER_MS if p.clock_period_ns else None for p in parts}
         gap_audit = gap_record(rec.recording_id, {name: c.gaps for name, c in channels.items()},
                                periods, len(parts[0].channels))
@@ -682,9 +695,20 @@ def generate(trace_path, run, source=None, proc_name=None,
         matches = glob_regex(pattern).fullmatch
 
     # ---- 1. Normalize the trace input ----
+    source_writes = None
+    real_steps = None
+    def is_real_step(name):
+        nonlocal source_writes, real_steps
+        if real_steps is None:
+            from plc_trace.capture.write_index import write_index
+            source_writes = write_index(source, run, branch_index)
+            real_steps = set(source_writes['real_step_channels'])
+        return name.casefold() in real_steps
+
     if is_omron_trace_input(trace_path):
         variables, trace_input = parse_omron_trace(
-            trace_path, sample_interval_ms=sample_interval_ms, matches=matches)
+            trace_path, sample_interval_ms=sample_interval_ms, matches=matches,
+            is_real_step=is_real_step if source else None)
     else:
         trace_input = {}
         variables = parse_trace(trace_path, audit=trace_input, sample_interval_ms=sample_interval_ms)
@@ -988,7 +1012,7 @@ def generate(trace_path, run, source=None, proc_name=None,
     }
     if action_branches:
         from plc_trace.trace.branch_report import prepare
-        summary['action_branches'] = prepare(run, source, rows, jump_rows, source_index, variables, branch_index)
+        summary['action_branches'] = prepare(run, source, rows, jump_rows, source_index, variables, branch_index, source_writes)
     (run / 'trace_pairs_summary.json').write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
 

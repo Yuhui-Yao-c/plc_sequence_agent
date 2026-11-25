@@ -36,6 +36,36 @@ class SysmacRecordingTests(unittest.TestCase):
         with open(path, encoding='utf-8-sig', newline='') as file:
             return list(csv.DictReader(file))
 
+    def test_source_proven_real_cursor_round_trips_without_analog_channels_or_fractional_jumps(self):
+        from plc_trace.capture.extract_step_variables import generate as configure
+        source = self.root/'Mixer.xml'
+        def var(name):
+            return f'<Variable name="{name}"><Type><TypeName>REAL</TypeName></Type></Variable>'
+        source.write_text('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+var('Cursor')+
+            var('Pressure')+'</GlobalVars><Program name="P"><BodyContent><ST>CASE Cursor OF 2: Cursor:=5; '
+            '5: Cursor:=2; END_CASE; Pressure:=Value;</ST></BodyContent></Program></Project>')
+        setup = self.root/'setup'
+        started = configure(source, setup)
+        path = self.root/'review.json'
+        path.write_text(json.dumps({'inventory_sha256':started['inventory_sha256'],'decisions':[
+            {'name':'Cursor','role':'component_sequence','basis':['t1'],'reason':'在两步间控制运行'}]}))
+        config = configure(source, setup, scope_results=path)
+        self.assertTrue(config['configuration_complete'])
+        self.assertIn('Cursor:REAL',Path(config['configuration']).read_text(encoding='utf-8-sig'))
+        sample = self.trace/'record.csv'
+        self.write_part(sample.name, self.EPOCH, [(1,'2.0','5.0'),(2,'5E0','10'),(3,'2.5','0'),(4,'2','10')],
+                        channels=('Cursor','Pressure'))
+        sample.write_text(sample.read_text(encoding='utf-8-sig').replace(':INT',':REAL'))
+        run = self.root/'run'
+        run.mkdir()
+        generate(self.trace,run,source=source,action_branches=True)
+        jumps = self.read_csv(run/'trace_jumps.csv')
+        self.assertEqual([(r['变量'],r['from值'],r['to值']) for r in jumps],[('Cursor','2','5')])
+        index = json.loads((run/'source_branch_index.json').read_bytes())
+        self.assertEqual(index['records']['real_step_channels'], ['cursor'])
+        _, audit = parse_omron_trace(sample,is_real_step=lambda name:name=='Cursor')
+        self.assertEqual(audit['recording_details'][0]['non_integer_step_samples'], {'Cursor':1})
+
     def write_csv(self, path, rows):
         with path.open('w', encoding='utf-8-sig', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))

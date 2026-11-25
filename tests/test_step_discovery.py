@@ -1,5 +1,6 @@
 import argparse
 import copy
+import csv
 import json
 import tempfile
 import unittest
@@ -261,7 +262,7 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertTrue(any(e['target']=='Pulse' for e in rows['Cursor']['effects']))
         self.assertGreater(inv['parse_limits']['unsupported_st'],0)
 
-    def test_station_scope_blocks_nested_word_and_keeps_parallel_cycles(self):
+    def test_nested_and_parallel_sequences_remain_capture_channels(self):
         control = ('CASE AxisX OF 2: IF Ready THEN AxisX:=9; END_IF; '
                    '9: IF ExitOK THEN AxisX:=2; END_IF; END_CASE; '
                    'IF AxisX=2 THEN CASE Ticket OF 1: Ticket:=5; 5: Ticket:=1; END_CASE; END_IF; '
@@ -273,15 +274,14 @@ class StepDiscoveryTests(unittest.TestCase):
                               '</GlobalVars><Program name="Bay"><BodyContent name="Cycle"><ST>'+control+
                               '</ST></BodyContent></Program></Project>')
         result = self.finish(inv, {'AxisX', 'Lane', 'Ticket'})
-        self.assertEqual({c['name'] for c in result['channels']}, {'AxisX','Lane'})
-        self.assertEqual(result['scope_uncertain'], 1)
+        self.assertEqual({c['name'] for c in result['channels']}, {'AxisX','Lane','Ticket'})
+        self.assertEqual(result['scope_uncertain'], 0)
         decision = json.loads((self.out/'scope_results.json').read_bytes())['decisions']
         self.assertEqual(next(r for r in decision if r['name']=='Ticket')['gated_by'], ['axisx'])
-        self.assertEqual(result['status'], 'done_with_review')
-        import csv
+        self.assertEqual(result['status'], 'done')
         with Path(result['configuration']).open(encoding='utf-8-sig', newline='') as f:
             header = next(r for r in csv.reader(f) if r and r[0] == 'Index')
-        self.assertEqual(header[5:], ['AxisX:INT','Lane:INT'])
+        self.assertEqual(header[5:], ['AxisX:INT','Lane:INT','Ticket:INT'])
 
     def test_per_element_notes_and_individually_scoped_instances(self):
         var = ('<Variable name="Cursor"><Documentation>运行序列</Documentation><AddData><Data><VariableComment>'
@@ -299,8 +299,8 @@ class StepDiscoveryTests(unittest.TestCase):
         item = next(r for r in scope['decisions'] if r['name']=='Cursor[1]')
         item.update(role='component_sequence', basis=['d2','t1'])
         chosen, reviewed = scope_selection(inv, scope)
-        self.assertEqual(set(chosen), {'cursor[0]'})
-        self.assertEqual(reviewed[1]['admission'], 'excluded')
+        self.assertEqual(set(chosen), {'cursor[0]', 'cursor[1]'})
+        self.assertEqual(reviewed[1]['admission'], 'captured')
         scope['decisions'][0]['basis'].remove('d2')
         with self.assertRaises(ValueError):
             scope_selection(inv, scope)
@@ -319,7 +319,7 @@ class StepDiscoveryTests(unittest.TestCase):
         rows = {r['name']:r for r in inv['candidates']}
         self.assertEqual([d['text'] for d in rows['Head.Mark']['declarations']], ['装配单元', '位置'])
         self.assertEqual([d['text'] for d in rows['Drive.Mark']['declarations']], ['移送元件', '位置'])
-        self.assertEqual(self.finish(inv, {'Head.Mark'})['static_variables'], 1)
+        self.assertEqual({c['name'] for c in self.finish(inv, {'Head.Mark'})['channels']}, {'Head.Mark', 'Drive.Mark'})
 
     def test_registered_slot_in_own_unit_with_foreign_array_and_program(self):
         var = '<Variable name="{}"><Type><TypeName>ARRAY[0..5] OF INT</TypeName></Type></Variable>'
@@ -337,7 +337,7 @@ class StepDiscoveryTests(unittest.TestCase):
         lookup['Q[1]'].update(role='station_slot', interface_peer='Q[0]')
         selected, decisions = scope_selection(inv, scope)
         self.assertIn('q[1]', selected)
-        self.assertNotIn('part[1]', selected)
+        self.assertIn('part[1]', selected)
         slot = next(r for r in decisions if r['name']=='Q[1]')
         self.assertEqual((slot['admission'],slot['gated_by']), ('captured',['q[0]']))
         for peer in ('Q[1]', 'Part[1]', 'Q[3]', 'absent'):
@@ -361,3 +361,130 @@ class StepDiscoveryTests(unittest.TestCase):
         parent.edge(9, 4, site('First', 30))
         rows['cursor'] = parent.record()
         self.assertEqual(dependent_writes(rows), {'word':['cursor']})
+
+    def test_sysmac_command_instances_and_auxiliary_cycle_survive_role_review_and_missing_types(self):
+        control = ('<FunctionBlock name="Worker"><InOutVars><Variable name="part"><Type><TypeName>Unit</TypeName>'
+                   '</Type></Variable></InOutVars><BodyContent name="Command"><ST>IF part.Mode=4 THEN '
+                   'CASE part.Position OF 8: part.Position:=15; 15: part.Position:=8; END_CASE; END_IF;'
+                   '</ST></BodyContent></FunctionBlock>')
+        def variable(name, kind):
+            return f'<Variable name="{name}"><Type><TypeName>{kind}</TypeName></Type></Variable>'
+        xml = ('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+variable('A','Unit')+
+               variable('B','Unit')+variable('Warm','INT')+variable('Reply','INT')+'</GlobalVars>'+control+
+               '<Program name="P"><LocalVars>'+variable('drive1','Worker')+variable('drive2','Worker')+
+               '</LocalVars><BodyContent name="Cycle"><ST>drive1(part:=A); drive2(part:=B); '
+               'CASE Warm OF 0: Warm:=5; 5: Warm:=0; END_CASE; '
+               'IF Reply=1 THEN Ack:=TRUE; Reply:=0; END_IF;</ST></BodyContent></Program></Project>')
+        first, inv = self.prepare(xml)
+        expected = {'A.Position','B.Position','Warm'}
+        self.assertEqual({c['name'] for c in first['channels']}, expected)
+        scope = self.scope(inv, set())
+        del scope['station_families']
+        for row in scope['decisions']:
+            row['role'] = 'auxiliary' if row['name'] == 'Warm' else 'component_sequence'
+            if row['name'] == 'Reply':
+                row.update(role='non_sequence', basis=['t1','e1'], reason='确认上位机写入的应答并清零')
+        path = self.root/'review.json'
+        path.write_text(json.dumps(scope))
+        result = generate(self.source, self.out, scope_results=path)
+        self.assertEqual(set((self.out/'static_variables.txt').read_text().splitlines()), expected)
+        self.assertEqual((result['configured_variables'], result['configuration_complete'], result['status']),
+                         (1, False, 'done_with_review'))
+        self.assertEqual(set(result['unresolved_types']), {'A.Position','B.Position'})
+        config = Path(result['configuration'])
+        self.assertTrue(config.name.endswith('_partial.csv'))
+        with config.open(encoding='utf-8-sig', newline='') as f:
+            self.assertEqual(next(r[5:] for r in csv.reader(f) if r[:1] == ['Index']), ['Warm:INT'])
+        with (self.out/'capture_context.csv').open(encoding='utf-8-sig', newline='') as f:
+            contexts = {(r['步序变量'],r['外层执行条件']) for r in csv.DictReader(f)}
+        self.assertEqual(contexts, {('A.Position','A.Mode=4'), ('B.Position','B.Mode=4')})
+        self.assertEqual(generate(self.source, self.out), result)
+
+    def test_evidenced_data_exclusion_and_short_if_sequence(self):
+        xml = ('<project><fileHeader productName="InoProShop"/><globalVars>'+
+               ''.join(f'<variable name="{n}"><type><INT/></type><documentation>{note}</documentation></variable>'
+                       for n,note in [('Recipe','产品编码'),('Short','单元出站步骤'),('One','单元回零步骤')])+
+               '</globalVars>'+program('Line','<body><ST>CASE Recipe OF 1: Recipe:=2; 2: Recipe:=1; END_CASE; '
+               'IF Short=4 AND Ready THEN Short:=7; END_IF; CASE One OF 9: One:=11; END_CASE;</ST></body>')+
+               '<resource><task name="T"><pouInstance name="Line"/></task></resource></project>')
+        first, inv = self.prepare(xml)
+        self.assertEqual({c['name'] for c in first['channels']}, {'One','Recipe'})
+        short = next(r for r in inv['candidates'] if r['name']=='Short')
+        self.assertEqual(short['eligibility'], 'single_write')
+        scope = self.scope(inv, set())
+        recipe = next(d for d in scope['decisions'] if d['name']=='Recipe')
+        recipe.update(role='non_sequence', reason='编码在两个产品值间切换')
+        with self.assertRaisesRegex(ValueError, '补充'):
+            scope_selection(inv, scope)
+        recipe['basis'].append('d1')
+        scope['decisions'].append(dict(name='Short', role='component_sequence', basis=['d1','t1'],
+                                       reason='声明为单元出站阶段，由到位条件推进'))
+        chosen, _ = scope_selection(inv, scope)
+        self.assertEqual(set(chosen), {'one','short'})
+
+    def test_connected_values_in_different_fb_instances_do_not_form_a_sequence_witness(self):
+        model = Discovery()
+        for old, new, instance in [(1,2,'A'), (2,1,'B')]:
+            model.candidate('Word').edge(old, new, {'scope':'F::Run', 'source_line':12,
+                'binding':[{'scope':'P','instance':instance,'source_line':4}]})
+        inv = model.inventory('source','unit')
+        self.assertIsNone(inv['candidates'][0]['sequence_witness'])
+        self.assertFalse(scope_selection(inv,None)[0])
+
+    def test_sysmac_nested_instance_storage_and_wired_call(self):
+        def var(name, typ):
+            return f'<Variable name="{name}"><Type><TypeName>{typ}</TypeName></Type></Variable>'
+        private = '<Vars>'+var('Phase','INT')+'</Vars><TempVars>'+var('Scratch','INT')+'</TempVars>'
+        code = 'CASE Phase OF 3: Phase:=7; 7: Phase:=3; END_CASE; CASE Scratch OF 4: Scratch:=5; 5: Scratch:=4; END_CASE;'
+        wired = ('<BodyContent name="R"><Rung><FbdObject xsi:type="Block" typeName="Worker" instanceName="Rail"/></Rung>'
+                 '</BodyContent>')
+        xml = ('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+               '<FunctionBlock name="Worker">'+private+'<BodyContent><ST>'+code+'</ST></BodyContent></FunctionBlock>'
+               '<FunctionBlock name="Wrapper"><Vars>'+var('Inner','Worker')+'</Vars><BodyContent><ST>Inner();</ST>'
+               '</BodyContent></FunctionBlock><Program name="P"><Vars>'+var('Cell','Wrapper')+var('Rail','Worker')+
+               var('Idle','Worker')+'</Vars><BodyContent><ST>Cell(); IF FALSE THEN Idle(); END_IF;</ST></BodyContent>'+
+               wired+'</Program></Project>')
+        result, inv = self.prepare(xml)
+        self.assertEqual({(c['name'],c['type']) for c in result['channels']}, {('P.Cell.Inner.Phase','INT'),('P.Rail.Phase','INT')})
+        rows = {r['name']:r for r in inv['candidates']}
+        self.assertEqual([c['instance'] for c in rows['P.Cell.Inner.Phase']['transitions'][0]['binding']], ['Cell','Inner'])
+        self.assertEqual([s['name'] for s in rows['P.Cell.Inner.Phase']['declarations']], ['Cell','Inner','Phase'])
+
+    def test_plcopen_wired_nested_instance_members_and_program_qualifiers(self):
+        def decl(names, typ):
+            return '<interface><localVars>'+''.join(f'<variable name="{n}"><type>{typ}</type></variable>' for n in names)+'</localVars></interface>'
+        def call(n, kind, instance):
+            return f'<block localId="{n}" typeName="{kind}" instanceName="{instance}"><inputVariables>'+port('EN',0)+'</inputVariables></block>'
+        child = ('<pou name="Worker" pouType="functionBlock">'+decl(['Cursor'],'<INT/>')+
+                 '<body><ST>CASE Cursor OF 7: Cursor:=9; 9: Cursor:=7; END_CASE;</ST></body></pou>')
+        parent = ('<pou name="Wrapper" pouType="functionBlock">'+decl(['Held'],'<derived name="Worker"/>')+
+                  ladder(call(6,'Worker','Held'))+'</pou>')
+        body = decl(['A','B','Idle'],'<derived name="Wrapper"/>')+ladder(call(4,'Wrapper','A')+call(5,'Wrapper','B'))
+        xml = ('<project><fileHeader productName="InoProShop"/>'+child+parent+program('Line',body)+
+               '<resource><task name="Clock"><pouInstance name="Line"/></task></resource></project>')
+        first, inv = self.prepare(xml)
+        self.assertEqual({c['name'] for c in first['channels']}, {'Line.A.Held.Cursor','Line.B.Held.Cursor'})
+        result = self.finish(inv,set())
+        self.assertTrue(result['configuration_complete'])
+        self.assertEqual(result['configured_variables'],2)
+        row = next(r for r in inv['candidates'] if r['name']=='Line.B.Held.Cursor')
+        self.assertEqual([s['name'] for s in row['declarations']], ['B','Held','Cursor'])
+
+    def test_dedicated_array_references_preserve_exact_storage_and_bounds(self):
+        array = lambda n: (f'<Variable name="{n}"><Documentation>单元步序槽</Documentation>'
+                           '<Type><TypeName>ARRAY[0..3] OF INT</TypeName></Type></Variable>')
+        code = ('CASE A[0] OF 1: A[0]:=2; 2: A[0]:=1; END_CASE; '
+                'COPY:=A[2]; Other:=B[2]; A[6]:=0;')
+        first, inv = self.prepare('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+array('A')+
+                                  array('B')+'</GlobalVars><Program name="P"><BodyContent><ST>'+code+
+                                  '</ST></BodyContent></Program></Project>')
+        self.assertEqual(first['static_variables'], 1)
+        scope = self.scope(inv, {'A[0]'})
+        scope['decisions'][0]['dedicated_step_array'] = True
+        path = self.root/'scopes.json'
+        path.write_text(json.dumps(scope))
+        final = generate(self.source, self.out, scope_results=path)
+        self.assertEqual((final['sequence_variables'],final['referenced_step_slots'],final['configured_variables']), (1,1,2))
+        self.assertEqual({c['name'] for c in final['channels']}, {'A[0]','A[2]'})
+        group, = json.loads((self.out/'step_variable_discovery.json').read_bytes())['step_arrays']
+        self.assertEqual((group['array'],group['bounds'],group['referenced_slots']), ('A',[0,3],['A[2]']))
