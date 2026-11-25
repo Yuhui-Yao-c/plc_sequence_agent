@@ -152,7 +152,9 @@ class TraceSetupTests(unittest.TestCase):
         self.assertEqual(report['status'], 'needs_review')
         self.assertIsNone(report['configuration'])
         self.assertEqual(set(report['unresolved_types']), {'Flags', 'States[3]', 'Unknown'})
-        self.assertEqual({p.name for p in self.out.iterdir()}, {'static_variables.txt', 'workflow_status.json'})
+        self.assertEqual({p.name for p in self.out.iterdir()}, {'static_variables.txt', 'workflow_status.json',
+                                                               'unresolved_types.csv'})
+        self.assertEqual(set(Path(report['trace_targets']).read_text().splitlines()), {'Flags', 'States[3]', 'Unknown'})
         rebuilt = generate(self.source, self.out, 'Unknown', default_type='DINT', force=True)
         self.assertEqual(rebuilt['status'], 'done')
         self.assertEqual(rebuilt['channels'][0]['type_source'], '用户指定')

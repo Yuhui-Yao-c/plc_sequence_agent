@@ -12,6 +12,31 @@ from plc_trace.source.source_expressions import source_condition
 from plc_trace.trace.trace_to_pairs import INTEGER_TYPES, REAL_TYPES
 
 
+MEMBER_COLUMNS = ('结构类型', '成员', '数据类型', '地址数', '示例地址')
+
+
+def read_member_types(path):
+    """Read independently verified scalar member declarations. Empty types remain unresolved."""
+    if not path:
+        return {}
+    declarations = {}
+    with path.open(encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        if not set(MEMBER_COLUMNS[:3]).issubset(reader.fieldnames or ()):
+            raise ValueError('成员类型表需要“结构类型、成员、数据类型”三列')
+        for row in reader:
+            owner, member, kind = ((row[k] or '').strip() for k in MEMBER_COLUMNS[:3])
+            if not all(re.fullmatch(r'[^\W\d]\w*', token) for token in (owner, member)):
+                raise ValueError(f'成员类型表第 {reader.line_num} 行缺少具体的结构类型或成员名')
+            if not kind:
+                continue
+            key, kind = (owner.casefold(), member.casefold()), kind.upper()
+            if kind not in INTEGER_TYPES | REAL_TYPES or declarations.get(key, kind) != kind:
+                raise ValueError(f'成员类型冲突或不适用：{owner}.{member} {kind}')
+            declarations[key] = kind
+    return declarations
+
+
 def _table(path):
     if path.suffix.lower() == '.xlsx':
         book = load_workbook(path, read_only=True, data_only=True)
@@ -124,10 +149,15 @@ def referenced_channels(scan, discovery, missing):
         return found
     if scan.source_format == 'omron_iec61131_10':
         for (_, unit), (spelling, _, line) in scan.references.items():
-            address, kind, _, _ = scan.sysmac_channel(spelling, unit)
+            address, kind, issue, _ = scan.sysmac_channel(spelling, unit)
             key = address.casefold()
-            if key in missing and kind:
-                found.setdefault(key, {'name': address, 'source_line': line, 'type': kind, 'type_source': '声明'})
+            if key not in missing or key in found:
+                continue
+            if kind:
+                found[key] = {'name': address, 'source_line': line, 'type': kind, 'type_source': '声明'}
+            elif not issue.startswith('功能块') and (slot := scan.scalar_member(address)) and slot[2]:
+                found[key] = {'name': address, 'source_line': line, 'type': None, 'type_source': '',
+                              'type_issue': f'缺少 {slot[0]}.{slot[1]} 的叶声明'}
     else:
         for key in missing & discovery.reference_sites.keys():
             row = discovery.candidates[key]

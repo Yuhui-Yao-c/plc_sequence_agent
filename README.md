@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。
 
-当前简化版为 **18.0.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **18.1.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -27,7 +27,7 @@ opencode
 
 两个任务分别输出到 `D:\工作成果\包mylar_trace\` 和 `D:\工作成果\包mylar_trace_setup\`。省略 `-output` 时使用 `outputs` 根目录。入口二的候选、范围判断、最终配置和通道清单都在同一个工序子目录。同一源码、程序及采集选项重复提交时，校验已有文件后返回当前阶段。不同采集任务或原位置已被其他数据占用时才另选编号。入口一新建独立运行的目录规则见下文。
 
-入口二省略模式时沿 XML 的写步、分支和功能块实参发现各层步序。首轮返回 `scope_review_pending`，在用途复核前默认清单为空。工位主步和子步只要能标记具体生产动作或独立等待，都可进入默认采集配置。已核实动作的写点及条件记录在 `capture_context.csv`。有源码步序证据、用途仍待核的地址也进入默认清单，标记为“待核，先采”。分散在不同例程的写入与分派按具体实例和值匹配，未知的写前值留空。能证实的设备服务、被父动作覆盖的通信细节及证据较弱的候选保存在 `optional_variables.csv`。独立运行 CLI 可按同一协议提交复核结果。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
+入口二省略模式时沿 XML 的写步、分支和功能块实参发现各层步序。首轮返回 `scope_review_pending`，输出有源码依据的候选地址 `trace_targets_preview.txt`。类型与采样任务可确定时，同目录立即生成文件名含 `_preview` 的零样本预配置。用途复核后由正式地址清单和配置接替。工位主步和子步只要能标记具体生产动作或独立等待，都可进入默认采集配置。已核实动作的写点及条件记录在 `capture_context.csv`。有源码步序证据、用途仍待核的地址也进入默认清单，标记为“待核，先采”。分散在不同例程的写入与分派按具体实例和值匹配，未知的写前值留空。能证实的设备服务、被父动作覆盖的通信细节及证据较弱的候选保存在 `optional_variables.csv`。独立运行 CLI 可按同一协议提交复核结果。[自动发现与合并协议](.opencode/skills/plc-trace-setup/SKILL.md)
 
 也可连续输入多个独立模式，每个模式用引号包住。命中任一模式的变量进入同一清单，完整变量名去重后自然排序。可混用完整名称、通配符和 `re:` 正则；单模式写法继续有效。
 
@@ -73,7 +73,7 @@ Trace 分析支持 TwinCAT Scope `.trace` 和 Sysmac 导出表、分卷目录，
 
 入口一简写遇到已占用目录时另开编号。`prepared_b_tier_pending` 时完成本轮 `batches_desc/*.result.json`，再以相同参数加 `--resume`。`done_with_review` 表示已出表且有待核项。
 
-入口二的配置在客户端导入并完成现场采集后，可将实测导出交给入口一。`static_variables.txt` 列出所有入选地址。自动 Sysmac 配置缺少部分叶类型时，已核实的地址写入 `*_trace_config_partial.csv`，其余地址及原因见 `unresolved_types.csv`。程序回读待发布配置中的实际地址和类型。`configured_variables` 是实际写入数，`configuration_complete` 表示配置含全部入选地址。自动发现可加 `--reference 核验表.xlsx`，也支持起止条件 TSV、每行一个地址的文本和含“变量,类型”的 CSV。独立核对地址清单与实际配置两处差集，精确地址的可信类型可以补齐缺失声明。差集与解析缺口见状态文件的 `coverage`。有部分配置而缺已选地址时状态为 `needs_review`。Sysmac 也支持用 REAL 或 LREAL 存储整数步值的离散序列。入口一依据源码确认步序，逐样本核对整数值，小数样点记为该通道缺口。对于已核实的专用步序数组，备选清单列出仅有固定引用的槽位，状态文件区分独立执行步与仅有引用的槽位。其他预留槽位可按 `step_array_coverage.csv` 的声明边界复查。外层执行条件及 XML 写点见 `capture_context.csv`。
+入口二的配置在客户端导入并完成现场采集后，可将实测导出交给入口一。`static_variables.txt` 列出所有入选地址。Sysmac 配置缺少部分叶类型时，已核实的地址写入 `*_trace_config_partial.csv`，其余地址及原因见 `unresolved_types.csv`。程序回读待发布配置中的实际地址和类型。`configured_variables` 是实际写入数，`configuration_complete` 表示配置含全部入选地址。自动发现可加 `--reference 核验表.xlsx`，也支持起止条件 TSV、每行一个地址的文本和含“变量,类型”的 CSV。独立核对地址清单与实际配置两处差集，精确地址的可信类型可以补齐缺失声明。若 XML 指向外部结构且缺成员定义，可从原工程核实 `missing_member_types.csv` 里的“数据类型”，另存后传 `--member-types 已核实成员.csv`。同一已声明结构的同名标量成员共用核实结果；不同结构、未知中间层和数组成员分别核对。已有带类型的具体地址也可以佐证同一外部成员。差集与解析缺口见状态文件的 `coverage`。有部分配置而缺已选地址时状态为 `needs_review`。Sysmac 也支持用 REAL 或 LREAL 存储整数步值的离散序列。入口一依据源码确认步序，逐样本核对整数值，小数样点记为该通道缺口。对于已核实的专用步序数组，备选清单列出仅有固定引用的槽位，状态文件区分独立执行步与仅有引用的槽位。其他预留槽位可按 `step_array_coverage.csv` 的声明边界复查。外层执行条件及 XML 写点见 `capture_context.csv`。
 
 ## 目录与职责
 
@@ -119,7 +119,7 @@ Sysmac 梯级注释按写点所在网络及起始步号对应到原文。相同�
 
 自动发现的控制证据及用途结论见 `step_variable_discovery.json`，按通道阅读的摘要见 `scope_candidates.jsonl`。自动采集以 `admission=captured` 的完整变量为准。升级后需重新判断工位归属；显式模式仍可指定需要的内部变量。
 
-入口二交付 `static_variables.txt`、`workflow_status.json` 和可用的 `<源码名>_trace_config.trace` 或 `.csv`。
+入口二按状态中的 `trace_targets` 找到当前阶段的地址名单。首轮预配置路径在 `preview_configuration`，正式配置路径在 `configuration`，`needs_review` 也可能已有 `_partial.csv` 可交付。汇川输出 `.trace`，Sysmac 输出零样本 `.csv`。在 Sysmac Studio 中按地址登记目标并核对模板的采样任务。
 
 ## 开发与验证
 

@@ -10,7 +10,7 @@ compatibility: opencode
 
 从[主 Agent](../../agents/plc-sequence.md)收到工程和采集选项后运行 `python plc_cli.py "工程.xml" --trace-setup`，保存返回的 `out`。候选从本次源码发现。有人工起止表、已确认的地址清单或 Sysmac 通道表时，两轮都可传入同一 `--reference`。用它核对默认清单和最终配置，可按精确地址补齐已知类型。
 
-1. 在 `scope_review_pending` 阶段读取 `scope_candidates.jsonl` 和 `step_variable_discovery.json`。首轮默认清单为空。沿调度、调用、实参和固定下标查实际可写的地址。按实例核对工位主步、命令、工作区、并行子步和辅助流程。
+1. 在 `scope_review_pending` 阶段读取 `scope_candidates.jsonl` 和 `step_variable_discovery.json`。核对 `trace_targets_preview.txt` 及 `preview_configuration` 的实际文件。预配置覆盖有源码证据、类型与采样设置均可确定的候选，正式清单在用途复核后生成。沿调度、调用、实参和固定下标查实际可写的地址。按实例核对工位主步、命令、工作区、并行子步和辅助流程。
 2. 为每个 `scope_required` 给出一项判断，再检查 `single_write` 中只写过一个出口的短流程，尤其是由调用方启动或收尾的子步。用该实例的写点和声明用途或步骤注释补录。保留未绑定、动态下标和未定位写点等证据缺口。
 3. 先判断地址在程序中如何使用。`role` 取 `station_auto`、`station_slot`、`component_sequence`、`auxiliary_sequence`、`uncertain` 或 `non_sequence`。命令号、计数、应答字也可能在几个数值间切换，核对谁读写它以及这些值控制什么。排除数据通道要引用它的迁移和受控读写、有说明的声明或另一写点。确认内部或辅助序列要引用本实例的迁移。
 4. 为工位角色引用本地址的全部声明及 `owner_scope` 内写点，并为每个声称的工位接口族在 `station_families` 填一个具体实例和周期说明。无说明时核对同一例程的其他阶段、写出或可写绑定。`station_slot` 还须提供同一具体数组和工位程序的 `interface_peer`。经证实专门存步的有界叶数组可在已确认实例上标 `dedicated_step_array: true` 并引用声明和迁移。其他仅固定引用或清零的槽位保留在备选清单。
@@ -44,5 +44,6 @@ compatibility: opencode
 - `static_variables.txt` 包含已确认生产步与待核先采地址。写入和分派分散时查看 `dispatch_writes` 的两处位置，写前值留空。`capture_context.csv` 记录每个已核实边界的动作、步值、命令/工况、完整导出条件及其解析情况、出处。表中写步示例是源码证据，现场 Trace 才提供实测时长。复现条件时可加采其中的命令、模式和反馈。
 - `optional_variables.csv` 给出备选地址、用途、理由、类型及出处。`step_array_coverage.csv` 给出专用数组边界。全量候选、其他出口、数据排除和解析范围保存在发现台账。
 - 核对 `workflow_status.json` 的 `static_variables`、`optional_variables`、`configured_variables` 和 `configuration_complete`。Sysmac 按声明类型生成配置，缺失的生产地址类型在 `unresolved_types.csv`。可写入部分配置时文件名含 `_partial`。已确认以 REAL/LREAL 存离散步值的通道沿用原类型。
-- 汇川按源码任务、调度和可定位写点选择采样设置。`needs_review` 表示缺配置、部分配置或独立核验有缺口，查看 `coverage` 的逐地址差集、未核实条件与源码解析缺口。区分 `configuration_complete`（全部入选地址已实际写入）与 `coverage_complete`（本次输入可核验范围内没有剩余缺口）。`done_with_review` 应同时交付配置和待核范围。采集配置样本数为 0。
-- 显式指定地址、通配或 `re:` 模式时仍按用户的选择生成配置。多模式取并集。Sysmac 显式模式可用已核实的 `--default-type` 补齐缺失的根变量类型。
+- 汇川按源码任务、调度和可定位写点选择采样设置。`needs_review` 表示缺配置、部分配置或独立核验有缺口，查看 `coverage` 的逐地址差集、未核实条件与源码解析缺口。区分 `configuration_complete`（全部入选地址已实际写入）与 `coverage_complete`（本次输入可核验范围内没有剩余缺口）。无论状态，准确报告实际文件路径。若 `configuration` 已存在，同时交付该文件和 `trace_targets` 全部目标，列明已配置和缺失的数量。采集配置样本数为 0。
+- 显式指定地址、通配或 `re:` 模式时仍按用户的选择生成配置。多模式取并集。若 XML 只引用外部结构，提供 `missing_member_types.csv`。由完整工程核实后另存，使用 `--member-types 已核实成员.csv`。可沿用本源码的 `scope_results.json`，以 `-output` 选择独立运行目录。已核实成员只适用于能沿声明链定位到同一结构和标量成员的实例。
+- Sysmac 显式模式可用已核实的 `--default-type` 补齐缺失的根变量类型。

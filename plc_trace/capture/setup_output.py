@@ -77,11 +77,13 @@ def verify_files(out, status):
         if state != 'scope_review_pending' and any(status.get(k) for k in
                 ('scope_candidates', 'single_write_candidates', 'distributed_write_candidates')):
             required.add('scope_results.json')
-    if status.get('configuration') or state in {'done', 'done_with_review'}:
-        config = Path(status.get('configuration') or '')
-        if config.parent != out:
+    for field in ('configuration', 'preview_configuration', 'trace_targets', 'member_type_template'):
+        if not status.get(field) and not (field == 'configuration' and state in {'done', 'done_with_review'}):
+            continue
+        artifact = Path(status.get(field) or '')
+        if artifact.parent != out:
             raise ValueError('已有采集配置的交付路径无效，请核对后显式重建')
-        required.add(config.name)
+        required.add(artifact.name)
     if not isinstance(hashes, dict) or not required.issubset(hashes):
         raise ValueError('已有采集配置缺少文件校验记录，请显式重建')
     for name, expected in hashes.items():
@@ -104,9 +106,14 @@ def publish(out, files, *, force, completing):
             changed = []
             owned = {'static_variables.txt', 'scope_candidates.jsonl', 'step_variable_discovery.json',
                      'workflow_status.json', 'scope_results.json', 'capture_context.csv',
-                     'step_array_coverage.csv', 'unresolved_types.csv', 'optional_variables.csv'}
+                     'step_array_coverage.csv', 'unresolved_types.csv', 'optional_variables.csv',
+                     'missing_member_types.csv', 'trace_targets_preview.txt'}
             try:
-                old_files = read_status(out).get('artifact_sha256', {})
+                previous = read_status(out)
+                old_files = previous.get('artifact_sha256', {})
+                preview = Path(previous.get('preview_configuration') or '')
+                if preview.parent == out and preview.name in old_files:
+                    owned.add(preview.name)
                 for name in (old_files.keys() & owned) - files.keys():
                     old = out / name
                     if old.is_symlink() or not old.is_file() or fingerprint(old) != old_files[name]:
@@ -122,7 +129,8 @@ def publish(out, files, *, force, completing):
                             continue
                         if name not in owned:
                             raise ValueError(f'目标位置已有其他文件，请核对：{target}')
-                        if name in {'capture_context.csv', 'step_array_coverage.csv', 'unresolved_types.csv', 'optional_variables.csv'} and name not in old_files:
+                        if name in {'capture_context.csv', 'step_array_coverage.csv', 'unresolved_types.csv',
+                                    'missing_member_types.csv', 'optional_variables.csv'} and name not in old_files:
                             raise ValueError(f'目标位置已有其他文件，请核对：{target}')
                         shutil.copy2(target, backup / name)
                     (stage / name).replace(target)

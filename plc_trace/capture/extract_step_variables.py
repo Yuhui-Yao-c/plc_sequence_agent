@@ -23,7 +23,10 @@ from plc_trace.paths import PROJECT_ROOT, RESOURCE_ROOT
 from plc_trace.analysis.boundary_logic import integer, symbol
 from plc_trace.analysis.candidate_filter import glob_regex
 from plc_trace.capture.capture_use import capture_context, capture_lists
-from plc_trace.capture.channel_reference import read_reference, referenced_channels, verify_config
+from plc_trace.capture.channel_reference import (
+    MEMBER_COLUMNS, read_member_types, read_reference, referenced_channels, verify_config,
+)
+from plc_trace.capture.coverage import source_obligations
 from plc_trace.capture.plcopen_tasks import (
     ProgramWrites, Routine, is_task_declaration, sampling_task, task_declaration, validated_task_name,
 )
@@ -55,6 +58,10 @@ _EXPRESSION_ATTRIBUTES = {'identifier', 'expression', 'variable', 'var', 'refere
 _CALL = re.compile(rf'(?P<qualified>\.\s*)?(?<![\w#])(?P<name>{_NAME})\s*\(')
 _ST_OPERATOR = re.compile(r'\(|\)|:=|=>')
 _OUTPUT_END = re.compile(r'\s*[,)]')
+_IEC_SCALARS = INTEGER_TYPES | REAL_TYPES | {
+    'BOOL', 'TIME', 'LTIME', 'DATE', 'LDATE', 'TOD', 'LTOD', 'DT', 'LDT', 'DATE_AND_TIME',
+    'TIME_OF_DAY', 'LDATE_AND_TIME', 'LTIME_OF_DAY', 'STRING', 'WSTRING', 'CHAR', 'WCHAR',
+}
 
 
 def _executable_text(text, *, keep_positions=False):
@@ -217,6 +224,8 @@ class _SourceScan:
         self.ambiguous_units = set()
         self.directions = defaultdict(set)
         self.declarations = defaultdict(set)
+        self.type_bodies = set()
+        self.type_spellings = {}
         self.members = defaultdict(set)
         self.declaration_sites = {}
         self.aliases = defaultdict(set)
@@ -288,6 +297,8 @@ class _SourceScan:
                             declaration_node = (node, ('variable', owner, name.casefold()))
                     if tag == 'fileheader':
                         self.header = ' '.join(node.get(k, '') for k in ('companyName', 'productName')).casefold()
+                    if name and tag in {'datatypedecl', 'program', 'function', 'functionblock'}:
+                        self.type_bodies.add(name.casefold())
                     if self.matcher is None and tag in {'program', 'function', 'functionblock'} and name:
                         if unit in self.units[name.casefold()]:
                             self.ambiguous_units.add(name.casefold())
@@ -348,10 +359,12 @@ class _SourceScan:
                     del node.getparent()[0]
 
     def _type_name(self, node, frame):
-        value = (node.text or '').strip().upper()
+        spelling = (node.text or '').strip()
+        value = spelling.upper()
         parent = node.getparent()
         if not value or parent is None:
             return
+        self.type_spellings.setdefault(value, spelling)
         if frame.type_name and _local_name(parent.tag) == 'userdefinedtypespec':
             self.aliases[frame.type_name.casefold()].add(value)
         if _local_name(parent.tag) != 'type' or parent.getparent() is None:
@@ -439,6 +452,29 @@ class _SourceScan:
             result.extend(at_path(site, parts, i))
         return result
 
+    def scalar_member(self, address):
+        """Identify a scalar leaf by the declared type of its parent, including array elements."""
+        parts = address.split('.')
+        if len(parts) < 2 or not re.fullmatch(_NAME, parts[-1]):
+            return None
+        program = self.programs.get(parts[0].casefold())
+        local = program and (program, parts[1].split('[')[0].casefold()) in self.declarations
+        if local:
+            parts = parts[1:]
+        if len(parts) < 2:
+            return None
+        values = self.declarations.get((program if local else None, parts[0].split('[')[0].casefold()), ())
+        for i, part in enumerate(parts[:-1]):
+            if i:
+                values, _ = self.member(owner, part.split('[')[0])
+            owner, _ = self._peel_type(values, part)
+            if not owner:
+                return None
+        # A missing member of a declared type or POU is a different problem from an omitted UDT.
+        if owner in _IEC_SCALARS or not re.fullmatch(_NAME, owner):
+            return None
+        return self.type_spellings.get(owner, owner), parts[-1], owner.casefold() not in self.type_bodies
+
     def sysmac_channel(self, name, unit):
         parts = name.split('.')
         first = _MEMBER_NAME.match(parts[0])[0].casefold()
@@ -498,6 +534,43 @@ def _csv_bytes(header, rows):
     return stream.getvalue().encode('utf-8-sig')
 
 
+def _member_type_gaps(scan, channels, unresolved, verified):
+    groups = defaultdict(list)
+    verified = dict(verified)
+    for channel in channels:
+        if channel.get('type_source') != '独立核验输入':
+            continue
+        slot = scan.scalar_member(channel['name'])
+        if slot and slot[2]:
+            key = slot[0].casefold(), slot[1].casefold()
+            if verified.setdefault(key, channel['type']) != channel['type']:
+                raise ValueError(f'成员类型与已有类型证据冲突：{slot[0]}.{slot[1]}（{channel["name"]}）')
+    for channel in channels:
+        name = channel['name']
+        if name not in unresolved and not verified:
+            continue
+        slot = scan.scalar_member(name)
+        if not slot:
+            continue
+        owner, field, external = slot
+        key = owner.casefold(), field.casefold()
+        confirmed = verified.get(key)
+        if confirmed and channel.get('type') and channel['type'] != confirmed:
+            raise ValueError(f'成员类型与已有类型证据冲突：{owner}.{field}（{name}）')
+        if not external or name not in unresolved or unresolved[name].startswith('功能块或函数局部量'):
+            continue
+        if confirmed:
+            if scan.matcher is not None and confirmed not in INTEGER_TYPES:
+                unresolved[name] = f'显式步序选择需要整数类型，已核实 {confirmed}'
+                continue
+            channel.update(type=confirmed, type_source='核实的结构成员声明', type_member=f'{owner}.{field}')
+            del unresolved[name]
+        else:
+            unresolved[name] = f'缺少 {owner}.{field} 的叶声明'
+            groups[key].append((owner, field, name))
+    return [(items[0][0], items[0][1], '', len(items), items[0][2]) for _, items in sorted(groups.items())]
+
+
 def _inovance_config(root, channels, task, source_digest):
     record = root.find(".//Single[@Name='Record']")
     record.find("./Single[@Name='TaskName']").text = task['task_name']
@@ -530,7 +603,7 @@ def _inovance_config(root, channels, task, source_digest):
 
 def generate(source, out, pattern=None, *, capture_format='auto', task_name=None, scope_results=None,
              every_n_cycles=None, default_type=None, case_sensitive=False, force=False, choose_available=False,
-             reference=None):
+             reference=None, member_types=None):
     source_input = Path(source).absolute()
     source = source_input.resolve()
     automatic = pattern is None
@@ -541,6 +614,9 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         raise ValueError('独立步序核验输入仅用于自动发现')
     reference = Path(reference).resolve() if reference else None
     reference_sha = fingerprint(reference) if reference else None
+    member_types = Path(member_types).resolve() if member_types else None
+    member_sha = fingerprint(member_types) if member_types else None
+    verified_members = read_member_types(member_types)
     if automatic and default_type:
         raise ValueError('自动发现需要源码声明的类型')
     if capture_format not in ('auto', 'sysmac', 'inovance'):
@@ -552,13 +628,13 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         'source': str(source), 'source_sha256': digest, 'pipeline': pipeline_fingerprint(),
         'patterns': matcher.patterns if matcher else [], 'case_sensitive': case_sensitive,
         'capture_format': capture_format, 'task_name': task_name, 'every_n_cycles': every_n_cycles,
-        'default_type': default_type, 'reference_sha256': reference_sha,
+        'default_type': default_type, 'reference_sha256': reference_sha, 'member_types_sha256': member_sha,
     }, sort_keys=True).encode()).hexdigest()
     out = Path(out)
     if choose_available:
         out = select_run_dir(out.parent.resolve() / out.name, request)
     out = out.resolve()
-    if (source_input.is_relative_to(out) or source.is_relative_to(out) or (reference and reference.is_relative_to(out)) or Path.cwd().is_relative_to(out)
+    if (any(p and p.is_relative_to(out) for p in (source_input, source, reference, member_types, Path.cwd()))
             or PROJECT_ROOT.is_relative_to(out)):
         raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
     with lock_run_dir(out):
@@ -576,6 +652,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 if not matches_request(status, out, request) and not legacy:
                     raise ValueError('源码、程序版本或采集选项与已有任务不同，请指定空目录或显式 --force 重建')
                 if scope_bytes is not None and status.get('status') == 'scope_review_pending':
+                    if not legacy:
+                        verify_files(out, status)
                     pending = status
                 else:
                     verify_files(out, status)
@@ -599,6 +677,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 raise ValueError('源码头部未识别采集平台，请指定 --format inovance 或 --format sysmac')
         if default_type and capture_format != 'sysmac':
             raise ValueError('--default-type 仅用于 Sysmac 采集配置')
+        if member_types and (capture_format != 'sysmac' or source_format != 'omron_iec61131_10'):
+            raise ValueError('--member-types 需要含结构声明的 Sysmac XML')
         if not automatic and not scan.references:
             raise ValueError(f'未找到可采集的显式变量。符号或表达式下标 {len(scan.dynamic)} 个，请核对匹配规则')
         channels, unresolved = {}, {}
@@ -639,26 +719,32 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             distributed = sum(r['eligibility'] == 'distributed_write' for r in inventory['candidates'])
             if decisions is None and (eligible or single_writes or distributed):
                 discovery_status = 'scope_review_pending'
-            for key, record in chosen.items():
-                row = discovered.candidates[key]
-                name = row.name
+            export_rows = chosen
+            if discovery_status == 'scope_review_pending':
+                provisional = source_obligations(inventory).keys() | required.keys()
+                export_rows = {r['identity']: r for r in inventory['candidates']
+                               if r['eligibility'] == 'distributed_write' or (r['identity'] in provisional
+                                   and r['eligibility'] in {'scope_required', 'single_write'})}
+            for key, record in export_rows.items():
+                name = record['name']
                 site = record['transitions'][0] if record['transitions'] else record['dispatch_writes'][0]['write']
                 channels[key] = {'name': name, 'source_line': site['source_line']}
                 if capture_format == 'sysmac':
-                    channels[key].update(type=row.declared, type_source='声明' if row.declared else '')
-                if row.type_issue:
-                    unresolved[name] = row.type_issue
-                if key in types and capture_format == 'sysmac':
-                    if row.declared and row.declared != types[key]:
-                        raise ValueError(f'核验类型与 XML 声明冲突：{name}')
-                    if not row.declared and (row.type_issue or '').startswith('缺少'):
-                        channels[key].update(type=types[key], type_source='独立核验输入')
-                        unresolved.pop(name, None)
-            recovered = {} if discovery_status else referenced_channels(scan, discovered, required.keys() - channels.keys())
-            for key, channel in recovered.items():
-                if key in types and channel.get('type') and channel['type'] != types[key]:
-                    raise ValueError(f'核验类型与 XML 声明冲突：{channel["name"]}')
+                    channels[key].update(type=record['type'], type_source='声明' if record['type'] else '')
+                if record['type_issue']:
+                    unresolved[name] = record['type_issue']
+            recovered = referenced_channels(scan, discovered, required.keys() - channels.keys())
             channels.update(recovered)
+            for key, channel in channels.items():
+                name = channel['name']
+                if channel.get('type_issue'):
+                    unresolved[name] = channel.pop('type_issue')
+                if key in types and capture_format == 'sysmac':
+                    if channel.get('type') and channel['type'] != types[key]:
+                        raise ValueError(f'核验类型与 XML 声明冲突：{name}')
+                    if not channel.get('type') and unresolved.get(name, '').startswith('缺少'):
+                        channel.update(type=types[key], type_source='独立核验输入')
+                        unresolved.pop(name, None)
             optional = [row for row in optional if row[0].casefold() not in recovered]
             if not channels and not discovery_status:
                 discovery_status = 'needs_review'
@@ -683,6 +769,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             if not channels:
                 raise ValueError('没有可按指定名称导出的采集变量，请核对变量作用域')
         ordered = sorted(channels.values(), key=lambda channel: _sort_key(channel['name']))
+        member_gaps = (_member_type_gaps(scan, ordered, unresolved, verified_members)
+                       if capture_format == 'sysmac' and source_format == 'omron_iec61131_10' else [])
         if capture_format == 'sysmac':
             if every_n_cycles is not None:
                 raise ValueError('--every-n-cycles 适用于汇川 .trace')
@@ -692,33 +780,47 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             template = ET.parse(RESOURCE_ROOT / 'templates' / 'inovance_trace.xml').getroot()
             task = sampling_task(scan.tasks, scan.program_writes, channels, template.find('./TraceConfiguration'),
                                  task_name=task_name, every_n_cycles=every_n_cycles)
-        config = None
-        exported = set()
-        files = {'static_variables.txt': ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
-        configurable = ordered
+        preview = discovery_status == 'scope_review_pending'
+        targets = 'trace_targets_preview.txt' if preview else 'static_variables.txt'
+        files = {'static_variables.txt': b'', targets: ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
         if unresolved:
-            configurable = ([c for c in ordered if c['name'] not in unresolved]
-                            if automatic else [])
-            if automatic:
-                files['unresolved_types.csv'] = _csv_bytes(('变量', '类型问题'), sorted(unresolved.items()))
-        if configurable and not discovery_status and task['task_name'] and not scan.parse_issues:
+            files['unresolved_types.csv'] = _csv_bytes(('变量', '类型问题'), sorted(unresolved.items()))
+        if member_gaps:
+            files['missing_member_types.csv'] = _csv_bytes(MEMBER_COLUMNS, member_gaps)
+        config, exported = None, set()
+        configurable = [c for c in ordered if c['name'] not in unresolved]
+        if configurable and task['task_name'] and not scan.parse_issues:
             extension = 'csv' if capture_format == 'sysmac' else 'trace'
-            suffix = '_partial' if len(configurable) < len(ordered) else ''
+            suffix = '_preview' if preview else ''
+            if len(configurable) < len(ordered):
+                suffix += '_partial'
             config = f'{source.stem}_trace_config{suffix}.{extension}'
             files[config] = (_sysmac_config(configurable, task['task_name']) if capture_format == 'sysmac'
                              else _inovance_config(template, configurable, task, digest))
             exported = verify_config(files[config], capture_format, configurable)
+        delivery = {
+            'trace_targets': str(out / targets), 'trace_target_count': len(ordered),
+            'member_type_template': str(out / 'missing_member_types.csv') if member_gaps else None,
+            'member_types_sha256': member_sha,
+        }
+        if preview:
+            delivery.update(preview_configuration=str(out / config) if config else None,
+                            preview_configured_variables=len(exported), preview_unresolved_types=unresolved)
+        final_channels = {} if preview else channels
+        final_exported = set() if preview else exported
         report = {
-            'version': __version__, 'mode': 'trace_setup', 'status': discovery_status or ('done' if config else 'needs_review'),
+            'version': __version__, 'mode': 'trace_setup',
+            'status': discovery_status or ('done' if config and len(exported) == len(ordered) else 'needs_review'),
+            'out': str(out), 'configuration': str(out / config) if config and not preview else None,
+            'configured_variables': len(final_exported), **delivery,
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,
             'pattern': matcher.single_pattern if matcher else None,
             'patterns': matcher.patterns if matcher else [], 'capture_format': capture_format, **task,
-            'static_variables': len(ordered), 'channels': ordered,
-            'configured_variables': len(exported),
-            'configuration_complete': bool(config) and exported == set(channels),
+            'static_variables': len(final_channels), 'channels': [] if preview else ordered,
+            'configuration_complete': not preview and bool(config) and exported == set(channels),
             'dynamic_variables': sorted(scan.dynamic.values(), key=_sort_key),
-            'unresolved_types': unresolved, 'parse_issues': scan.parse_issues,
-            'sample_count': 0, 'out': str(out), 'configuration': str(out / config) if config else None,
+            'unresolved_types': {} if preview else unresolved, 'parse_issues': scan.parse_issues,
+            'sample_count': 0,
         }
         if automatic:
             report.update(selection_mode='automatic', discovery='step_variable_discovery.json',
@@ -744,11 +846,11 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             source_limits = {k: v for k,v in limits.items() if k != 'adapter_counts' and v}
             report['coverage'] = {
                 'reference_sha256': reference_sha, 'reference_variables': len(required),
-                'reference_missing_from_list': sorted(required[k] for k in required.keys() - channels.keys()),
-                'reference_missing_from_config': sorted(required[k] for k in required.keys() - exported),
-                'reference_recovered': list(recovered.values()),
+                'reference_missing_from_list': sorted(required[k] for k in required.keys() - final_channels.keys()),
+                'reference_missing_from_config': sorted(required[k] for k in required.keys() - final_exported),
+                'reference_recovered': [] if preview else list(recovered.values()),
                 'unresolved_reference_rows': reference_gaps,
-                'missing_from_config': sorted(c['name'] for k,c in channels.items() if k not in exported),
+                'missing_from_config': sorted(c['name'] for k,c in final_channels.items() if k not in final_exported),
                 'source_limits': source_limits,
             }
             gap = report['coverage']
@@ -756,14 +858,15 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                         and not reference_gaps and not source_limits and not retained and not recovered and not report['scope_uncertain']
                         and not report['unproven_candidates'])
             report['coverage_complete'] = bool(complete)
-            if config and not complete:
+            if report['configuration'] and not complete:
                 report['status'] = ('needs_review' if not report['configuration_complete'] or
                                     gap['reference_missing_from_config'] or reference_gaps else 'done_with_review')
             files['capture_context.csv'] = _csv_bytes(
                 ('步序变量', '生产动作或等待', '所属例程', '外层执行条件', '写前步值', '写后步值', '写入条件',
                  '写入条件解析完整', 'XML证据段行', '段内ST行', '写点引用', '动作佐证', '佐证内容'),
                 [*capture_context(chosen, roles), *((c['name'], '独立核验，写步待核', '', '', '', '', '', '',
-                    c['source_line'], '', '', 'reference', '独立清单确认且源码有该具体地址的引用') for c in recovered.values())])
+                    c['source_line'], '', '', 'reference', '独立清单确认且源码有该具体地址的引用')
+                    for c in report['coverage']['reference_recovered'])])
             files['optional_variables.csv'] = _csv_bytes(
                 ('步序变量', '用途', '声明类型', '所属例程', 'XML证据段行', '原因', '同数组执行步'),
                 sorted(optional, key=lambda row: _sort_key(row[0])))
@@ -777,6 +880,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             raise ValueError('发现期间源码发生变化，请重新执行')
         if reference and fingerprint(reference) != reference_sha:
             raise ValueError('核验输入在执行期间发生变化，请重新运行')
+        if member_types and fingerprint(member_types) != member_sha:
+            raise ValueError('成员类型表在执行期间发生变化，请重新运行')
         report['request_sha256'] = request
         report['artifact_sha256'] = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
         if scope_bytes is not None:
@@ -790,6 +895,7 @@ def add_task_arguments(parser):
     parser.add_argument('--task-name', help='指定采样任务，汇川按导出的源码任务表核对')
     parser.add_argument('--every-n-cycles', type=int, help='汇川每 N 个任务周期采样一次，默认 1')
     parser.add_argument('--reference', help='可选的已核实步序清单、带类型的地址表或人工起止条件表')
+    parser.add_argument('--member-types', help='从完整工程核实的结构成员类型 CSV，可填写 missing_member_types.csv 的副本')
 
 
 def add_arguments(parser):
@@ -821,7 +927,8 @@ def run(args):
                           task_name=args.task_name,
                           every_n_cycles=args.every_n_cycles, default_type=args.default_type,
                           case_sensitive=args.case_sensitive, force=args.force, scope_results=args.scope_results,
-                          choose_available=args.output_root is not None, reference=args.reference)
+                          choose_available=args.output_root is not None, reference=args.reference,
+                          member_types=args.member_types)
     except (OSError, ValueError, re.error, etree.XMLSyntaxError) as exc:
         raise SystemExit(f'采集配置生成失败：{exc}') from exc
     print(json.dumps(report, ensure_ascii=False, indent=2))

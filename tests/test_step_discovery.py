@@ -73,6 +73,10 @@ class StepDiscoveryTests(unittest.TestCase):
                '</ST></BodyContent></Program></Project>')
         initial, inventory = self.prepare(xml)
         self.assertEqual(initial['status'], 'scope_review_pending')
+        preview = Path(initial['preview_configuration'])
+        self.assertEqual(initial['preview_configured_variables'], 1)
+        self.assertEqual(Path(initial['trace_targets']).read_text().splitlines(), ['Cursor'])
+        self.assertIn('Cursor:INT', preview.read_text(encoding='utf-8-sig'))
         scope = self.out / 'scope_results.json'
         scope.write_text(json.dumps(self.scope(inventory, {'Cursor'})))
         note = self.out / '现场笔记.txt'
@@ -92,6 +96,9 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertEqual(set(self.root.iterdir()), {self.source, self.out})
 
         final = generate(self.source, self.out, scope_results=scope)
+        self.assertFalse(preview.exists())
+        self.assertFalse(Path(initial['trace_targets']).exists())
+        self.assertEqual(Path(final['trace_targets']).read_text().splitlines(), ['Cursor'])
         self.assertEqual(final['static_variables'], 1)
         self.assertEqual(generate(self.source, self.out, scope_results=scope), final)
         self.assertEqual(generate(self.source, self.out), final)
@@ -130,9 +137,11 @@ class StepDiscoveryTests(unittest.TestCase):
                                          + program('Line', decl + body)
                                          + '<resource><task name="Clock"><pouInstance name="Line"/></task></resource></project>')
         marker = self.out / 'workflow_status.json'
-        legacy = {k:v for k,v in status.items() if k not in {'request_sha256', 'artifact_sha256'}}
+        legacy = {k:v for k,v in status.items() if k not in {'request_sha256', 'artifact_sha256', 'trace_targets',
+                  'trace_target_count', 'preview_configuration', 'preview_configured_variables', 'preview_unresolved_types'}}
         legacy['version'] = '14.0.0'
-        for later_file in ('optional_variables.csv', 'capture_context.csv'):
+        for later_file in ('optional_variables.csv', 'capture_context.csv', Path(status['trace_targets']).name,
+                           Path(status['preview_configuration']).name):
             (self.out / later_file).unlink()  # Absent in the earlier pending fixture.
         marker.write_text(json.dumps(dict(legacy, inventory_sha256='different')))
         with self.assertRaisesRegex(ValueError, '候选证据'):

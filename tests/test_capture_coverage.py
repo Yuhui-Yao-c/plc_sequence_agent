@@ -44,6 +44,89 @@ class CoverageTests(unittest.TestCase):
         reviews.write_text(json.dumps(scope))
         return generate(self.xml, out, scope_results=reviews, **options)
 
+    def test_preview_and_reviewed_config_keep_untyped_targets_and_group_by_declared_owner(self):
+        variables = [('Arm','Job'), ('Rack','ARRAY[1..3] OF Job'), ('Buffer','Transfer'), ('Known','INT')]
+        names = ['Arm.Phase', 'Rack[2].Phase', 'Buffer.Phase', 'Known']
+        body = ' '.join(f'CASE {n} OF 1: {n}:=4; 4: {n}:=1; END_CASE;' for n in names)
+        out, inv = self.prepare(sysmac(variables, [('Cell',body)]))
+        first = json.loads((out/'workflow_status.json').read_bytes())
+        self.assertEqual((first['static_variables'], first['trace_target_count'], first['preview_configured_variables']),
+                         (0, 4, 1))
+        self.assertEqual(set(Path(first['trace_targets']).read_text().splitlines()), set(names))
+        self.assertIn('Known:INT', Path(first['preview_configuration']).read_text(encoding='utf-8-sig'))
+        final = self.merge(out, neutral(inv))
+        self.assertEqual((final['status'],final['configured_variables'],final['static_variables']), ('needs_review',1,4))
+        self.assertFalse(Path(first['preview_configuration']).exists())
+        self.assertEqual(set(Path(final['trace_targets']).read_text().splitlines()), set(names))
+        with Path(final['member_type_template']).open(encoding='utf-8-sig') as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([(r['结构类型'],r['成员'],r['数据类型'],r['地址数']) for r in rows],
+                         [('Job','Phase','','2'),('Transfer','Phase','','1')])
+        supplement = self.root/'verified.csv'
+        supplement.write_text('结构类型,成员,数据类型\nJob,Phase,UINT\nTransfer,Phase,DINT\n')
+        complete = generate(self.xml,self.root/'completed',scope_results=out/'scope_results.json',member_types=supplement)
+        self.assertTrue(complete['configuration_complete'])
+        self.assertIsNone(complete['member_type_template'])
+        self.assertEqual({r['name']:r['type'] for r in complete['channels']},
+                         {'Arm.Phase':'UINT','Rack[2].Phase':'UINT','Buffer.Phase':'DINT','Known':'INT'})
+        self.assertEqual((out/'workflow_status.json').read_bytes(),json.dumps(final,ensure_ascii=False,indent=2).encode())
+
+    def test_reference_type_applies_only_to_instances_of_the_same_omitted_scalar_member(self):
+        reference = self.root/'reference.csv'
+        reference.write_text('变量,类型\nLeft.Stage,UINT\n')
+        addresses = ['Left.Stage','Right.Stage','Other.Stage','Left.Index[1]']
+        xml = sysmac([('Left','Outer'),('Right','Outer'),('Other','Inner')], [('Line',' '.join(
+            f'CASE {n} OF 1: {n}:=2; 2: {n}:=1; END_CASE;' for n in addresses))])
+        out, inv = self.prepare(xml,reference=reference)
+        before = self.merge(out,neutral(inv),reference=reference)
+        self.assertEqual({r['name']:r['type'] for r in before['channels']},
+                         {'Left.Stage':'UINT','Right.Stage':'UINT','Other.Stage':None,'Left.Index[1]':None})
+        reference.write_text('变量,类型\nLeft.Stage,UINT\nRight.Stage,DINT\n')
+        with self.assertRaisesRegex(ValueError,'冲突'):
+            generate(self.xml,self.root/'conflict',scope_results=out/'scope_results.json',reference=reference)
+        self.assertFalse((self.root/'conflict/workflow_status.json').exists())
+
+    def test_explicit_pattern_exports_known_subset_and_rejects_a_conflicting_real_declaration(self):
+        xml = sysmac([('Leaf','Box'),('Port','LibraryPort')],[('Line','Leaf.Mark:=2; Port.Mark:=3; Port.Child.Mark:=4;')])
+        xml = xml.replace('<GlobalVars>', '<DataTypeDecl name="Box"><Member name="Mark"><Type><TypeName>INT</TypeName>'
+                          '</Type></Member></DataTypeDecl><GlobalVars>')
+        self.xml.write_text(xml)
+        st = generate(self.xml,self.root/'mixed',pattern='*.Mark')
+        self.assertEqual((st['status'],st['static_variables'],st['configured_variables']), ('needs_review',3,1))
+        self.assertIn('Leaf.Mark:INT', Path(st['configuration']).read_text(encoding='utf-8-sig'))
+        verified = self.root/'typed.csv'
+        verified.write_text('结构类型,成员,数据类型\nBox,Mark,DINT\n')
+        with self.assertRaisesRegex(ValueError,'冲突'):
+            generate(self.xml,self.root/'conflict',pattern='*.Mark',member_types=verified)
+        verified.write_text('结构类型,成员,数据类型\nLibraryPort,Mark,UINT\n')
+        partial = generate(self.xml,self.root/'partial',pattern='*.Mark',member_types=verified)
+        self.assertEqual((partial['configured_variables'],set(partial['unresolved_types'])),(2,{'Port.Child.Mark'}))
+
+    def test_all_untyped_still_produces_the_entire_target_list_in_both_stages(self):
+        out, inv = self.prepare(sysmac([('Arm','Interface')],[('Work','CASE Arm.State OF 0: Arm.State:=3; '
+                                                          '3: Arm.State:=0; END_CASE;')]))
+        first = json.loads((out/'workflow_status.json').read_bytes())
+        self.assertIsNone(first['preview_configuration'])
+        self.assertEqual(Path(first['trace_targets']).read_text().splitlines(),['Arm.State'])
+        final = self.merge(out,neutral(inv))
+        self.assertIsNone(final['configuration'])
+        self.assertEqual(Path(final['trace_targets']).read_text().splitlines(),['Arm.State'])
+        self.assertEqual(final['trace_target_count'],1)
+
+    def test_member_binding_uses_the_concrete_program_local_and_declared_array_bounds(self):
+        xml = sysmac([], [('West','Cursor[1].Phase:=2; Cursor[7].Phase:=2;'),('East','Cursor[1].Phase:=3;')])
+        for program, kind in [('West','PressJob'),('East','SortJob')]:
+            start = f'<Program name="{program}">'
+            xml = xml.replace(start, start + f'<LocalVars><Variable name="Cursor"><Type>'
+                              f'<TypeName>ARRAY[0..2] OF {kind}</TypeName></Type></Variable></LocalVars>')
+        self.xml.write_text(xml)
+        types = self.root/'types.csv'
+        types.write_text('结构类型,成员,数据类型\nPressJob,Phase,DINT\n')
+        status = generate(self.xml,self.root/'local',pattern='*Cursor[*].Phase',member_types=types)
+        self.assertEqual({r['name']:r['type'] for r in status['channels']},
+                         {'West.Cursor[1].Phase':'DINT','East.Cursor[1].Phase':None,'West.Cursor[7].Phase':None})
+        self.assertEqual(status['configured_variables'],1)
+
     def test_renamed_production_cursor_survives_each_negative_role(self):
         for name,owner in [('Amber','Bay'),('物件位置','左侧工艺')]:
             xml = sysmac([(name,'INT')], [(owner,f'CASE {name} OF 2: IF Ready THEN Grip:=TRUE; {name}:=5; END_IF; 5: {name}:=2; END_CASE;')])
