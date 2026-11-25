@@ -22,6 +22,7 @@ from plc_trace.paths import PROJECT_ROOT, RESOURCE_ROOT
 
 from plc_trace.analysis.boundary_logic import integer, symbol
 from plc_trace.analysis.candidate_filter import glob_regex
+from plc_trace.capture.capture_use import capture_context, capture_lists
 from plc_trace.capture.plcopen_tasks import (
     ProgramWrites, Routine, is_task_declaration, sampling_task, task_declaration, validated_task_name,
 )
@@ -496,18 +497,6 @@ def _csv_bytes(header, rows):
     return stream.getvalue().encode('utf-8-sig')
 
 
-def _capture_context(channels):
-    """Keep each distinct enclosing operating condition with a write in that branch."""
-    for row in sorted(channels.values(), key=lambda item: _sort_key(item['name'])):
-        seen = set()
-        for site in row['transitions']:
-            guard = site.get('operating_guard')
-            source = site['scope'], guard
-            if guard and source not in seen:
-                seen.add(source)
-                yield row['name'], site['scope'], guard, site['source_line'], site.get('st_line', ''), site['id']
-
-
 def _inovance_config(root, channels, task, source_digest):
     record = root.find(".//Single[@Name='Record']")
     record.find("./Single[@Name='TaskName']").text = task['task_name']
@@ -627,14 +616,15 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             decisions = json.loads(scope_bytes) if scope_bytes is not None else None
             if scope_results is not None and decisions is None:
                 raise ValueError('用途判断 JSON 为空')
-            chosen, roles = scope_selection(inventory, decisions)
+            sequences, roles = scope_selection(inventory, decisions)
             inventory['decisions'] = roles
             families = decisions.get('station_families', []) if decisions is not None else []
             inventory['station_families'] = families
             inventory['reference_sites'] = discovered.reference_sites
-            slots, arrays = array_coverage(inventory, chosen, roles, discovered.reference_sites)
+            slots, arrays = array_coverage(inventory, sequences, roles, discovered.reference_sites)
+            chosen, optional = capture_lists(inventory, roles, slots)
             inventory['step_arrays'] = arrays
-            inventory['selector_replay'] = replay_selectors([r['name'] for r in (*chosen.values(), *slots.values())],
+            inventory['selector_replay'] = replay_selectors([r['name'] for r in chosen.values()],
                                                            discovered.visible | set(discovered.candidates),
                                                            (n for n, _, _ in scan.references.values()))
             eligible = sum(r['eligibility'] == 'scope_required' for r in inventory['candidates'])
@@ -649,8 +639,6 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                     channels[key].update(type=row.declared, type_source='声明' if row.declared else '')
                 if row.type_issue:
                     unresolved[name] = row.type_issue
-            for key, slot in slots.items():
-                channels[key] = {**slot, 'type_source': '同一实例数组的元素声明'}
             if not channels and not discovery_status:
                 discovery_status = 'needs_review'
         else:
@@ -711,7 +699,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         }
         if automatic:
             report.update(selection_mode='automatic', discovery='step_variable_discovery.json',
-                          sequence_variables=len(chosen), referenced_step_slots=len(slots),
+                          sequence_variables=len(sequences), referenced_step_slots=len(slots), optional_variables=len(optional),
                           scope_candidates=eligible, single_write_candidates=single_writes, inventory_sha256=inventory['inventory_sha256'],
                           scope_policy=inventory['scope_policy'], station_family_count=len(families),
                           scope_excluded=sum(r['admission'] == 'excluded' for r in roles),
@@ -720,13 +708,19 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             resolved_singles = sum(r['eligibility'] == 'single_write' and r['identity'] in resolved
                                    for r in inventory['candidates'])
             report['unproven_candidates'] = len(inventory['candidates']) - eligible - resolved_singles
+            if decisions is not None and not chosen:
+                report['review_reason'] = '本轮未确认可独立计时的生产动作，请查备选清单和源码证据'
             files['step_array_coverage.csv'] = _csv_bytes(
                 ('具体数组', '声明下界', '声明上界', '声明行', '执行步实例', '有引用无独立跳步的槽位'),
                 ((g['array'], *g['bounds'], g['declaration_line'], g['example'], ' | '.join(g['referenced_slots'])) for g in arrays))
             if (unresolved or report['scope_uncertain'] or report['unproven_candidates']) and config:
                 report['status'] = 'done_with_review'
-            files['capture_context.csv'] = _csv_bytes(('步序变量', '所属例程', '外层执行条件', 'XML行', 'ST行', '写点引用'),
-                                                       _capture_context(chosen))
+            files['capture_context.csv'] = _csv_bytes(
+                ('步序变量', '生产动作或等待', '所属例程', '外层执行条件', '写前步值', '写后步值', '写入条件',
+                 '写入条件解析完整', 'XML证据段行', '段内ST行', '写点引用', '动作佐证', '佐证内容'), capture_context(chosen, roles))
+            files['optional_variables.csv'] = _csv_bytes(
+                ('步序变量', '用途', '声明类型', '所属例程', 'XML证据段行', '原因', '同数组执行步'),
+                sorted(optional, key=lambda row: _sort_key(row[0])))
             files['scope_candidates.jsonl'] = ''.join(json.dumps(r, ensure_ascii=False) + '\n'
                                                        for r in scope_index(inventory)).encode('utf-8')
             if decisions is not None:

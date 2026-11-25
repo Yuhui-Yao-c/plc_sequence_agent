@@ -42,13 +42,14 @@ class SysmacRecordingTests(unittest.TestCase):
         def var(name):
             return f'<Variable name="{name}"><Type><TypeName>REAL</TypeName></Type></Variable>'
         source.write_text('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+var('Cursor')+
-            var('Pressure')+'</GlobalVars><Program name="P"><BodyContent><ST>CASE Cursor OF 2: Cursor:=5; '
+            var('Pressure')+'</GlobalVars><Program name="P"><BodyContent><ST>CASE Cursor OF 2: IF Mixed THEN Cursor:=5; END_IF; '
             '5: Cursor:=2; END_CASE; Pressure:=Value;</ST></BodyContent></Program></Project>')
         setup = self.root/'setup'
         started = configure(source, setup)
         path = self.root/'review.json'
         path.write_text(json.dumps({'inventory_sha256':started['inventory_sha256'],'decisions':[
-            {'name':'Cursor','role':'component_sequence','basis':['t1'],'reason':'在两步间控制运行'}]}))
+            {'name':'Cursor','role':'component_sequence','basis':['t1'],'reason':'搅拌完成后推进','use':'production',
+             'boundaries':[{'write':'t1','via':'signal:Mixed','action':'等待搅拌完成'}]}]}))
         config = configure(source, setup, scope_results=path)
         self.assertTrue(config['configuration_complete'])
         self.assertIn('Cursor:REAL',Path(config['configuration']).read_text(encoding='utf-8-sig'))

@@ -59,7 +59,7 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 **执行**
 
-免填模式收到 `scope_review_pending` 后，保存返回的 `out`。按 [采集配置](../skills/plc-trace-setup/SKILL.md) 核验工位、工作区、命令、子流程和辅助步序，检查单向写回的候选。父步门控和用途层级作为归属证据。以该 `out` 和首轮采集选项提交 `--scope-results`。查看进度时直接读取该目录的 `workflow_status.json`。收到完成状态后核对并交付现有配置。显式模式按规则提取完整路径和固定下标。核对类型、作用域及解析问题。生成配置后交付客户端导入，检查任务、触发、采样设置和通道容量。
+免填模式收到 `scope_review_pending` 后，保存返回的 `out`。按 [采集配置](../skills/plc-trace-setup/SKILL.md) 核验所有层级的具体步序，检查单向写回。默认采集须有本实例的生产动作或独立等待边界，标出适用命令和工况。内部细节、设备服务和用途待核的地址列入备选。以该 `out` 和首轮采集选项提交 `--scope-results`。查看进度时直接读取该目录的 `workflow_status.json`。完成后交付默认配置、动作边界与备选清单。显式模式按规则提取完整路径和固定下标。核对类型、作用域及解析问题。生成配置后交付客户端导入，检查任务、触发、采样设置和通道容量。
 
 **验收**
 

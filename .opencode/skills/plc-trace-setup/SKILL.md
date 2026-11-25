@@ -1,6 +1,6 @@
 ---
 name: plc-trace-setup
-description: 从 PLC 源码识别各层的真实步序变量，按可写实例、步值分派和写回生成汇川或 Sysmac 采集配置。支持显式指定多个变量模式。
+description: 从本次 PLC 源码发现各层执行步，按真实生产动作和工件等待的计时边界生成采集配置，保留备选地址和证据。支持显式指定多个变量模式。
 compatibility: opencode
 ---
 
@@ -8,34 +8,41 @@ compatibility: opencode
 
 ## 输入与发现
 
-从[主 Agent](../../agents/plc-sequence.md)收到工程路径及用户指定的采集选项后，执行 `python plc_cli.py "工程.xml" --trace-setup`，保存返回的 `out`。自动发现只读本次源码。历史 Trace、人工表和历史配置可在结果产生后独立验收。
+从[主 Agent](../../agents/plc-sequence.md)收到工程和采集选项后运行 `python plc_cli.py "工程.xml" --trace-setup`，保存返回的 `out`。自动发现只使用本次源码。历史 Trace、人工表和配置用于结果产生后的独立核验。
 
-目标是找出能表示本工程执行到哪一步的具体变量。工位主步、命令内部步、工作区、并行子流程，以及初始化、复位、手动、通信等辅助流程内真正按阶段执行的游标都需要采集。一个父步可启动多个子步，两个功能块实例可在不同的可写实参上执行相同代码。沿已调用的功能块实例还原其持久成员，逐个保留程序限定名、实例名和固定下标。输入副本、临时变量和仅声明的实例须核对其可采集性。
+1. 在 `scope_review_pending` 阶段读取 `scope_candidates.jsonl` 和 `step_variable_discovery.json`。首轮默认清单为空。沿调度、调用、实参和固定下标查实际可写的地址。按实例核对工位主步、命令、工作区、并行子步和辅助流程。
+2. 为每个 `scope_required` 给出一项判断，再检查 `single_write` 中只写过一个出口的短流程，尤其是由调用方启动或收尾的子步。用该实例的写点和声明用途或步骤注释补录。保留未绑定、动态下标和未定位写点等证据缺口。
+3. 先判断地址在程序中如何使用。`role` 取 `station_auto`、`station_slot`、`component_sequence`、`auxiliary_sequence`、`uncertain` 或 `non_sequence`。命令号、计数、应答字也可能在几个数值间切换，核对谁读写它以及这些值控制什么。排除数据通道要引用它的迁移和受控读写、有说明的声明或另一写点。确认内部或辅助序列要引用本实例的迁移。
+4. 为工位角色引用本地址的全部声明及 `owner_scope` 内写点，并为每个声称的工位接口族在 `station_families` 填一个具体实例和周期说明。无说明时核对同一例程的其他阶段、写出或可写绑定。`station_slot` 还须提供同一具体数组和工位程序的 `interface_peer`。经证实专门存步的有界叶数组可在已确认实例上标 `dedicated_step_array: true` 并引用声明和迁移。其他仅固定引用或清零的槽位保留在备选清单。
 
-## 源码复核
+## 默认采集判断
 
-1. `scope_review_pending` 时读取该目录的 `scope_candidates.jsonl` 和 `step_variable_discovery.json`。首轮 `static_variables.txt` 是初选。每个 `sequence_witness` 可回到同一实例的 CASE 写回或同一例程与调用实例内接续的两个写点。查步骤所控制的输出、完成条件、调用实参及声明，判断这些数值是否代表正在执行的阶段。
-2. 逐一核对 `scope_required`。再浏览 `single_write` 索引，按同一原始例程、声明用途和写点检查仅有单向写回的实例。特别留意短动作、调用方启动或收尾的步序。可引用声明用途或该写点的注释补录短序列。纯引用、未绑定形参、动态下标、只有声明以及没有可达写点的项保留具体缺口。工程中同族地址的数量或编号连续性都不能代替逐实例证据。
-3. 区分执行游标和作为数据传送的命令号、结果码、计数、质量码、握手字等。两个数据值能互相切换时，核对读方在各值下执行的行为及写方的职责。确认属于数据时填写 `non_sequence`，说明读取、写回以及为何表示数据，引用本变量的一处迁移和声明说明、受控读写或另一个写点。缺少判断依据时填 `uncertain`。已有结构依据的通道即使层级不明也会保留。没有结构依据且用途不明的候选继续列在审计中。
-4. 为每个候选选择角色。`station_auto` 是工位或独立作业单元的周期，`station_slot` 是同一工位正式接口下的其他槽位，`component_sequence` 是命令、工作区或部件内推进的步，`auxiliary_sequence` 是经核实的辅助流程步。后两种角色均引用本实例的迁移。工位类引用本通道的全部声明（含精确下标注释）和 `owner_scope` 的迁移，缺少用途文本时补充同例程的其他阶段、写出或可写绑定。`station_slot` 提供同一数组、同一工位程序的 `interface_peer`。兼容旧角色 `auxiliary`，仅表示功能归属。
-5. 将判断写入本轮 `scope_results.json`。指纹使用本轮 `inventory_sha256`。每个 `scope_required` 恰有一项，单向写回的补录也需逐地址引用证据。`station_families` 为每个声称工位归属的变量族提供一个已核实的真实实例和边界说明，只有内部序列时可省略该字段。一个项目可同时使用多种接口。若叶数组的用途说明可证实该具体数组专门存放步序，可在一个已采纳的代表地址上写 `"dedicated_step_array": true` 并引用叶声明和写步。程序按实际数组、声明边界及源码固定引用补齐只读或只复位的槽位，分别统计独立执行步和补入的槽位。`step_array_coverage.csv` 保留每个已核实数组的声明范围，现场可据此复查仅在声明范围内的预留地址。
+从工件在该工位的一次作业出发，指出操作对象、实际动作或等待，以及哪一处写步标志动作开始、结束或阶段交接。对不同命令、产品模式、并行和旁路逐分支核对。实例的层级和名字不决定采集用途。
+
+- `production` 表示该地址本身能为生产动作或需要独立计时的等待提供边界。记录 `boundaries`，每项含具体动作 `action`、本地址迁移编号 `write` 和一项 `via`。同一地址可有多项。对共用地址的各生产命令、模式及不同等待出口分别留代表写点。不要引用回原命令下同号步作为取料命令的证据。正常生产中的回安全位、等待扫码结果或工件出站均可属于生产动作。
+- `via` 可取 `comment`（本写点的步骤注释）、`signal:完整信号名`（该出口条件中的命名反馈）、同阶段受控写出 `eN`、本通道有用途说明的声明或精确元素注释 `dN`、同一具体实例启动或等待子步的关系 `lN`。阅读写点、调用方和佐证原文，核实它们合起来能解释所填动作。通用的“初始”“等待”字样、步骤命名、数值递增、单次调用或家族中的另一成员，均不足以判断生产用途。
+- `detail` 表示步骤解释已有动作的内部实现，例如业务步已涵盖扫码触发到结果返回，扫码器建连和收发握手可备查。子步实际区分夹胶、拉胶或另一段需要量时的操作时，保留该子步并指明对应写点。
+- `service` 表示本实例只服务于初始化、调试、维护、诊断或设备后台通信。复用同一个功能块的其他实例分别核对。用于生产动作的通信反馈或模式信号可以出现在计时条件中。
+- `unresolved` 表示目前不足以判定生产计时用途。填写现场可复核的缺口。已确认的设备服务、内部细节和待核项各自在备选表列明原因。每个非数据候选都应填写 `use`，缺省按待核处理。
+
+将判断保存到本轮 `scope_results.json`。证据编号均在各自地址内查找。以下为格式示例。
 
 ```json
 {
   "inventory_sha256": "本轮指纹",
-  "station_families": [{"example": "Line.Phase", "boundary": "该工位从接料到交料"}],
   "decisions": [
-    {"name": "Line.Phase", "role": "station_auto", "owner_scope": "Line::Run", "basis": ["d1","t1","t2"], "reason": "核对工位运行例程的阶段与写回"},
-    {"name": "Grip.Phase", "role": "component_sequence", "basis": ["t1","e1"], "reason": "夹取命令分步发出并等待夹紧到位"}
+    {"name":"Grip.Phase","role":"component_sequence","basis":["t2","e1"],"reason":"夹取命令等待夹爪到位后进入移送","use":"production","boundaries":[{"action":"夹爪夹紧到位","write":"t2","via":"signal:Grip.Closed"}]},
+    {"name":"Meter.Phase","role":"auxiliary_sequence","basis":["t1"],"reason":"电表周期轮询并刷新能耗数据","use":"service"}
   ]
 }
 ```
 
-6. 执行 `python plc_cli.py trace-setup --source "工程.xml" --out "本轮实际目录" --scope-results "本轮实际目录/scope_results.json"`，复用首轮选项。程序重算源证据、校验逐实例引用，并在 `gated_by` 记录可证实的父步。逐个检查 `captured`、`excluded`、`review`。重复运行同一请求可读取已有结果。
+复用首轮选项执行 `python plc_cli.py trace-setup --source "工程.xml" --out "本轮实际目录" --scope-results "本轮实际目录/scope_results.json"`。程序重算源证据、逐实例校验边界，并保留可证实的父步 `gated_by`。
 
 ## 输出与验收
 
-- `static_variables.txt` 是采集地址清单。`capture_context.csv` 列出已定位的外层执行条件、所属例程及代表写点，例如用同一个步变量执行不同命令时的命令号和模式判定。工程师可按需要加采条件中的通道。
-- 核对 `workflow_status.json` 中的 `static_variables`、`configured_variables`、`configuration_complete`。Sysmac 自动模式按源码声明类型生成配置。REAL 和 LREAL 存储的离散步可保留原类型，入口一核对源码写步依据并逐样本检查整数步值；小数样点作为缺口计数。部分通道缺少叶类型时交付 `*_trace_config_partial.csv` 和 `unresolved_types.csv`。从完整工程核准缺失的叶类型，完整地址清单可供现场继续配置。
-- 汇川沿任务表、写入和调用链核对任务、采样间隔、分频与缓冲区。遇到任务冲突、解析限制、动态下标和未定用途，报告具体范围。`needs_review` 表示当前没有可交付配置。`done_with_review` 应同时交付配置及明确的缺口。配置采样数为 0，现场导出的实测记录才进入入口一。
-- 用户显式指定完整地址、通配或 `re:` 模式时走显式入口，多个模式取并集。Sysmac 显式模式允许用已核实的 `--default-type` 补齐缺失的根变量类型。形参经绑定才得到的完整地址，自动模式可直接发现。
+- `static_variables.txt` 和采集配置使用默认生产地址。`capture_context.csv` 记录每个已核实边界的动作、步值、命令/工况、完整导出条件及其解析情况、出处。表中写步示例是源码证据，现场 Trace 才提供实测时长。复现条件时可加采其中的命令、模式和反馈。
+- `optional_variables.csv` 给出备选地址、用途、理由、类型及出处。`step_array_coverage.csv` 给出专用数组边界。全量候选、其他出口、数据排除和解析范围保存在发现台账。
+- 核对 `workflow_status.json` 的 `static_variables`、`optional_variables`、`configured_variables` 和 `configuration_complete`。Sysmac 按声明类型生成配置，缺失的生产地址类型在 `unresolved_types.csv`。可写入部分配置时文件名含 `_partial`。已确认以 REAL/LREAL 存离散步值的通道沿用原类型。
+- 汇川按源码任务、调度和可定位写点选择采样设置。`needs_review` 表示当前没有可交付配置，查看具体缺口。`done_with_review` 应同时交付配置和待核范围。采集配置样本数为 0。
+- 显式指定地址、通配或 `re:` 模式时仍按用户的选择生成配置。多模式取并集。Sysmac 显式模式可用已核实的 `--default-type` 补齐缺失的根变量类型。

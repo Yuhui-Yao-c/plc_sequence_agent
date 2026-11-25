@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from plc_trace.analysis.boundary_logic import IDENT, symbol
 from plc_trace.analysis.candidate_filter import glob_regex
 from plc_trace.analysis.successor_graph import _st_tokens_with_spans
+from plc_trace.capture.capture_use import timing_use
 from plc_trace.capture.station_scope import dependent_writes, family, same_station_array, writer_context
 
 
@@ -19,6 +20,24 @@ def digest(value):
 def fixed_path(value):
     return (bool(re.fullmatch(IDENT, value)) and
             all(re.fullmatch(r'-?\d+(?:,-?\d+)*', ix) for ix in re.findall(r'\[([^]]*)\]', value)))
+
+
+def _storage_region(path):
+    """Known address prefix, up to the first data-dependent subscript."""
+    path = symbol(path).casefold()
+    dynamic = re.search(r'\[(?!-?\d+(?:,-?\d+)*\])', path)
+    prefix = path[:dynamic.start()] if dynamic else path
+    return re.sub(r'\[(-?\d+(?:,-?\d+)*)\]',
+                  lambda m: ''.join(f'[{int(i)}]' for i in m[1].split(',')), prefix)
+
+
+def loop_may_write(path, regions):
+    """Whole-object assignments and dynamic indices cover descendants, sibling members stay distinct."""
+    if not regions:
+        return False
+    path = _storage_region(path)
+    return any(path == r or path.startswith((r + '.', r + '[')) or r.startswith((path + '.', path + '['))
+               for r in regions)
 
 
 def _sequence_witness(sites):
@@ -34,10 +53,10 @@ def _sequence_witness(sites):
     return None
 
 
-def isolate_counted_loops(code, *, writer_locations=False):
-    """Omit balanced assignment-only FORs, never transfers or calls. Keep original offsets.
+def isolate_counted_loops(code, *, writer_locations=False, allow_early_exit=True):
+    """Omit balanced counted loops with only local control and assignments. Preserve offsets.
 
-    The caller ignores transitions of any root the omitted code may write.
+    The caller ignores transitions overlapping any storage the omitted code may write.
     Conditions depending on a loop result are still conditions, not evaluated facts.
     """
     tokens = list(_st_tokens_with_spans(code))
@@ -51,16 +70,25 @@ def isolate_counted_loops(code, *, writer_locations=False):
             depth += 1
         if depth and upper in {'RETURN','JMP','GOTO'}:
             return code, set()
-        if depth and not writer_locations and (upper in {'EXIT','CONTINUE','REF=','^'} or '^' in token):
+        # EXIT and CONTINUE inside a FOR cannot leave the enclosing POU.
+        # A timing path still needs the branch through the loop; discovery only needs an accessible write.
+        if depth and upper in {'EXIT', 'CONTINUE'} and not (allow_early_exit or writer_locations):
+            return code, set()
+        if depth and not writer_locations and (upper in {'REF', 'REF='} or '^' in token):
             return code, set()
         if depth and not writer_locations and token == '(' and i and re.fullmatch(IDENT, tokens[i-1][0]) and tokens[i-1][0].upper() not in {
                 'IF', 'ELSIF', 'NOT', 'AND', 'OR', 'XOR', 'WHILE', 'DO', 'THEN'}:
             return code, set()
         if depth and token == ':=' and not writer_locations:
-            lhs = symbol(tokens[i-1][0])
+            # The ST tokenizer separates commas in multidimensional subscripts.
+            # Validate the whole lvalue, including its containing structure.
+            first = i - 1
+            while first and tokens[first - 1][0].upper() not in {'FOR', 'DO', 'THEN', 'ELSE', ';', ':'}:
+                first -= 1
+            lhs = symbol(code[tokens[first][1][0]:start])
             if not re.fullmatch(IDENT, lhs):
                 return code, set()
-            touched.add(re.split(r'[.\[]', lhs, 1)[0].casefold())
+            touched.add(_storage_region(lhs))
         if upper == 'END_FOR':
             depth -= 1
             if depth < 0:
@@ -103,13 +131,14 @@ class Candidate:
 
     def effect(self, step, site):
         if site.get('target') and site['target'].casefold() != self.name.casefold():
-            self.effects.setdefault((writer_context(site), step, site['target']), {**site, 'step': step})
+            key = writer_context(site), step, site['target'], site.get('value'), site.get('network'), site.get('guard', '')
+            self.effects.setdefault(key, {**site, 'step': step})
 
     def record(self):
         starts = {a for a, _ in self.edges}
         ends = {b for _, b in self.edges}
         scoped_steps = {(writer_context(site), site['from']) for site in self.sites.values()}
-        effects = [site for (writer, step, _), site in self.effects.items() if (writer, step) in scoped_steps]
+        effects = [site for key, site in self.effects.items() if key[:2] in scoped_steps]
         # A one-way scalar reset (timer wrap, range clamp, recipe default) is not
         # a sequence. A short sequence can qualify through a real controlled output.
         chain = bool(starts & ends)
@@ -128,7 +157,7 @@ class Candidate:
             site['id'] = f't{n}'
         for n, site in enumerate(effects, 1):
             site['id'] = f'e{n}'
-        links = [{**self.links[key], 'id': f'l{n}'} for n, key in enumerate(sorted(self.links), 1)]
+        links = [{**self.links[key], 'id': f'l{n}'} for n, key in enumerate(sorted(self.links, key=repr), 1)]
         eligibility = ('single_write' if self.reasons == {'isolated_write_without_controlled_effect'}
                        else 'review' if self.reasons else 'scope_required')
         return {'name': self.name, 'identity': self.name.casefold(), 'type': self.declared or None,
@@ -167,7 +196,7 @@ class Discovery:
                 continue
             link = {**site, 'parent': first.name, 'parent_step': step, 'child': second.name,
                     'child_value': value, 'kind': role}
-            key = (parent, step, child, value, role, site['scope'])
+            key = (parent, step, child, value, role, writer_context(site), site.get('guard', ''))
             first.links.setdefault(key, link)
             second.links.setdefault(key, link)
 
@@ -195,7 +224,7 @@ class Discovery:
             for site in row['transitions']:
                 if 'co_cursors' in site:
                     site['co_cursors'] = sorted(controllers.intersection(site['co_cursors']) - {row['identity']})
-        data = {'schema': 'plc.step_discovery.v3', 'scope_policy': 'all_sequence_levels', 'source_sha256': source_sha, 'adapter': adapter,
+        data = {'schema': 'plc.step_discovery.v4', 'scope_policy': 'production_timing', 'source_sha256': source_sha, 'adapter': adapter,
                 'candidates': records, 'parse_limits': self.issues}
         data['inventory_sha256'] = digest(data)
         return data
@@ -291,8 +320,12 @@ def scope_selection(inventory, decisions):
                 if not isinstance(peer, str) or peer.casefold() == key:
                     raise ValueError(f'工位槽位须指向同一接口的另一已核实实例：{key}')
                 item['interface_peer'] = peer
-        item['admission'] = ('captured' if key in selected else
-                             'excluded' if row['role'] == 'non_sequence' else 'review')
+        if row['role'] == 'non_sequence':
+            if row.get('boundaries') or row.get('use') not in (None, 'unresolved'):
+                raise ValueError(f'非步序数据不能声明采集用途：{key}')
+            item['admission'] = 'excluded'
+        else:
+            item.update(timing_use(candidate, row, key in selected))
         if row.get('dedicated_step_array'):
             declarations = [s for s in candidate['declarations'] if s.get('array_bounds') and s.get('text')
                             and s['path'].casefold() == key and s['id'] in citations]
@@ -379,7 +412,7 @@ def scope_index(inventory):
                 for i in sorted({0, len(items)//2, len(items)-1}):
                     site = items[i]
                     brief = {k: site[k] for k in ('id', 'scope', 'program', 'source_line', 'st_line', 'kind', 'from', 'to',
-                             'target', 'child', 'parent', 'comment', 'guard', 'co_cursors') if site.get(k) is not None}
+                             'target', 'step', 'child', 'parent', 'comment', 'operating_guard', 'guard', 'co_cursors') if site.get(k) is not None}
                     if site.get('binding'):
                         brief['call'] = [{k: x[k] for k in ('scope', 'instance', 'source_line')} for x in site['binding']]
                     examples.append(brief)

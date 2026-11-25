@@ -6,7 +6,7 @@ from functools import lru_cache
 from plc_trace.analysis.boundary_logic import FALSE, IDENT, TRUE, combine, comparisons, integer, symbol
 from plc_trace.analysis.successor_graph import STParser, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import INSTANCE_STORAGE, _executable_text
-from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops
+from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops, loop_may_write
 from plc_trace.capture.station_scope import required_cursors
 from plc_trace.source.omron_native import collect_native
 from plc_trace.source.plcopen_trace_control import ERRORS, _bound_guard, _conditions, _states, step_comment_text
@@ -300,9 +300,13 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
         if block.get('external_issue'):
             continue
         code = block['code']
-        available, loop_writes = isolate_counted_loops(code) if block.get('issue', '').startswith('ST unsupported flow FOR') else (code, set())
+        available, loop_writes = code, set()
+        if block.get('issue', '').startswith('ST unsupported flow FOR'):
+            available, loop_writes = isolate_counted_loops(code, allow_early_exit=on_transition is None)
+        first_omitted = len(code)
         if loop_writes:
             limits['counted_loop_contents_omitted'] += 1
+            first_omitted = next(i for i, (a, b) in enumerate(zip(code, available)) if a != b)
         parser = STParser(available, condition_parser=source_condition, strict=False, retain_source=True)
         try:
             parser.seq()
@@ -348,7 +352,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             return bool(kind and kind.upper() in INTEGER_BOUNDS and kind == binding.type_of(rhs, unit))
         statements = parser.staged_writes(parser.statements, same_type) if block['flow_complete'] else parser.statements
         for lhs, rhs, condition, offset, note in statements:
-            if not fixed_path(lhs) or _root(lhs) in loop_writes:
+            if not fixed_path(lhs) or (offset >= first_omitted and loop_may_write(lhs, loop_writes)):
                 continue
             gate = combine('and', outer, condition)
             anchors = {a.args[0].casefold() for a in comparisons(gate) if a.kind == 'eq'}
@@ -399,7 +403,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                 target = scan.sysmac_channel(lhs, unit)[0]
                 if lhs.casefold() not in anchors:external_writer(lhs,rhs,gate,site)
                 for other, value in src:
-                    if other == lhs.casefold() or _root(other) in loop_writes:
+                    if other == lhs.casefold() or (offset >= first_omitted and loop_may_write(other, loop_writes)):
                         continue
                     reference = scan.sysmac_channel(other, unit)[0]
                     location = {**site, 'scope': block['scope']}

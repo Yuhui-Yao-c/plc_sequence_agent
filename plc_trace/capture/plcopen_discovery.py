@@ -9,7 +9,7 @@ from plc_trace.analysis.boundary_logic import IDENT, integer, symbol
 from plc_trace.analysis.fb_transport import bindings, interface
 from plc_trace.analysis.successor_graph import STParser, WireBody, pins, tag, text, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import _executable_text
-from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops
+from plc_trace.capture.step_discovery import Discovery, fixed_path, isolate_counted_loops, loop_may_write
 from plc_trace.capture.station_scope import at_path, declaration, required_cursors
 from plc_trace.source.source_expressions import source_condition
 from plc_trace.source.plcopen_trace_control import ERRORS, INSTANCE_STORAGE, _bodies, _program, _scope, collect_root
@@ -84,7 +84,7 @@ def _nominations(root):
 
 
 def _site(item):
-    site = {k: item[k] for k in ('scope', 'source_line', 'st_line', 'guard', 'guard_complete', 'comment')
+    site = {k: item[k] for k in ('scope', 'source_line', 'st_line', 'guard', 'guard_complete', 'comment', 'network', 'frames')
             if item.get(k) or k == 'guard_complete'}
     if item.get('instance_path'):
         site['binding'] = [{'scope': c['scope'], 'instance': c['instance'], 'type': c['type'], 'source_line': c['source_line'],
@@ -101,14 +101,14 @@ def _channel_declaration(types, variable, program):
     return (tag(typ).upper() if typ is not None and types.bounds(variable, program) else None), facts
 
 
-def _recover_st(code, parser, error):
-    """Keep the parsed prefix. Beyond a simple counted loop, exclude every root it can write."""
+def _recover_st(code, parser, error, *, allow_early_exit):
+    """Keep the parsed prefix. Beyond a counted loop, exclude storage it can write."""
     if not str(error).startswith('ST unsupported flow '):
         return []
     prefix = list(parser.statements)
     if str(error) != 'ST unsupported flow FOR':
         return prefix
-    isolated, touched = isolate_counted_loops(code)
+    isolated, touched = isolate_counted_loops(code, allow_early_exit=allow_early_exit)
     if not touched:
         return prefix
     later = STParser(isolated, condition_parser=source_condition, strict=False, retain_source=True)
@@ -117,7 +117,7 @@ def _recover_st(code, parser, error):
     except ERRORS:
         pass  # Only statements actually parsed before the next unsupported control.
     last = prefix[-1][3] if prefix else -1
-    return prefix + [s for s in later.statements if s[3] > last and re.split(r'[.\[]', s[0], 1)[0].casefold() not in touched]
+    return prefix + [s for s in later.statements if s[3] > last and not loop_may_write(s[0], touched)]
 
 
 def _ordered_action_calls(root,pous):
@@ -153,7 +153,9 @@ def _ordered_action_calls(root,pous):
 def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=None):
     root = etree.parse(str(source), etree.XMLParser(huge_tree=True, no_network=True, resolve_entities=False)).getroot()
     names = _nominations(root)
-    ci = collect_root(root, names, recover_st=_recover_st)
+    def recover(code, parser, error):
+        return _recover_st(code, parser, error, allow_early_exit=on_transition is None)
+    ci = collect_root(root, names, recover_st=recover)
     pous = {_scope(p): p for p in root.iter('{*}pou')}
     calls = _ordered_action_calls(root,pous) if on_transition else {}
     result = Discovery()
