@@ -1,5 +1,6 @@
 """Project-local review of which sequence instances mark production timing boundaries."""
 import re
+from collections import defaultdict
 from functools import lru_cache
 
 from plc_trace.analysis.boundary_logic import IDENT, combine, compatible, symbol
@@ -9,7 +10,7 @@ from plc_trace.source.source_expressions import source_condition
 
 
 USES = {'production': '生产动作', 'detail': '内部细节', 'service': '设备服务', 'unresolved': '用途待核',
-        'referenced_slot': '仅固定引用'}
+        'referenced_slot': '仅固定引用', 'inactive': '未定位可执行入口'}
 
 
 def _same_phase(candidate, write, effect):
@@ -170,12 +171,11 @@ def capture_lists(inventory, decisions, slots):
             t = (next((t for t in row['transitions'] if t['id'] in basis), row['transitions'][0])
                  if row['transitions'] else row['dispatch_writes'][0]['write'])
             proof = decision.get('exclusion_evidence') or {}
-            inactive = proof.get('kind') == 'inactive_from_initial'
             reason = proof.get('reason') or decision.get('timing_review_reason') or decision.get('reason', '待核对本实例的生产动作边界')
             if 'purpose' in proof and 'operation' in proof:
                 reason += f" 用途见 XML 行 {proof['purpose']['line']}，执行指令见行 {proof['operation']['line']}。"
-            use = 'unresolved' if admission == 'review' else decision.get('use', 'unresolved')
-            optional.append((row['name'], '未定位可执行入口' if inactive else USES[use],
+            use = decision.get('effective_use', 'unresolved')
+            optional.append((row['name'], USES[use],
                              row['type'] or '', t['scope'], t['source_line'], reason, ''))
     return primary, optional
 
@@ -195,6 +195,15 @@ def _support_text(via, write, references):
 
 
 def capture_context(primary, decisions):
+    # Keep the observable parent exit in the evidence table even when the
+    # review nominated another production boundary on that same address.
+    joins = defaultdict(dict)
+    for child in decisions:
+        proof = child.get('exclusion_evidence', {})
+        if proof.get('kind') == 'enclosed_child':
+            exit_id = proof['parent_exit_write']
+            notes = joins[proof['parent'].casefold()].setdefault(exit_id, [])
+            notes.append(child['name'] + '：' + proof['reason'])
     for decision in decisions:
         if decision['admission'] == 'retained':
             row = primary[decision['name'].casefold()]
@@ -217,9 +226,21 @@ def capture_context(primary, decisions):
         row = primary[decision['name'].casefold()]
         by_id = {t['id']: t for t in row['transitions']}
         references = {s['id']: s for field in ('effects', 'declarations', 'control_links') for s in row[field]}
-        for boundary in decision['boundaries']:
+        boundaries = {b['write']: b for b in decision['boundaries']}
+        waiting = joins.get(row['identity'], {})
+        for wid in waiting:
+            if wid in boundaries:
+                continue
+            site = by_id[wid]
+            boundaries[wid] = {'write': wid, 'via': 'child_completion',
+                               'action': site.get('comment') or '等待子流程完成'}
+        for boundary in boundaries.values():
             site = by_id[boundary['write']]
-            source = _support_text(boundary['via'], site, references)
+            via = boundary['via']
+            notes = list(waiting.get(site['id'], ()))
+            if via != 'child_completion':
+                notes.insert(0, _support_text(via, site, references))
+            source = '。'.join(notes)
             basis = decision['timing_basis']
             if basis['boundary_write'] == site['id']:
                 source += '。独立计时工步：' + basis['operation']

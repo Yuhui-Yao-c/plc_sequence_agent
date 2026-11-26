@@ -7,6 +7,7 @@ from plc_trace.analysis.boundary_logic import FALSE, IDENT, TRUE, combine, compa
 from plc_trace.analysis.successor_graph import STParser, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import INSTANCE_STORAGE, _executable_text
 from plc_trace.capture.capture_use import _guard_signals
+from plc_trace.capture.coordination_scope import sole_cursor_section
 from plc_trace.capture.coverage import service_isolation
 from plc_trace.capture.step_discovery import Discovery, fixed_path, gated_write, isolate_counted_loops, loop_may_write
 from plc_trace.capture.station_scope import required_cursors
@@ -280,7 +281,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                 bound['co_cursors'] = sorted(peers)
             yield row, bound
 
-    def control_links(scope, site, target, number, tests, previous, reads_target):
+    def control_links(scope, site, target, number, tests, previous, reads_target, local_guard):
         """Resolve both operands along one invocation, including nested FB instances."""
         unit = binding.unit(scope)
         for address, _, _, chain in binding.paths(target, unit):
@@ -290,6 +291,8 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                         continue
                     location = bound_site(scope, site, chain)
                     if not reads_target:
+                        if location['guard'] != local_guard:
+                            location['local_guard'] = local_guard
                         yield peer, value, address, number, 'starts_child', location
                     for step in previous:
                         yield address, step, peer, value, 'waits_for_child', location
@@ -298,6 +301,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
     # the original XML fragment. Distinct instructions on one line keep separate IDs.
     native_st = {}
     separate_writes = {}
+    wired = {operand for values in scan.wired_operands.values() for operand in values}
     network_notes = _numbered_network_notes(model['transitions']) if on_transition is not None and not grid else {}
     # Native weak connectivity can be enough for an audit but never proves an
     # input state when another arm bypasses its comparison.
@@ -412,6 +416,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             kind = binding.type_of(lhs, unit) if unit else None
             return bool(kind and kind.upper() in INTEGER_BOUNDS and kind == binding.type_of(rhs, unit))
         statements = parser.staged_writes(parser.statements, same_type) if block['flow_complete'] else parser.statements
+        pure_cursor = sole_cursor_section(parser) if on_transition is None and block['flow_complete'] and not omissions else None
         # A request is consumed by this body if it reads a Boolean input and explicitly
         # clears it. Look at parsed expressions, including edge-trigger input assignments.
         reset_inputs = {lhs.casefold() for lhs, rhs, *_ in statements
@@ -440,6 +445,11 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                     'frames': parser.frames.get(offset, ()), 'selector': lhs,
                     'selectors': parser.selector_decisions(offset, lhs),
                     'comment': note[0] if note else ''}
+            if pure_cursor == lhs.casefold():
+                site['self_only_st'] = True
+                if (pure_cursor not in wired and '[' not in pure_cursor
+                        and (unit, _root(lhs)) not in scan.declarations and (None, _root(lhs)) in scan.declarations):
+                    site['direct_cursor_reads'] = scan.direct_reads[pure_cursor]
             try:
                 number = integer(rhs)
             except ValueError:
@@ -504,7 +514,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                              not uncertain_write(other, offset)]
                     if tests:
                         result.possible_links.extend(control_links(block['scope'], site, lhs, number, tests,
-                                                                   current, lhs.casefold() in anchors))
+                                                                   current, lhs.casefold() in anchors, condition.text()))
             if not current and (reset_inputs or rhs.strip().upper() in ('TRUE', 'FALSE')):
                 entries.append((src, lhs, rhs, site))
         for src, lhs, rhs, site in entries:
@@ -528,12 +538,29 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
 
     if separate_writes:
         wanted = {r.name.casefold() for r in result.candidates.values() if (r.dispatches and not r.edges) or len(r.edges) == 1}
+        # A parent can be re-armed by an ordinary Boolean request, outside a
+        # parent/child CASE link. Keep that concrete writer on multi-child launches.
+        children = defaultdict(set)
+        for parent, step, child, _, role, _ in result.possible_links:
+            if role == 'starts_child':
+                children[parent.casefold(), step].add(child.casefold())
+        launchers = defaultdict(set)
+        for (parent, step), channels in children.items():
+            if len(channels) > 1:
+                launchers[parent].add(step)
+        watched = wanted | launchers.keys()
         for (scope, lhs, value), site in separate_writes.items():
             unit = binding.unit(scope)
-            if unit and not wanted.isdisjoint(name.casefold() for name, *_ in binding.paths(lhs, unit)):
+            if unit and not watched.isdisjoint(name.casefold() for name, *_ in binding.paths(lhs, unit)):
                 for row, bound in records(lhs, scope, site):
                     if row.name.casefold() in wanted and (value in row.dispatches or any(a == value for a, _ in row.edges)):
                         row.external_write(value, bound)
+                    if row.name.casefold() in launchers and any(a == value for a, _ in row.edges):
+                        for transition in row.sites.values():
+                            if transition['from'] in launchers[row.name.casefold()]:
+                                transition.setdefault('independent_entry', {
+                                    'scope': bound['scope'], 'source_line': bound['source_line'],
+                                    'st_line': bound.get('st_line'), 'value': value})
 
     for args in native_st.values():
         on_transition(*args)

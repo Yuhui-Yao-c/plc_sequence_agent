@@ -82,12 +82,45 @@ def _required_inputs(condition, calls, block, offset, seen=frozenset()):
     return result
 
 
+def _section_coordinates(block, code):
+    """Use the same ST section and character offsets as the Sysmac write index."""
+    from plc_trace.source.omron_native import content, scope_of
+
+    body = block.getparent()
+    if _tag(body) != 'bodycontent' or _tag(block) != 'st':
+        return {}, 0
+    scope, _ = scope_of(body)
+    preceding = [n for n in block.itersiblings(preceding=True) if _tag(n) == 'st']
+    # collect_native joins each direct ST child's stripped text with one newline.
+    shift = sum(len(content(n)) + 1 for n in preceding) - (len(code) - len(code.lstrip()))
+    return {'scope': scope + '::' + body.get('name', 'ST'), 'network': body.get('evaluationOrder', 'ST')}, shift
+
+
+_TERMINAL_IF = re.compile(rf'\s*=\s*(-?\d+)\s+THEN\s+({IDENT})\s*:=\s*(-?\d+)\s*;\s*END_IF\b', re.I)
+
+
+def _read_use(parsed, dispatches, previous, identity, clean, pos, end, locator, shift):
+    """Recognize only a direct self dispatch or a terminal test with one consumer."""
+    token, start = previous.get(pos, ('', -1))
+    if locator and token == 'CASE' and (start, identity) in dispatches:
+        return {'kind': 'dispatch', 'offset': start + shift}
+    if locator and token == 'IF' and (test := _TERMINAL_IF.match(clean, end)):
+        writer = test.start(2)
+        statement = parsed.get(writer)
+        if statement and statement[0] == test[2].casefold() and integer(statement[1]) == int(test[3]):
+            return {'kind': 'parent_exit', 'value': int(test[1]), 'target': test[2],
+                    'to': int(test[3]), 'write_offset': writer + shift}
+    return {'kind': 'other'}
+
+
 def _block_facts(code, block, origin, wanted, types, facts, calls, flags, cited_lines, controlled):
+    from plc_trace.capture.dispatch_operations import dispatch_operations
     from plc_trace.capture.extract_step_variables import _executable_text
     from plc_trace.capture.sysmac_discovery import _args
 
     clean = ''.join(_executable_text(code, keep_positions=True))
     safe_code = ''.join(_executable_text(code, keep_positions=True, keep_strings=True))
+    locator, shift = _section_coordinates(block, code)
     newlines = [m.start() for m in re.finditer('\n', clean)]
     def source_line(offset):
         return origin + bisect_left(newlines, offset)
@@ -144,6 +177,12 @@ def _block_facts(code, block, origin, wanted, types, facts, calls, flags, cited_
     parsed = {p:(l.casefold(),r,g) for l,r,g,p,_ in parser.statements}
     for lhs,rhs,guard,offset,_ in parser.statements:
         flags[block].append((lhs.casefold(), rhs.strip().upper(), guard, source_line(offset)))
+    previous = {offset: (parser.ts[i-1].upper(), parser.spans[i-1][0])
+                for i, (offset, _) in enumerate(parser.spans) if i and parser.ts[i].casefold() in wanted}
+    dispatches = {(start, lhs) for offset, (lhs, _, _) in parsed.items()
+                  for kind, start, _, selector in parser.frames.get(offset, ())
+                  if kind == 'case' and selector.casefold() == lhs}
+    audited = dispatch_operations(code, safe_code, parser, {lhs for _, lhs in dispatches if facts.get(lhs, {}).get('audit')}, shift)
     words = re.compile(r'(?<![\w.])(?:' + '|'.join(map(re.escape, wanted)) + r')(?!\w)', re.I)
     for m in words.finditer(clean):
         leaf = m[0].casefold()
@@ -155,10 +194,15 @@ def _block_facts(code, block, origin, wanted, types, facts, calls, flags, cited_
             statement = parsed.get(pos)
             if statement and statement[0] == leaf:
                 _, rhs, guard = statement
-                data['writes'].append((integer(rhs), guard, line, block, pos))
+                data['writes'].append((integer(rhs), guard, line, block, pos, locator, shift))
                 continue
-        elif _read_only(clean[max(0,pos-180):pos], after):
-            continue
+        else:
+            use = _read_use(parsed, dispatches, previous, leaf, clean, pos, m.end(), locator, shift)
+            if use['kind'] == 'dispatch' and (audit := audited.get(use['offset'] - shift)):
+                use['operations'] = audit
+            data['reads'].append({'line': line, 'section_line': _section(block).sourceline, **locator, **use})
+            if _read_only(clean[max(0,pos-180):pos], after):
+                continue
         data['open'].add(line)
 
 
@@ -186,7 +230,10 @@ def _scalar_facts(unit, wanted, origins, project_types, cited_lines, controlled)
     if not private:
         return {}
     words = re.compile(r'(?<![\w.])(?:'+'|'.join(map(re.escape,private))+r')(?!\w)', re.I)
-    facts = {leaf:{'open':set(), 'writes':[]} for leaf in private}
+    def needs_audit(row):
+        kinds = {s['kind'] for s in row['control_links'] if s['child'].casefold() == row['identity']}
+        return {'starts_child', 'waits_for_child'} <= kinds
+    facts = {leaf:{'open':set(), 'writes':[], 'reads':[], 'audit':any(map(needs_audit, wanted[leaf]))} for leaf in private}
     calls, flags = defaultdict(list), defaultdict(list)
     for body in unit.iter('{*}BodyContent','{*}body'):
         for node in body.iter():
@@ -211,7 +258,7 @@ def _scalar_facts(unit, wanted, origins, project_types, cited_lines, controlled)
     for leaf, init in private.items():
         values = facts[leaf]
         resets, entries = [], []
-        for number, guard, line, block, offset in values['writes']:
+        for number, guard, line, block, offset, locator, shift in values['writes']:
             if not compatible(guard,leaf,init,check_remaining=True):
                 continue
             if number == init:
@@ -237,12 +284,12 @@ def _scalar_facts(unit, wanted, origins, project_types, cited_lines, controlled)
                                             and sites[0][1] in inputs[gate])
                             stops[gate]={'latch':name,'line':stop_line,'enabled_operations':operations,'clocks':clocks}
                             break
-                entries.append({'line':line, 'section_line':_section(block).sourceline, 'offset':offset,
+                entries.append({'line':line, 'section_line':_section(block).sourceline, **locator, 'offset':offset + shift,
                                 'value':number, 'guard':guard.text(), 'required_inputs':inputs,
                                 **({'mode_stops':stops} if stops else {})})
         if values['writes']:
             result[leaf] = {'initial':init, 'reset_lines':sorted(set(resets)), 'entries':entries,
-                            'open_lines':sorted(values['open'])}
+                            'open_lines':sorted(values['open']), 'read_uses':values['reads']}
     return result
 
 

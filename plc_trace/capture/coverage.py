@@ -3,6 +3,8 @@ import re
 from collections import defaultdict
 
 from plc_trace.capture.capture_use import _guard_signals, _same_phase
+from plc_trace.capture.coordination_scope import coordination_only
+from plc_trace.capture.production_ownership import enclosed_child
 from plc_trace.capture.station_scope import writer_context
 from plc_trace.analysis.boundary_logic import substitute
 from plc_trace.analysis.fb_transport import required_signals
@@ -236,11 +238,16 @@ def _parent_entries(row):
     if act.get('open_lines') or not act.get('entries'):
         return []
     starts = [s for s in row['control_links'] if s['kind']=='starts_child' and s['child'].casefold()==row['identity']]
+    contexts = {writer_context(site)[1] for site in row.get('transitions', ())}
     parents = []
     for entry in act['entries']:
-        links = [s for s in starts if s['child_value'] == entry['value'] and s['guard'] == entry['guard']
-                 and s.get('source_line') == entry['section_line'] and s.get('offset') == entry['offset']]
-        if not links:
+        if 'read_uses' in act and not all(k in entry for k in ('scope', 'network')):
+            return []  # No shared instruction coordinate for this representation.
+        links = [s for s in starts if s['child_value'] == entry['value']
+                 and s.get('local_guard', s['guard']) == entry['guard']
+                 and s.get('source_line') == entry['section_line'] and s.get('offset') == entry['offset']
+                 and all(s.get(k) == entry[k] for k in ('scope', 'network') if k in entry)]
+        if not links or (contexts and {writer_context(s)[1] for s in links} != contexts):
             return []
         parents.extend(links)
     return parents
@@ -307,12 +314,18 @@ def protect_channels(inventory, roles, required=(), *, execution=None):
 
     for key, decision in by_name.items():
         row = rows[key]
-        if proof := _inactive(row):
-            decision.update(admission='optional', exclusion_evidence=proof)
+        inactive = _inactive(row)
+        if inactive:
+            decision.update(admission='optional', exclusion_evidence=inactive)
+        elif decision.get('use') in ('production', 'detail') and (
+                ownership := enclosed_child(row, rows, _parent_entries(row))):
+            decision.update(admission='optional', exclusion_evidence=ownership)
         elif decision['admission'] == 'captured':
             if row.get('service_isolation'):
                 decision.update(admission='review', exclusion_evidence=row['service_isolation'],
                                 timing_review_reason='该地址的写步受已声明的设备服务模式约束')
+            elif evidence := coordination_only(row, rows, decision['boundaries']):
+                decision.update(admission='review', exclusion_evidence=evidence)
             else:
                 reason, modes = _parent_context(row, rows, execution)
                 if modes:
@@ -322,8 +335,8 @@ def protect_channels(inventory, roles, required=(), *, execution=None):
 
         if key in required and decision['admission'] != 'captured':
             decision.update(admission='retained', retention_reason='独立核验输入指定该地址，源码有本实例写步')
-            if proof:
-                decision['activation_conflict'] = proof
+            if inactive:
+                decision['activation_conflict'] = inactive
                 decision['retention_reason'] += '，但未定位离开初值的入口'
 
     jobs = _job_ports([rows[key] for key, d in by_name.items() if d['admission'] == 'captured'])
@@ -358,3 +371,16 @@ def protect_channels(inventory, roles, required=(), *, execution=None):
                 decision.update(admission='review', timing_review_reason='写步已有来源，仍缺本实例的数据用途证据')
         if proof:
             decision['exclusion_evidence'] = proof
+
+    # Keep the review input replayable. The effective use describes what the
+    # final files actually do with the channel after applying source evidence.
+    by_admission = {'captured': 'production', 'retained': 'reference',
+                    'review': 'unresolved', 'excluded': 'non_sequence'}
+    for decision in roles:
+        admission = decision['admission']
+        if admission in by_admission:
+            decision['effective_use'] = by_admission[admission]
+        elif decision.get('exclusion_evidence', {}).get('kind') == 'inactive_from_initial':
+            decision['effective_use'] = 'inactive'
+        else:
+            decision['effective_use'] = 'service' if decision.get('use') == 'service' else 'detail'

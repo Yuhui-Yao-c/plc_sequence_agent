@@ -41,6 +41,8 @@ from plc_trace.runtime.workflow import fingerprint, lock_run_dir, pipeline_finge
 
 
 _NAME = r'[^\W\d]\w*'
+_READ_PATH = re.compile(rf'{_NAME}(?:\s*\.\s*{_NAME})*')
+_ASSIGN = re.compile(r'\s*:=')
 _ROOT = re.compile(rf'(?<![\w.#]){_NAME}')
 _MEMBER_NAME = re.compile(rf'{_NAME}|\d+')
 _SUFFIX = re.compile(rf'\s*(?:\.\s*(?:{_NAME}|\d+)|(?P<index>\[))')
@@ -221,6 +223,7 @@ class _SourceScan:
         self.source_format = source_format
         self.case_sensitive = case_sensitive
         self.references = {}
+        self.direct_reads = Counter()
         self.dynamic = {}
         self.units = defaultdict(set)
         self.ambiguous_units = set()
@@ -251,6 +254,11 @@ class _SourceScan:
             assigned, outputs = _st_targets(code)
             parts = (code,)
         for part in parts:
+            if self.matcher is None and self.source_format == 'omron_iec61131_10':
+                # Count literal scalar member reads, including in unparsed calls,
+                # subscript expressions and other programs. Ignore assignment targets.
+                self.direct_reads.update(symbol(m[0]).casefold() for m in _READ_PATH.finditer(part)
+                                         if not st or not _ASSIGN.match(part, m.end()))
             for raw, name, dynamic, start, end in _channels(part):
                 names = (name, raw)
                 if unit and unit[0] == 'program':
