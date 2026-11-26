@@ -32,7 +32,7 @@ from plc_trace.capture.plcopen_tasks import (
 )
 from plc_trace.capture.station_scope import at_path, declaration
 from plc_trace.capture.setup_output import (
-    legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files, verify_scope_upgrade,
+    PENDING_SCOPE_STATES, legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files, verify_scope_upgrade,
 )
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
@@ -693,13 +693,13 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                     verified_members[key] = declaration['type']
                     member_sources[key] = declaration['source_sha256']
                     new_keys.discard(key)
-                if status['status'] != 'scope_review_pending' and scope_bytes is not None:
-                    if hashlib.sha256(scope_bytes).hexdigest() not in (
-                            status.get('scope_input_sha256'), status['artifact_sha256'].get('scope_results.json')):
-                        if not status.get('legacy_timing_reviews'):
-                            raise ValueError('已有任务已结束，范围判断与已提交结果不同，请核对后显式重建')
-                        upgrading_scope = json.loads((out / 'scope_results.json').read_bytes())
-                completing_scope = scope_bytes is not None and status['status'] == 'scope_review_pending'
+                submitted = scope_bytes is not None and hashlib.sha256(scope_bytes).hexdigest() not in (
+                    status.get('scope_input_sha256'), status.get('artifact_sha256', {}).get('scope_results.json'))
+                completing_scope = submitted and status['status'] in PENDING_SCOPE_STATES
+                if submitted and not completing_scope:
+                    if not status.get('legacy_timing_reviews'):
+                        raise ValueError('已有任务已结束，范围判断与已提交结果不同，请核对后显式重建')
+                    upgrading_scope = json.loads((out / 'scope_results.json').read_bytes())
                 if not new_keys and not completing_scope and not upgrading_scope:
                     return status
                 pending = status
@@ -731,6 +731,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         inventory, discovery_status = None, None
         if automatic:
             from plc_trace.capture.step_discovery import Discovery, array_coverage, replay_selectors, scope_index, scope_selection
+            from plc_trace.capture.scope_recheck import scope_recheck
             if source_format == 'plcopen':
                 from plc_trace.capture.plcopen_discovery import discover
             else:
@@ -757,6 +758,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 raise ValueError('用途判断 JSON 为空')
             required, types, reference_gaps = read_reference(reference, inventory['candidates']) if reference else ({}, {}, [])
             sequences, roles = scope_selection(inventory, decisions, required, execution=execution)
+            rechecks = scope_recheck(inventory, roles, required_keys=required.keys()) if decisions is not None else []
             inventory['decisions'] = roles
             families = decisions.get('station_families', []) if decisions is not None else []
             if upgrading_scope:
@@ -774,12 +776,18 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             distributed = sum(r['eligibility'] == 'distributed_write' for r in inventory['candidates'])
             if decisions is None and (eligible or single_writes or distributed):
                 discovery_status = 'scope_review_pending'
+            elif rechecks:
+                discovery_status = 'scope_recheck_pending'
             export_rows = chosen
             if discovery_status == 'scope_review_pending':
                 provisional = source_obligations(inventory).keys() | required.keys()
                 export_rows = {r['identity']: r for r in inventory['candidates']
                                if r['eligibility'] == 'distributed_write' or (r['identity'] in provisional
                                    and r['eligibility'] in {'scope_required', 'single_write'})}
+            elif rechecks:
+                targets_to_review = {r['name'].casefold() for r in rechecks}
+                export_rows = {r['identity']: r for r in inventory['candidates']
+                               if r['identity'] in chosen or r['identity'] in targets_to_review}
             for key, record in export_rows.items():
                 name = record['name']
                 site = record['transitions'][0] if record['transitions'] else record['dispatch_writes'][0]['write']
@@ -835,7 +843,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             template = ET.parse(RESOURCE_ROOT / 'templates' / 'inovance_trace.xml').getroot()
             task = sampling_task(scan.tasks, scan.program_writes, channels, template.find('./TraceConfiguration'),
                                  task_name=task_name, every_n_cycles=every_n_cycles)
-        preview = discovery_status == 'scope_review_pending'
+        preview = discovery_status in PENDING_SCOPE_STATES
         targets = 'trace_targets_preview.txt' if preview else 'static_variables.txt'
         files = {'static_variables.txt': b'', targets: ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
         if unresolved:
@@ -902,7 +910,14 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             resolved_singles = sum(r['eligibility'] == 'single_write' and r['identity'] in resolved
                                    for r in inventory['candidates'])
             report['unproven_candidates'] = len(inventory['candidates']) - eligible - resolved_singles
-            if decisions is not None and not final_channels:
+            if rechecks:
+                review_file = 'scope_recheck.json'
+                report.update(scope_recheck=str(out / review_file), scope_recheck_count=len(rechecks),
+                              proposed_target_count=len(chosen) + len(recovered),
+                              review_reason='未入选的地址仍有具体工步证据，请逐项复核并在本目录重交完整的用途判断')
+                files[review_file] = json.dumps({'inventory_sha256': inventory['inventory_sha256'],
+                    'activation_sha256': evidence_sha, 'items': rechecks}, ensure_ascii=False, indent=1).encode('utf-8')
+            elif decisions is not None and not final_channels:
                 report['review_reason'] = '本轮未确认可独立计时的生产动作，请查备选清单和源码证据'
             files['step_array_coverage.csv'] = _csv_bytes(
                 ('具体数组', '声明下界', '声明上界', '声明行', '执行步实例', '有引用无独立跳步的槽位'),

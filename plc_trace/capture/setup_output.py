@@ -7,6 +7,8 @@ from tempfile import TemporaryDirectory
 
 from plc_trace.runtime.workflow import _fresh_output, fingerprint
 
+PENDING_SCOPE_STATES = {'scope_review_pending', 'scope_recheck_pending'}
+
 
 def read_status(out):
     marker = out / 'workflow_status.json'
@@ -68,7 +70,7 @@ def verify_files(out, status):
     hashes = status.get('artifact_sha256', {})
     required = {'static_variables.txt'}
     state = status.get('status')
-    if state not in {'scope_review_pending', 'needs_review', 'done', 'done_with_review'}:
+    if state not in PENDING_SCOPE_STATES | {'needs_review', 'done', 'done_with_review'}:
         raise ValueError('已有采集配置的工作流状态无效，请核对后显式重建')
     if status.get('selection_mode') == 'automatic':
         required.update(('step_variable_discovery.json', 'scope_candidates.jsonl'))
@@ -76,6 +78,10 @@ def verify_files(out, status):
         if state != 'scope_review_pending' and any(status.get(k) for k in
                 ('scope_candidates', 'single_write_candidates', 'distributed_write_candidates')):
             required.add('scope_results.json')
+    if state == 'scope_recheck_pending':
+        required.update(('scope_recheck.json', 'scope_results.json', 'trace_targets_preview.txt'))
+        if status.get('scope_recheck') != str(out / 'scope_recheck.json') or status.get('configuration'):
+            raise ValueError('范围补核目录的状态与交付文件不一致，请核对后显式重建')
     for field in ('configuration', 'preview_configuration', 'trace_targets', 'member_type_template'):
         if not status.get(field) and not (field == 'configuration' and state in {'done', 'done_with_review'}):
             continue
@@ -123,7 +129,7 @@ def publish(out, files, *, force, completing):
             owned = {'static_variables.txt', 'scope_candidates.jsonl', 'step_variable_discovery.json',
                      'workflow_status.json', 'scope_results.json', 'capture_context.csv',
                      'step_array_coverage.csv', 'unresolved_types.csv', 'optional_variables.csv',
-                     'missing_member_types.csv', 'trace_targets_preview.txt'}
+                     'missing_member_types.csv', 'trace_targets_preview.txt', 'scope_recheck.json'}
             try:
                 previous = read_status(out)
                 old_files = previous.get('artifact_sha256', {})
@@ -147,7 +153,7 @@ def publish(out, files, *, force, completing):
                         if name not in owned:
                             raise ValueError(f'目标位置已有其他文件，请核对：{target}')
                         if name in {'capture_context.csv', 'step_array_coverage.csv', 'unresolved_types.csv',
-                                    'missing_member_types.csv', 'optional_variables.csv'} and name not in old_files:
+                                    'missing_member_types.csv', 'optional_variables.csv', 'scope_recheck.json'} and name not in old_files:
                             raise ValueError(f'目标位置已有其他文件，请核对：{target}')
                         shutil.copy2(target, backup / name)
                     (stage / name).replace(target)
