@@ -68,6 +68,56 @@ CASE Cal OF 1: IF TestOn THEN Cal:=2; END_IF; 2: Cal:=1; END_CASE;
         self.assertIn('Line.Cal', Path(final['trace_targets']).read_text().splitlines())
         self.assertEqual(final['coverage']['reference_missing_from_config'], [])
 
+    def test_run_enable_alone_cannot_certify_an_array_slot_as_a_production_interval(self):
+        # Rename the entire interface. Only the source declaration and the use of
+        # the individual slot establish what the transition measures.
+        self.source.write_text('''<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10">
+<GlobalVars>
+<Variable name="Q"><Type><TypeName>ARRAY[0..5] OF INT</TypeName></Type><Documentation>automatic cycle step</Documentation></Variable>
+<Variable name="Permit"><Type><TypeName>BOOL</TypeName></Type><Documentation>automatic run enable</Documentation></Variable>
+</GlobalVars><Program name="Cell"><BodyContent name="Auto"><ST>
+CASE Q[0] OF 0: IF Loaded THEN Q[0]:=1; END_IF; 1: Q[0]:=0; END_CASE;
+IF Q[1]=0 AND Permit THEN Q[1]:=5; END_IF;
+IF Q[2]=0 AND Permit AND PartArrived THEN Q[2]:=5; END_IF;
+IF Q[3]=0 AND Permit THEN Q[3]:=5; END_IF;
+IF Q[4]=0 AND Permit THEN Q[4]:=5; END_IF;
+IF Q[5]=0 AND Permit THEN Q[5]:=5; END_IF;
+</ST></BodyContent><BodyContent name="Handoff"><ST>
+IF Q[3]=5 THEN TransferRequest:=TRUE; END_IF;
+IF NextPart THEN Q[4]:=0; END_IF;
+IF Q[5]=0 THEN AcceptTray:=TRUE; END_IF;
+</ST></BodyContent></Program></Project>''', encoding='utf-8')
+        for use_reference in (False, True):
+            with self.subTest(use_reference=use_reference):
+                out = self.root / ('specified' if use_reference else 'default')
+                reference = self.root / 'requested.txt' if use_reference else None
+                if reference:
+                    reference.write_text('Q[1]\n')
+                first = generate(self.source, out, reference=reference)
+                names = set(Path(first['trace_targets']).read_text().splitlines())
+                self.assertEqual('Q[1]' in names, use_reference)
+                self.assertTrue({'Q[0]', 'Q[2]', 'Q[3]', 'Q[4]', 'Q[5]'} <= names)
+                ledger = json.loads((out / first['discovery']).read_bytes())
+                review = neutral(ledger)
+                for index, signal in enumerate(('Loaded', 'Permit', 'PartArrived', 'Permit', 'Permit', 'Permit')):
+                    name = f'Q[{index}]'
+                    proposal = next((d for d in review['decisions'] if d['name'] == name), None)
+                    if proposal is None:
+                        proposal = {'name': name}
+                        review['decisions'].append(proposal)
+                    proposal.update(role='component_sequence', use='production', basis=['d1', 't1'],
+                                    reason='记录工件移送', timing_basis=dict(scope='workstation',
+                                    operation='工件移送', boundary_write='t1'),
+                                    boundaries=[dict(action='工件移送', write='t1', via='signal:' + signal)])
+                path = out / 'review.json'
+                path.write_text(json.dumps(review), encoding='utf-8')
+                final = generate(self.source, out, scope_results=path, reference=reference)
+                self.assertEqual(set(Path(final['trace_targets']).read_text().splitlines()), names)
+                rows = json.loads((out / 'evidence/scope_results.json').read_bytes())['decisions']
+                latch = next(r for r in rows if r['name'] == 'Q[1]')
+                self.assertEqual(latch['admission'], 'retained' if use_reference else 'review')
+                self.assertEqual(latch['exclusion_evidence']['kind'], 'operating_enable_only')
+
 
 class EquipmentBoundaryTests(unittest.TestCase):
     def setUp(self):

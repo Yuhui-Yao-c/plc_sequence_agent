@@ -2,11 +2,14 @@
 import re
 from collections import defaultdict
 
-from plc_trace.analysis.boundary_logic import IDENT, symbol
+from plc_trace.analysis.boundary_logic import IDENT, compatible, substitute, symbol
 from plc_trace.capture.action_obligations import action_obligation
+from plc_trace.capture.capture_use import _guard_signals
 from plc_trace.capture.command_interface import CommandInterfaces
 from plc_trace.capture.coverage import array_storage
 from plc_trace.capture.station_scope import writer_context
+from plc_trace.capture.step_discovery import fixed_path
+from plc_trace.source.source_expressions import source_condition
 
 
 # These are affirmative descriptions on the declared storage itself. An address,
@@ -23,6 +26,10 @@ _ACTUATOR = re.compile(
 
 _SERVICE_SECTION = re.compile(
     r'(?:^|[_\s])(?:manual|maintenance|calibration|alarms?|diagnostics?|手动|标定|报警|维护|诊断)(?:$|[_\s])', re.I)
+_INITIAL_SECTION = re.compile(r'(?:^|[_\s])(?:init(?:ial(?:iz(?:e|ation))?)?|reset|初始化|复位)(?:$|[_\s])', re.I)
+_RUN_CONTROL = re.compile(
+    r'(?:自动|手动)(?:模式)?(?:执行|运行|使能|启动|自动)|(?:自动|手动)模式|'
+    r'(?:automatic|auto|manual)\s+(?:(?:run|cycle)\s+)?(?:mode|enable|start|run)', re.I)
 
 
 def _operands(guard):
@@ -71,17 +78,62 @@ def _declared_chart(row, fields):
     return True
 
 
+def _operating_start(row, candidate, scan):
+    """A declared chart slot can merely latch when operation is enabled."""
+    if (row['eligibility'] != 'single_write' or len(row['transitions']) != 1
+            or row.get('entry_writes') or any(d['kind'] == 'element' and d.get('text') for d in row['declarations'])):
+        return None
+    write, = row['transitions']
+    if (write.get('binding') or write.get('comment') or candidate.dispatches
+            or any(e['step'] == write['to'] or not _INITIAL_SECTION.search(_call_scope(e).rsplit('::', 1)[-1])
+                   for e in candidate.effects.values())):
+        return None
+    unit = scan.programs.get(write['program'].rsplit('::', 1)[-1].casefold())
+    if not unit:
+        return None
+    selector = write.get('selector') or row['identity']
+    guard = substitute(source_condition(write['guard']), selector, write['from'])
+    controls = {}
+    for signal in sorted(_guard_signals(guard.text())):
+        if not fixed_path(signal):
+            return None
+        address = scan.sysmac_channel(signal, unit)[0]
+        notes = [d for d in scan.channel_declarations(address) if d['path'].casefold() == address.casefold()]
+        if not notes or not _RUN_CONTROL.fullmatch(notes[-1].get('text', '').strip()):
+            return None
+        controls[signal] = notes[-1]['line']
+    # A complete alternative must need only declared mode bits. An opaque
+    # sensor test in series with the enable cannot establish this finding.
+    branches = guard.args if guard.kind == 'or' else (guard,)
+    for branch in branches:
+        terms = branch.args if branch.kind == 'and' else (branch,)
+        atoms = [t.args[0] if t.kind == 'not' else t for t in terms]
+        if (all(a.kind == 'signal' and a.args[0].casefold() in controls for a in atoms)
+                and compatible(branch, selector, write['from'], check_remaining=True)):
+            return {'kind': 'operating_enable_only', 'write': write['id'], 'source_line': write['source_line'],
+                    'from': write['from'], 'to': write['to'], 'control_declarations': controls,
+                    'reason': f"运行使能可将本地址从 {write['from']} 写至 {write['to']}。"
+                              '当前源码证据未显示按该步值执行工件动作或为下一件重新进入该步。'}
+    return None
+
+
 class WorkstationInterfaces:
-    def __init__(self, rows, scan):
+    def __init__(self, rows, scan, candidates=None):
         self.fields = scan.fb_fields
         declared = [r for r in rows if r['eligibility'] in ('scope_required', 'single_write', 'distributed_write')
                     and _declared_chart(r, self.fields)]
+        self.operating_starts = {}
+        if candidates is not None:
+            for row in declared:
+                if proof := _operating_start(row, candidates[row['identity']], scan):
+                    self.operating_starts[row['identity']] = proof
         witnessed_arrays = {array_storage(r) for r in declared if r['sequence_witness']}
         witnessed_arrays.discard(None)
         self.channels = {r['identity'] for r in declared if r['sequence_witness'] or r.get('dispatch_writes')
                          or r['transitions'] and array_storage(r) in witnessed_arrays}
         self.commands = CommandInterfaces(rows)
         self.channels.update(self.commands.owners)
+        self.channels.difference_update(self.operating_starts)
         self.by_caller = defaultdict(dict)
         self.chart_scopes = defaultdict(set)
         self.chart_outputs = defaultdict(set)

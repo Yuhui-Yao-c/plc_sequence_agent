@@ -772,7 +772,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             inventory = discovered.inventory(digest, source_format)
             from plc_trace.capture.activation import ExecutionEvidence
             decisions = json.loads(scope_bytes) if scope_bytes is not None else None
-            execution = ExecutionEvidence(source, inventory, scan, decisions)
+            execution = ExecutionEvidence(source, inventory, scan, decisions, discovered.candidates)
             activation = {r['identity']: r['activation'] for r in inventory['candidates'] if 'activation' in r}
             evidence_sha = hashlib.sha256(json.dumps(activation, sort_keys=True).encode()).hexdigest()
             inventory['activation_sha256'] = evidence_sha
@@ -811,7 +811,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 if execution.workstations.channels:
                     provisional = execution.workstations.preview(inventory['candidates']) | required.keys()
                 else:
-                    provisional = source_obligations(inventory).keys() | required.keys()
+                    provisional = (source_obligations(inventory).keys() - execution.workstations.operating_starts.keys()) | required.keys()
                     provisional.update(r['identity'] for r in inventory['candidates']
                                        if r['eligibility'] == 'distributed_write')
                 export_rows = {r['identity']: r for r in inventory['candidates'] if r['identity'] in provisional

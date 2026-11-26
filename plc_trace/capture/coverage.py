@@ -324,8 +324,8 @@ def protect_channels(inventory, roles, required=(), *, execution=None):
         elif interfaces and decision.get('use') in ('production', 'detail') and (device := interfaces.equipment_cycle(row)):
             decision.update(admission='optional', exclusion_evidence=device)
         elif decision['admission'] == 'captured':
-            if interfaces and (service := interfaces.separate_service_section(row)):
-                decision.update(admission='review', exclusion_evidence=service, timing_review_reason=service['reason'])
+            if interfaces and (finding := interfaces.operating_starts.get(key) or interfaces.separate_service_section(row)):
+                decision.update(admission='review', exclusion_evidence=finding, timing_review_reason=finding['reason'])
             elif row.get('service_isolation'):
                 decision.update(admission='review', exclusion_evidence=row['service_isolation'],
                                 timing_review_reason='该地址的写步受已声明的设备服务模式约束')

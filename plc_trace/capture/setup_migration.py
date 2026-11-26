@@ -6,7 +6,7 @@ def can_migrate_pending(status, out, *, source, digest, automatic, capture_forma
     """Match the saved request. The caller verifies files and recomputes both evidence digests."""
     legacy_list = (status.get('version') == '18.5.1' and 'trace_targets_stage' not in status
                    and status.get('trace_targets') == str(out / 'trace_targets_preview.txt'))
-    fixed_list = (status.get('version') in {'19.0.0', '19.0.1'} and status.get('trace_targets_stage') == 'preview'
+    fixed_list = (status.get('version') in {'19.0.0', '19.0.1', '19.0.2'} and status.get('trace_targets_stage') == 'preview'
                   and status.get('trace_targets') == str(out / 'static_variables.txt'))
     if not (automatic and (legacy_list or fixed_list) and status.get('mode') == 'trace_setup'
             and status.get('selection_mode') == 'automatic' and status.get('patterns') == []

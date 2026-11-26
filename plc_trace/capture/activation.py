@@ -303,8 +303,8 @@ def _all_polarities(condition):
 
 class ExecutionEvidence:
     """Source excerpts stay in memory. Published records contain only the evidence actually used."""
-    def __init__(self, source, inventory, scan, review):
-        self.workstations = WorkstationInterfaces(inventory['candidates'], scan)
+    def __init__(self, source, inventory, scan, review, candidates):
+        self.workstations = WorkstationInterfaces(inventory['candidates'], scan, candidates)
         self.sections = defaultdict(list)
         self.declarations = scan.channel_declarations
         self.callees = defaultdict(set)
