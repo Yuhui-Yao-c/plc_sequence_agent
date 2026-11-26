@@ -1,17 +1,19 @@
-"""Recognize unfinished 18.5.1 capture runs that can adopt the new output layout."""
+"""Recognize compatible unfinished runs and recompute their scope with the current pipeline."""
 
 
 def can_migrate_pending(status, out, *, source, digest, automatic, capture_format, task_name,
                         every_n_cycles, reference_sha):
     """Match the saved request. The caller verifies files and recomputes both evidence digests."""
-    if not (automatic and status.get('version') == '18.5.1' and status.get('mode') == 'trace_setup'
+    legacy_list = (status.get('version') == '18.5.1' and 'trace_targets_stage' not in status
+                   and status.get('trace_targets') == str(out / 'trace_targets_preview.txt'))
+    fixed_list = (status.get('version') == '19.0.0' and status.get('trace_targets_stage') == 'preview'
+                  and status.get('trace_targets') == str(out / 'static_variables.txt'))
+    if not (automatic and (legacy_list or fixed_list) and status.get('mode') == 'trace_setup'
             and status.get('selection_mode') == 'automatic' and status.get('patterns') == []
             and status.get('status') in {'scope_review_pending', 'scope_recheck_pending'}
             and status.get('out') == str(out) and status.get('source') == str(source)
             and status.get('source_sha256') == digest and status.get('request_sha256')
-            and status.get('inventory_sha256') and status.get('activation_sha256')
-            and status.get('trace_targets') == str(out / 'trace_targets_preview.txt')
-            and 'trace_targets_stage' not in status):
+            and status.get('inventory_sha256') and status.get('activation_sha256')):
         return False
     coverage = status.get('coverage')
     if not isinstance(coverage, dict) or coverage.get('reference_sha256', '') != reference_sha:

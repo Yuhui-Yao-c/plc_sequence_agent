@@ -312,6 +312,7 @@ def protect_channels(inventory, roles, required=(), *, execution=None):
         roles.append(decision)
         by_name[key] = decision
 
+    interfaces = getattr(execution, 'workstations', None)
     for key, decision in by_name.items():
         row = rows[key]
         inactive = _inactive(row)
@@ -320,8 +321,12 @@ def protect_channels(inventory, roles, required=(), *, execution=None):
         elif decision.get('use') in ('production', 'detail') and (
                 ownership := enclosed_child(row, rows, _parent_entries(row))):
             decision.update(admission='optional', exclusion_evidence=ownership)
+        elif interfaces and decision.get('use') in ('production', 'detail') and (device := interfaces.equipment_cycle(row)):
+            decision.update(admission='optional', exclusion_evidence=device)
         elif decision['admission'] == 'captured':
-            if row.get('service_isolation'):
+            if interfaces and (service := interfaces.separate_service_section(row)):
+                decision.update(admission='review', exclusion_evidence=service, timing_review_reason=service['reason'])
+            elif row.get('service_isolation'):
                 decision.update(admission='review', exclusion_evidence=row['service_isolation'],
                                 timing_review_reason='该地址的写步受已声明的设备服务模式约束')
             elif evidence := coordination_only(row, rows, decision['boundaries']):

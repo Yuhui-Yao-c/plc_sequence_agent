@@ -10,7 +10,7 @@ compatibility: opencode
 
 从[主 Agent](../../agents/plc-sequence.md)收到工程和采集选项后运行 `python plc_cli.py "工程.xml" --trace-setup`，保存返回的 `out`。候选从本次源码发现。有人工起止表、已确认的地址清单或 Sysmac 通道表时，在各轮传入同一 `--reference`。用它核对默认清单和最终配置，可按精确地址补齐已知类型。
 
-1. 当 `next_action=review_scope`（`scope_review_pending`）时，在当前轮直接读取 `evidence/scope_candidates.jsonl` 和 `evidence/step_variable_discovery.json`，完成以下用途复核。`trace_targets` 始终指向运行目录的 `static_variables.txt`。`trace_targets_stage=preview` 时，该文件列出当轮候选，`preview_configuration` 只含其中可写入的通道。即使 `preview_unresolved_types` 非空或预配置通道为零，也用现有 XML 继续检查调度、调用、实参和固定下标，确认每个工位主步、命令、工作区、并行子步或辅助流程的用途。用途复核期间将类型缺口留在台账。
+1. 当 `next_action=review_scope`（`scope_review_pending`）时，在当前轮直接读取 `evidence/scope_candidates.jsonl` 和 `evidence/step_variable_discovery.json`，完成以下用途复核。`trace_targets` 始终指向运行目录的 `static_variables.txt`。`trace_targets_stage=preview` 时，先从变量自身声明和可执行写点定位工位自动步，清单列出当轮拟采地址，`preview_configuration` 只含其中可写入的通道。即使 `preview_unresolved_types` 非空或预配置通道为零，也用现有 XML 继续检查调度、调用、实参和固定下标，确认每个工位主步、命令、工作区、并行子步或辅助流程的用途。用途复核期间将类型缺口留在台账。
 2. 为每个 `scope_required` 给出一项判断，再检查 `single_write` 中只写过一个出口的短流程，尤其是由调用方启动或收尾的子步。用该实例的写点和声明用途或步骤注释补录。保留未绑定、动态下标和未定位写点等证据缺口。
 3. 先判断地址在程序中如何使用。`role` 取 `station_auto`、`station_slot`、`component_sequence`、`auxiliary_sequence`、`uncertain` 或 `non_sequence`。命令号、计数、应答字也可能在几个数值间切换，核对谁读写它以及这些值控制什么。排除数据通道要引用它的迁移和受控读写、有说明的声明或另一写点。确认内部或辅助序列要引用本实例的迁移。
 4. 为工位角色引用本地址的全部声明及 `owner_scope` 内写点，并为每个声称的工位接口族在 `station_families` 填一个具体实例和周期说明。无说明时核对同一例程的其他阶段、写出或可写绑定。`station_slot` 还须提供同一具体数组和工位程序的 `interface_peer`。经证实专门存步的有界叶数组可在已确认实例上标 `dedicated_step_array: true` 并引用声明和迁移。其他仅固定引用或清零的槽位保留在备选清单。
@@ -29,6 +29,8 @@ compatibility: opencode
 | 内部阶段本身是工艺作业，例如两条物料通道各自完成一次交接 | 独立工件、独立完成写点、其他工位消费中间结果或工程对该阶段的计时记录均可作为归属线索。用本实例实际的生产写点核验，填 `production`。 |
 | 手动单循环、标定或后台诊断 | 追查实际实例的入口和执行指令，有依据时填 `service`。同一定义的其他实例分别判断。 |
 | 只有分派、反馈或注释，计时对象仍然不明确 | 填 `unresolved`，指出缺哪个写点、绑定关系、生产入口或计时边界。保留在备选表中复核。 |
+
+从完整候选台账复核其余地址，包括以标量或独立子流程实现的工位。对每个设备块，沿具体实参核对工位地址、局部步读者、命令和反馈。引用电机启动线圈只能定位一次设备动作。若主张该步还划分独立作业，写明对应的工件转移或单独完成的出口，并核对哪一工位读取它。
 
 同一地址兼任调度与生产动作时，核查各命令、模式及调用方。任一正常生产分支能证明它独立计量一道工步，就保留具体地址，并在对应边界写清运行条件。地址留在备选时，保留包含程序及实例名的原始完整路径。
 

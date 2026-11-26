@@ -237,6 +237,7 @@ class _SourceScan:
         self.declaration_sites = {}
         self.private_storage = set()
         self.default_instances = set()
+        self.fb_fields = {}
         self.wired_operands = defaultdict(set)
         self.aliases = defaultdict(set)
         self.programs = {}
@@ -291,6 +292,7 @@ class _SourceScan:
         frames = [_Frame('', None, False, False, '')]
         task_node = None
         declaration_node = None
+        fb_definition = None
         routines = []
         plcopen = self.source_format == 'plcopen'
         with source.open('rb') as stream:
@@ -303,6 +305,9 @@ class _SourceScan:
                     frames.append(_Frame(tag, unit, parent.body or tag in {'body', 'bodycontent'},
                                          parent.comment or tag in _XML_COMMENTS,
                                          name if tag == 'datatypedecl' else parent.type_name))
+                    if self.matcher is None and (tag == 'functionblock' or
+                            tag == 'pou' and node.get('pouType', '').casefold() == 'functionblock'):
+                        fb_definition = node
                     if (self.matcher is None and unit and tag == 'variable' and parent.tag in ('vars','localvars')
                             and node.getparent().get('accessSpecifier','').lower() == 'private'):
                         self.private_storage.add((unit[1].casefold(), name.casefold()))
@@ -319,6 +324,9 @@ class _SourceScan:
                         elif tag == 'variable' and parent.tag.endswith('vars') and parent.tag != 'externalvars':
                             owner = None if parent.tag == 'globalvars' else unit
                             declaration_node = (node, ('variable', owner, name.casefold()))
+                    if (plcopen and fb_definition is not None and not parent.body and tag == 'variable'
+                            and parent.tag.endswith('vars') and declaration_node is None):
+                        declaration_node = (node, None)
                     if tag == 'fileheader':
                         self.header = ' '.join(node.get(k, '') for k in ('companyName', 'productName')).casefold()
                     if name and tag in {'datatypedecl', 'program', 'function', 'functionblock'}:
@@ -373,8 +381,15 @@ class _SourceScan:
                     if node is not declared:
                         continue
                     # Conflicting declarations cannot serve as unit ownership evidence.
-                    self.declaration_sites[key] = declaration(node) if key not in self.declaration_sites else None
+                    definition = declaration(node)
+                    if key is not None:
+                        self.declaration_sites[key] = definition if key not in self.declaration_sites else None
+                    if fb_definition is not None and frame.tag == 'variable':
+                        field = fb_definition.get('name', '').casefold(), node.get('name', '').casefold()
+                        self.fb_fields[field] = ((parent.tag, definition[0]) if field not in self.fb_fields else None)
                     declaration_node = None
+                if node is fb_definition:
+                    fb_definition = None
                 if task_node is not None:
                     if node is not task_node:
                         continue
@@ -793,10 +808,14 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 discovery_status = 'scope_recheck_pending'
             export_rows = chosen
             if discovery_status == 'scope_review_pending':
-                provisional = source_obligations(inventory).keys() | required.keys()
-                export_rows = {r['identity']: r for r in inventory['candidates']
-                               if r['eligibility'] == 'distributed_write' or (r['identity'] in provisional
-                                   and r['eligibility'] in {'scope_required', 'single_write'})}
+                if execution.workstations.channels:
+                    provisional = execution.workstations.preview(inventory['candidates']) | required.keys()
+                else:
+                    provisional = source_obligations(inventory).keys() | required.keys()
+                    provisional.update(r['identity'] for r in inventory['candidates']
+                                       if r['eligibility'] == 'distributed_write')
+                export_rows = {r['identity']: r for r in inventory['candidates'] if r['identity'] in provisional
+                               and r['eligibility'] in {'scope_required', 'single_write', 'distributed_write'}}
             elif rechecks:
                 targets_to_review = {r['name'].casefold() for r in rechecks}
                 export_rows = {r['identity']: r for r in inventory['candidates']

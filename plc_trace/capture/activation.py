@@ -11,6 +11,7 @@ from plc_trace.analysis.boundary_logic import IDENT, TRUE, Expr, combine, compat
 from plc_trace.analysis.fb_transport import required_signals
 from plc_trace.analysis.successor_graph import STParser
 from plc_trace.capture.step_discovery import isolate_counted_loops
+from plc_trace.capture.workstation_interface import WorkstationInterfaces
 from plc_trace.source.plcopen_trace_control import ERRORS
 from plc_trace.source.source_expressions import INTEGER_BOUNDS, source_condition
 
@@ -303,6 +304,7 @@ def _all_polarities(condition):
 class ExecutionEvidence:
     """Source excerpts stay in memory. Published records contain only the evidence actually used."""
     def __init__(self, source, inventory, scan, review):
+        self.workstations = WorkstationInterfaces(inventory['candidates'], scan)
         self.sections = defaultdict(list)
         self.declarations = scan.channel_declarations
         self.callees = defaultdict(set)
