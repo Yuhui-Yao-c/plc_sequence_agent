@@ -297,13 +297,16 @@ class CoverageTests(unittest.TestCase):
             child={'identity':'p.helper.pos','request_inputs':[request],'control_links':[],
                    'transitions':[site(str(i),a,b,trigger if a==0 else 'Ready') for i,(a,b) in enumerate(edges)],
                    'other_outputs':outputs,
-                   'effects':[{'step':7,'global_target':'dev.done','value':'TRUE'}]}
+                   'effects':[{'step':7,'global_target':'dev.done','value':'TRUE','guard_complete':True}]}
             return _covered_transaction(child,_job_ports([parent]))
         self.assertEqual(proof()['channel'],'Phase')
         self.assertIsNone(proof('Phase=4 AND (Dev.Done OR Bypass)'))
+        self.assertIsNone(proof('Phase=4 AND Dev.Done AND Other.Done'))
+        self.assertIsNone(proof('Phase=4 AND Dev.Done AND ConveyorReady'))
         self.assertIsNone(proof('Phase=4 AND NOT Dev.Done'))
         self.assertIsNone(proof(mode='Mode=2'))
         self.assertIsNone(proof(extra=True))
         self.assertIsNone(proof(request='other.go'))
         self.assertIsNone(proof(outputs=['axis.target']))
         self.assertIsNone(proof(trigger='OtherTrigger'))
+        self.assertIsNone(proof(trigger='Dev.Go OR IndependentCycle'))

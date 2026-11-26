@@ -25,11 +25,16 @@ compatibility: opencode
 - `service` 表示本实例只服务于初始化、调试、维护、诊断或设备后台通信。复用同一个功能块的其他实例分别核对。用于生产动作的通信反馈或模式信号可以出现在计时条件中。
 - `unresolved` 表示目前不足以判定生产计时用途。填写现场可复核的缺口。提交用途判断后由程序检查排除证据。单向写步、完整分派或父子步有独立依据时，证据不足以排除的地址标为“待核，先采”。确认服务要核实每一写点的维护门控。排除通信细节要找到父动作发出的请求、接收的结果及具体子实例。每个非数据候选都应填写 `use`，缺省按待核处理。
 
-将判断保存到本轮 `scope_results.json`。证据编号均在各自地址内查找。以下为格式示例。
+复核私有步序时，先读 `activation` 的初值、同值写入、可执行入口和未解析引用。检查上层例程能否发起这个实例。入口完全依赖父步而父步的来源缺失时保留地址并记录缺口。父步发出请求并读取多个子设备的结果时，逐个核对各子实例完成和复位的时刻。现场采不到某个分支，或父步能量到整体等待，都不足以据此移出子步。
+
+为只在维护模式运行的实例填写 `service_evidence.kind=mode` 和源码中的 `gate`。核实每个入口都依赖此条件、失去模式会撤销运行使能、所引用的执行指令确实受该使能控制。后台设备服务填 `kind=equipment`，同时核实实际调用处对服务用途的说明、被调例程执行的具体指令，以及它与工件请求的关系。两种判断都填写 `purpose` 和 `operation`，格式为 `{"line": 物理XML行号, "text": "该行原文片段"}`。前者引用工程注释，后者引用可执行指令。源码不足时保留地址，复用同一定义的其他实例各自判断。
+
+将判断保存到本轮 `scope_results.json`。复制本轮的 `inventory_sha256` 和 `activation_sha256`，程序合并时重算校验。证据编号均在各自地址内查找。以下为格式示例。
 
 ```json
 {
   "inventory_sha256": "本轮指纹",
+  "activation_sha256": "本轮启动依据指纹",
   "decisions": [
     {"name":"Grip.Phase","role":"component_sequence","basis":["t2","e1"],"reason":"夹取命令等待夹爪到位后进入移送","use":"production","boundaries":[{"action":"夹爪夹紧到位","write":"t2","via":"signal:Grip.Closed"}]},
     {"name":"Meter.Phase","role":"auxiliary_sequence","basis":["t1"],"reason":"电表周期轮询并刷新能耗数据","use":"service"}
@@ -38,6 +43,8 @@ compatibility: opencode
 ```
 
 复用首轮选项执行 `python plc_cli.py trace-setup --source "工程.xml" --out "本轮实际目录" --scope-results "本轮实际目录/scope_results.json"`。程序重算源证据、逐实例校验边界，并保留可证实的父步 `gated_by`。
+
+独立清单中若有本次未跳变的数组通道，核对同一数组实例的执行步、元素类型和声明上下界。即使程序未单独写出该下标，程序也可按独立清单精确补回有声明依据的地址。缺少声明或下标越界时，在 `coverage` 报告差集。
 
 ## 输出与验收
 

@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from plc_trace.capture.capture_use import _guard_signals, _same_phase
 from plc_trace.capture.station_scope import writer_context
+from plc_trace.analysis.boundary_logic import substitute
 from plc_trace.analysis.fb_transport import required_signals
 from plc_trace.source.source_expressions import source_condition
 
@@ -74,13 +75,13 @@ def _job_ports(rows):
     for row in rows:
         starts = defaultdict(list)
         for effect in row['effects']:
-            if effect.get('guard_complete') and effect.get('global_target') and str(effect.get('value')).upper() == 'TRUE':
+            if effect.get('global_target') and str(effect.get('value')).upper() == 'TRUE':
                 starts[writer_context(effect), effect['step']].append(effect)
         if not starts:
             continue
         exits = defaultdict(list)
         for end in row['transitions']:
-            if end.get('guard_complete') and end.get('global_reads'):
+            if end.get('global_reads'):
                 exits[writer_context(end), end['from'], end.get('operating_guard', '')].append(end)
         for start in row['transitions']:
             owner = writer_context(start)
@@ -89,8 +90,11 @@ def _job_ports(rows):
                 for end in exits.get((owner, start['to'], mode), ()):
                     if not _same_phase(row, start, command):
                         continue
+                    selector = end.get('selector') or end.get('case_selector') or row['identity']
+                    feedback = substitute(source_condition(end['guard']), selector, end['from'])
+                    complete = all(s.get('guard_complete') for s in (start, command, end))
                     jobs[command['global_target']].append(
-                        (row['name'], start['id'], command['id'], end['id'], end['global_reads'], end['guard']))
+                        (row['name'], start['id'], command['id'], end['id'], end['global_reads'], feedback, complete))
     return jobs
 
 
@@ -101,13 +105,32 @@ def _positive_operand(expr, name):
 
 
 def _requires_result(expr, results):
+    """Every remaining exit operand must be a completion published by this device."""
     if expr.kind == 'signal':
         return expr.args[0].casefold() in results
-    if expr.kind == 'and':
-        return any(_requires_result(part, results) for part in expr.args)
-    if expr.kind == 'or':
+    if expr.kind in ('and', 'or'):
         return all(_requires_result(part, results) for part in expr.args)
     return False
+
+
+def _job_observations(row, jobs):
+    """A workpiece can wait for several devices. Its interval describes only the group."""
+    edges = {(w['from'],w['to']) for w in row['transitions']}
+    if len(edges) not in (2,3) or row['control_links']:
+        return []
+    outputs = {e['global_target'] for e in row['effects'] if e.get('global_target') and
+               str(e.get('value')).upper()=='TRUE'}
+    observations = []
+    for request in row.get('request_inputs',()):
+        signals = {p for p in outputs if p != request and p.rpartition('.')[0] == request.rpartition('.')[0]}
+        for parent, start, command, end, reads, guard, _ in jobs.get(request, ()):
+            if parent.casefold()==row['identity']:
+                continue
+            results = sorted(p for p in signals.intersection(reads) if _positive_operand(guard,p))
+            if results:
+                observations.append({'channel':parent,'request':request,'results':results,
+                                     'start_write':start,'request_effect':command,'result_write':end})
+    return observations
 
 
 def _covered_transaction(row, jobs):
@@ -121,7 +144,7 @@ def _covered_transaction(row, jobs):
     edges = {(t['from'], t['to']) for t in writes}
     results = defaultdict(set)
     for e in row['effects']:
-        if e.get('global_target') and str(e.get('value')).upper() == 'TRUE':
+        if e.get('guard_complete') and e.get('global_target') and str(e.get('value')).upper() == 'TRUE':
             results[e['step']].add(e['global_target'])
     for request in row['request_inputs']:
         port, sep, _ = request.rpartition('.')
@@ -132,16 +155,17 @@ def _covered_transaction(row, jobs):
         if (any(e.get('global_target') and not e['global_target'].startswith(port + '.') for e in row['effects'])
                 or any(not p.startswith(port + '.') for p in row.get('other_outputs', ()))):
             continue
-        for parent, start, command, end, reads, guard in jobs.get(request, ()):
-            if parent.casefold() == row['identity']:
+        for parent, start, command, end, reads, guard, complete in jobs.get(request, ()):
+            if not complete or parent.casefold() == row['identity']:
                 continue
             for idle, wait in edges:
-                if not any(t['from'] == idle and t['to'] == wait and request in t.get('global_reads', ())
-                           and _positive_operand(source_condition(t['guard']), request) for t in writes):
+                launches = [t for t in writes if t['from'] == idle and t['to'] == wait]
+                if not all(request in t.get('global_reads', ()) and
+                           (request, True) in required_signals(source_condition(t['guard'])) for t in launches):
                     continue
                 completion = {p for p in results[wait].intersection(reads)
                               if p != request and p.rpartition('.')[0] == port}
-                if not completion or not _requires_result(source_condition(guard), completion):
+                if not completion or not _requires_result(guard, completion):
                     continue
                 # The result stage has exactly one successor, regardless of response code.
                 after = {dst for src, dst in edges if src == wait}
@@ -189,13 +213,83 @@ def _data_use(row):
     return None
 
 
-def protect_channels(inventory, roles, required=()):
+def _inactive(row):
+    state = row.get('activation', {})
+    if state.get('reset_lines') and not state['open_lines'] and not state['entries']:
+        return {'kind':'inactive_from_initial', 'initial':state['initial'], 'reset_lines':state['reset_lines'],
+                'reason':f"私有整数从声明初值 {state['initial']} 出发，全部可执行写入均不能离开该值。"
+                         + '同值写入位于 XML 行 ' + '、'.join(str(line) for line in state['reset_lines'])}
+
+
+def _parent_entries(row):
+    """Return the exact parent writes that account for every visible launch."""
+    act = row.get('activation', {})
+    if act.get('open_lines') or not act.get('entries'):
+        return []
+    starts = [s for s in row['control_links'] if s['kind']=='starts_child' and s['child'].casefold()==row['identity']]
+    parents = []
+    for entry in act['entries']:
+        links = [s for s in starts if s['child_value'] == entry['value'] and s['guard'] == entry['guard']
+                 and s.get('source_line') == entry['section_line'] and s.get('offset') == entry['offset']]
+        if not links:
+            return []
+        parents.extend(links)
+    return parents
+
+
+def _parent_context(row, rows, execution):
+    launches = _parent_entries(row)
+    missing, modes = set(), []
+    for link in launches:
+        value = link['parent_step']
+        parent = rows.get(link['parent'].casefold())
+        if parent is None:
+            missing.add(f"{link['parent']}={value}")
+            continue
+        incoming = [s for s in parent['transitions'] if s['to']==value]
+        if value==parent.get('activation',{}).get('initial',0) or any(s['value']==value for s in parent.get('entry_writes',())):
+            return None, []
+        if not incoming:
+            missing.add(f"{link['parent']}={value}")
+            continue
+        signals = set.intersection(*(required_signals(source_condition(s['guard'])) for s in incoming))
+        for signal,positive in sorted(signals):
+            if positive and execution:
+                for decl in execution.declarations(signal):
+                    if decl['path'].casefold()==signal and decl.get('text'):
+                        modes.append({'channel':parent['name'],'step':value,'guard':signal,'declaration':decl['text'],
+                                      'declaration_line':decl['line'],'incoming':[s['id'] for s in incoming]})
+    reason = '启动依赖父步 ' + '、'.join(sorted(missing)) + '，其写入来源尚未定位' if missing else None
+    return reason, modes
+
+
+def protect_channels(inventory, roles, required=(), *, execution=None):
     """Apply source obligations after review. Only positive production parents can cover a child."""
     rows = {r['identity']: r for r in inventory['candidates']}
+    required = set(required)
+    for decision in roles:
+        key=decision['name'].casefold()
+        row=rows[key]
+        if proof := _inactive(row):
+            if key in required:
+                decision.update(admission='retained', activation_conflict=proof,
+                                retention_reason='独立核验要求采集，源码中未定位离开初值的写入')
+            else:
+                decision.update(admission='optional', exclusion_evidence=proof)
+        elif decision['admission']=='captured':
+            reason, modes = _parent_context(row,rows,execution)
+            if reason:
+                decision.update(admission='retained',retention_reason=reason)
+            if modes:
+                decision['parent_entry_conditions']=modes
     positive = [rows[d['name'].casefold()] for d in roles if d['admission'] == 'captured']
     jobs = _job_ports(positive)
+    request_writers = defaultdict(set)
+    for row in rows.values():
+        for effect in row.get('effects', ()):
+            if effect.get('global_target') and str(effect.get('value')).upper() == 'TRUE':
+                request_writers[effect['global_target']].add(row['identity'])
     obligations = source_obligations(inventory)
-    required = set(required)
     by_name = {d['name'].casefold(): d for d in roles}
     for key, row in rows.items():
         decision = by_name.get(key)
@@ -222,17 +316,25 @@ def protect_channels(inventory, roles, required=()):
                         'admission': 'review', 'basis': [row['transitions'][0]['id']],
                         'reason': '单向写入尚未核实用途，可按本实例写点复核'}
             roles.append(decision)
-        if not decision or decision['admission'] == 'captured' or key not in obligations:
+        if not decision or decision['admission'] in ('captured','retained') or decision.get('exclusion_evidence') or key not in obligations:
             continue
         # An independent reference takes precedence over every discretionary exclusion.
         proof = None
         if key not in required:
             if decision.get('use') == 'detail':
                 proof = _covered_transaction(row, jobs)
+                observations = _job_observations(row, jobs)
+                if observations:
+                    decision['parent_timing']=observations
             elif decision.get('use') == 'service':
                 # A statically gated service can be verified against the source-mode
                 # declaration. Unguarded jobs with observable I/O keep their channel.
                 proof = row.get('service_isolation')
+                review = decision.get('service_evidence') or {}
+                another_request = any(request_writers[p] - {key} for p in row.get('request_inputs', ()))
+                if (not proof and execution and (review.get('kind') == 'mode' or
+                        decision['role'] == 'auxiliary_sequence' and not another_request)):
+                    proof = execution.cited_service(row,review)
             elif decision['role'] == 'non_sequence':
                 if data_reason := _data_use(row):
                     proof = {'reason': data_reason}
@@ -241,3 +343,6 @@ def protect_channels(inventory, roles, required=()):
         else:
             decision['admission'] = 'retained'
             decision['retention_reason'] = obligations[key]
+            if decision.get('parent_timing'):
+                parents = sorted({e['channel'] for e in decision['parent_timing']})
+                decision['retention_reason'] += '。' + '、'.join(parents) + '发出请求并读取结果，保留本实例以区分独立完成或复位时间'

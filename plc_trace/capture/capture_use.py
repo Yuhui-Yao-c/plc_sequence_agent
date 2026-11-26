@@ -128,8 +128,13 @@ def capture_lists(inventory, decisions, slots):
             basis = set(decision.get('basis', ()))
             t = (next((t for t in row['transitions'] if t['id'] in basis), row['transitions'][0])
                  if row['transitions'] else row['dispatch_writes'][0]['write'])
-            optional.append((row['name'], USES[decision.get('use', 'unresolved')], row['type'] or '',
-                             t['scope'], t['source_line'], decision.get('reason', '待核对本实例的生产动作边界'), ''))
+            proof = decision.get('exclusion_evidence') or {}
+            inactive = proof.get('kind') == 'inactive_from_initial'
+            reason = proof.get('reason') or decision.get('reason', '待核对本实例的生产动作边界')
+            if 'purpose' in proof and 'operation' in proof:
+                reason += f" 用途见 XML 行 {proof['purpose']['line']}，执行指令见行 {proof['operation']['line']}。"
+            optional.append((row['name'], '未定位可执行入口' if inactive else USES[decision.get('use', 'unresolved')],
+                             row['type'] or '', t['scope'], t['source_line'], reason, ''))
     return primary, optional
 
 
@@ -172,7 +177,11 @@ def capture_context(primary, decisions):
         references = {s['id']: s for field in ('effects', 'declarations', 'control_links') for s in row[field]}
         for boundary in decision['boundaries']:
             site = by_id[boundary['write']]
+            source = _support_text(boundary['via'], site, references)
+            for entry in decision.get('parent_entry_conditions', ()):
+                source += (f"。父步 {entry['channel']}={entry['step']} 的可见入口含 {entry['guard']}"
+                           f"（{entry['declaration']}，XML 行 {entry['declaration_line']}）")
             yield (row['name'], boundary['action'], site['scope'], site.get('operating_guard', ''),
                    site['from'], site['to'], site.get('guard', ''), site.get('guard_complete', False),
                    site['source_line'], site.get('st_line', ''), site['id'], boundary['via'],
-                   _support_text(boundary['via'], site, references))
+                   source)

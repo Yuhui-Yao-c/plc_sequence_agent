@@ -142,8 +142,8 @@ def read_reference(path, candidates):
     return names, types, unresolved
 
 
-def referenced_channels(scan, discovery, missing):
-    """Recover a verified step that appears in this export without a recognized state write."""
+def referenced_channels(scan, discovery, missing, inventory):
+    """Recover independently requested channels from a concrete reference or an exact declared array."""
     found = {}
     if not missing:
         return found
@@ -163,6 +163,25 @@ def referenced_channels(scan, discovery, missing):
             row = discovery.candidates[key]
             if row.declared and not row.reasons - {'reference_only', 'no_constrained_state_change'}:
                 found[key] = {'name': row.name, 'source_line': discovery.reference_sites[key]['source_line']}
+    # A reference list can include an idle element never spelled out in the program.
+    # Anchor it to a witnessed step of this exact array instance and to its declared bounds.
+    arrays = defaultdict(set)
+    for row in inventory['candidates']:
+        if not row['sequence_witness'] or row['type'] not in INTEGER_TYPES:
+            continue
+        element = re.fullmatch(r'(.+)\[-?\d+\]', row['name'])
+        if element:
+            for decl in row['declarations']:
+                if decl['path'].casefold() == row['identity'] and decl.get('array_bounds'):
+                    arrays[element[1].casefold()].add((element[1], *decl['array_bounds'], row['type'], decl['line']))
+    for key in sorted(missing - found.keys()):
+        slot = re.fullmatch(r'(.+)\[(-?\d+)\]', key)
+        if not slot or len(arrays[slot[1]]) != 1:
+            continue
+        base, lower, upper, kind, line = next(iter(arrays[slot[1]]))
+        if lower <= int(slot[2]) <= upper:
+            found[key] = {'name': f'{base}[{slot[2]}]', 'source_line': line, 'type': kind, 'type_source': '声明',
+                          'evidence': f'独立清单指定本下标，同一实例 {base} 有执行步，声明范围 [{lower}, {upper}]'}
     return found
 
 

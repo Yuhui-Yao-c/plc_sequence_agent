@@ -64,7 +64,7 @@ _IEC_SCALARS = INTEGER_TYPES | REAL_TYPES | {
 }
 
 
-def _executable_text(text, *, keep_positions=False):
+def _executable_text(text, *, keep_positions=False, keep_strings=False):
     """Keep tokens separated when removing PLC comments and string literals."""
     position = 0
     while match := _IGNORED.search(text, position):
@@ -79,8 +79,10 @@ def _executable_text(text, *, keep_positions=False):
                     break
             else:
                 return
-        if keep_positions:
-            yield " " * (position - match.start())
+        if keep_strings and match[0][0] in ('"', "'"):
+            yield match[0]
+        elif keep_positions:
+            yield re.sub(r'[^\r\n]', ' ', text[match.start():position])
     yield text[position:]
 
 
@@ -228,6 +230,9 @@ class _SourceScan:
         self.type_spellings = {}
         self.members = defaultdict(set)
         self.declaration_sites = {}
+        self.private_storage = set()
+        self.default_instances = set()
+        self.wired_operands = defaultdict(set)
         self.aliases = defaultdict(set)
         self.programs = {}
         self.header = ''
@@ -288,6 +293,15 @@ class _SourceScan:
                     frames.append(_Frame(tag, unit, parent.body or tag in {'body', 'bodycontent'},
                                          parent.comment or tag in _XML_COMMENTS,
                                          name if tag == 'datatypedecl' else parent.type_name))
+                    if (self.matcher is None and unit and tag == 'variable' and parent.tag in ('vars','localvars')
+                            and node.getparent().get('accessSpecifier','').lower() == 'private'):
+                        self.private_storage.add((unit[1].casefold(), name.casefold()))
+                    if self.matcher is None and unit and not parent.body:
+                        if (tag == 'variable' and parent.tag in ('vars', 'localvars') and
+                                set(node.attrib) == {'name'} and set(node.getparent().attrib) <= {'accessSpecifier'}):
+                            self.default_instances.add((unit[1].casefold(), name.casefold()))
+                        elif parent.tag == 'variable' and tag not in ('type', 'documentation'):
+                            self.default_instances.discard((unit[1].casefold(), node.getparent().get('name', '').casefold()))
                     if (self.matcher is None and self.source_format == 'omron_iec61131_10'
                             and declaration_node is None and not parent.body and name):
                         if tag == 'member' and parent.type_name:
@@ -327,6 +341,9 @@ class _SourceScan:
                     for attribute, value in node.attrib.items():
                         if _local_name(attribute) in _EXPRESSION_ATTRIBUTES:
                             self._read(value, frame.unit, node.sourceline)
+                        elif self.matcher is None and frame.unit and _local_name(attribute) == 'operand':
+                            self.wired_operands[frame.unit[1].casefold()].update(
+                                name.casefold() for _, name, _, _, _ in _channels(value))
                 if parent.body and not parent.comment:
                     self._read(node.tail, parent.unit, node.sourceline)
                 if routines:
@@ -696,14 +713,21 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 discovered.issues['reason'] = 'no_static_executable_references'
             discovered.add_unproven_siblings(scan)
             inventory = discovered.inventory(digest, source_format)
+            from plc_trace.capture.activation import ExecutionEvidence
+            decisions = json.loads(scope_bytes) if scope_bytes is not None else None
+            execution = ExecutionEvidence(source, inventory, scan, decisions)
+            activation = {r['identity']: r['activation'] for r in inventory['candidates'] if 'activation' in r}
+            evidence_sha = hashlib.sha256(json.dumps(activation, sort_keys=True).encode()).hexdigest()
+            inventory['activation_sha256'] = evidence_sha
+            if isinstance(decisions, dict) and decisions.get('activation_sha256', evidence_sha) != evidence_sha:
+                raise ValueError('启动依据与本次工程重算结果不同，请按本轮证据复核')
             if pending and (pending.get('inventory_sha256') != inventory['inventory_sha256']
                             or pending.get('capture_format') != capture_format):
                 raise ValueError('重算的候选证据或采集格式与待复核目录不同，请重新准备')
-            decisions = json.loads(scope_bytes) if scope_bytes is not None else None
             if scope_results is not None and decisions is None:
                 raise ValueError('用途判断 JSON 为空')
             required, types, reference_gaps = read_reference(reference, inventory['candidates']) if reference else ({}, {}, [])
-            sequences, roles = scope_selection(inventory, decisions, required)
+            sequences, roles = scope_selection(inventory, decisions, required, execution=execution)
             inventory['decisions'] = roles
             families = decisions.get('station_families', []) if decisions is not None else []
             inventory['station_families'] = families
@@ -733,7 +757,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                     channels[key].update(type=record['type'], type_source='声明' if record['type'] else '')
                 if record['type_issue']:
                     unresolved[name] = record['type_issue']
-            recovered = referenced_channels(scan, discovered, required.keys() - channels.keys())
+            recovered = referenced_channels(scan, discovered, required.keys() - channels.keys(), inventory)
             channels.update(recovered)
             for key, channel in channels.items():
                 name = channel['name']
@@ -828,6 +852,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                           confirmed_production_variables=sum(d['admission'] == 'captured' for d in roles),
                           scope_candidates=eligible, single_write_candidates=single_writes, distributed_write_candidates=distributed,
                           inventory_sha256=inventory['inventory_sha256'],
+                          activation_sha256=evidence_sha,
                           scope_policy=inventory['scope_policy'], station_family_count=len(families),
                           scope_excluded=sum(r['admission'] == 'excluded' for r in roles),
                           scope_uncertain=sum(r['admission'] == 'review' for r in roles))
@@ -865,7 +890,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 ('步序变量', '生产动作或等待', '所属例程', '外层执行条件', '写前步值', '写后步值', '写入条件',
                  '写入条件解析完整', 'XML证据段行', '段内ST行', '写点引用', '动作佐证', '佐证内容'),
                 [*capture_context(chosen, roles), *((c['name'], '独立核验，写步待核', '', '', '', '', '', '',
-                    c['source_line'], '', '', 'reference', '独立清单确认且源码有该具体地址的引用')
+                    c['source_line'], '', '', 'reference', c.get('evidence', '独立清单确认且源码有该具体地址的引用'))
                     for c in report['coverage']['reference_recovered'])])
             files['optional_variables.csv'] = _csv_bytes(
                 ('步序变量', '用途', '声明类型', '所属例程', 'XML证据段行', '原因', '同数组执行步'),
@@ -874,7 +899,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                                                        for r in scope_index(inventory)).encode('utf-8')
             if decisions is not None:
                 files['scope_results.json'] = json.dumps({'inventory_sha256': inventory['inventory_sha256'],
-                    'station_families': families, 'decisions': roles}, ensure_ascii=False, indent=1).encode('utf-8')
+                    'activation_sha256': evidence_sha, 'station_families': families, 'decisions': roles},
+                    ensure_ascii=False, indent=1).encode('utf-8')
             files['step_variable_discovery.json'] = json.dumps(inventory, ensure_ascii=False, indent=1).encode('utf-8')
         if fingerprint(source) != digest:
             raise ValueError('发现期间源码发生变化，请重新执行')

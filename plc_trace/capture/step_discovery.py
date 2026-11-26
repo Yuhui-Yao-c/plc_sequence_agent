@@ -293,7 +293,7 @@ def _station_evidence(candidate, row, citations):
         raise ValueError(f'工位归属缺独立佐证，请补充本例程证据或标为待核：{candidate["name"]}')
 
 
-def scope_selection(inventory, decisions, required_channels=()):
+def scope_selection(inventory, decisions, required_channels=(), *, execution=None):
     """Separate source evidence of progression from the channel's role in the machine."""
     eligible = {r['identity']: r for r in inventory['candidates'] if r['eligibility'] in {'scope_required', 'single_write'}}
     required = {key for key, row in eligible.items() if row['eligibility'] == 'scope_required'}
@@ -375,6 +375,10 @@ def scope_selection(inventory, decisions, required_channels=()):
             item['admission'] = 'excluded'
         else:
             item.update(timing_use(candidate, row, key in selected))
+        if row.get('service_evidence') is not None:
+            if not isinstance(row['service_evidence'], dict) or item.get('use') != 'service':
+                raise ValueError(f'服务依据须属于该实例的服务用途判断：{key}')
+            item['service_evidence'] = row['service_evidence']
         if row.get('dedicated_step_array'):
             declarations = [s for s in candidate['declarations'] if s.get('array_bounds') and s.get('text')
                             and s['path'].casefold() == key and s['id'] in citations]
@@ -398,7 +402,7 @@ def scope_selection(inventory, decisions, required_channels=()):
     for key, parents in dependent_writes(selected).items():
         reviewed[key]['gated_by'] = parents
     roles = list(reviewed.values())
-    protect_channels(inventory, roles, required_channels)
+    protect_channels(inventory, roles, required_channels, execution=execution)
     for decision in roles:
         key = decision['name'].casefold()
         if decision['admission'] == 'retained' and key in eligible:
@@ -476,7 +480,8 @@ def scope_index(inventory):
                     examples.append(brief)
         yield {'name': row['name'], 'family': row['family'], 'eligibility': row['eligibility'], 'declarations': row['declarations'],
                'type_issue': row['type_issue'], 'sequence_witness': row['sequence_witness'],
-               'scheduled_writers': row.get('scheduled_writers', {}), 'evidence': examples}
+               'scheduled_writers': row.get('scheduled_writers', {}), 'evidence': examples,
+               **({'activation': row['activation']} if 'activation' in row else {})}
 
 
 def discover_source_writes(source, dialect, on_transition, on_unresolved=None, on_entry=None):
