@@ -21,8 +21,23 @@ class SetupDeliveryOrderTests(unittest.TestCase):
                         for n in cursors)
         self.source.write_text(sysmac(declarations, [('Cell', body)]))
 
+    def assert_delivery(self, status, stage, names, configuration, gaps=False):
+        targets = self.out / 'static_variables.txt'
+        self.assertEqual(Path(status['trace_targets']), targets)
+        self.assertEqual(status['trace_targets_stage'], stage)
+        self.assertEqual((status['static_variables'], status['trace_target_count']), (len(names), len(names)))
+        self.assertCountEqual(targets.read_text(encoding='utf-8').splitlines(), names)
+        expected = {'evidence', 'workflow_status.json', targets.name}
+        if configuration:
+            expected.add(Path(configuration).name)
+        if gaps:
+            expected.add('missing_member_types.csv')
+        self.assertEqual({entry.name for entry in self.out.iterdir()}, expected)
+        self.assertEqual(status['discovery'], 'evidence/step_variable_discovery.json')
+        self.assertTrue((self.out / status['discovery']).is_file())
+
     def review(self, production_names):
-        inventory = json.loads((self.out / 'step_variable_discovery.json').read_bytes())
+        inventory = json.loads((self.out / 'evidence/step_variable_discovery.json').read_bytes())
         review = neutral(inventory)
         for decision in review['decisions']:
             if decision['name'] in production_names:
@@ -43,6 +58,8 @@ class SetupDeliveryOrderTests(unittest.TestCase):
         self.assertFalse((self.out / 'missing_member_types.csv').exists())
         self.assertEqual(set(first['preview_unresolved_types']), {'Arm.Phase', 'Monitor.Stage'})
         self.assertEqual(first['preview_configured_variables'], 1)
+        self.assert_delivery(first, 'preview', ['Feed', 'Arm.Phase', 'Monitor.Stage'], first['preview_configuration'])
+        self.assertEqual(first['channels'], [])
 
         final = self.review({'Feed', 'Arm.Phase'})
         self.assertEqual(final['next_action'], 'deliver_results')
@@ -50,11 +67,12 @@ class SetupDeliveryOrderTests(unittest.TestCase):
         self.assertEqual(Path(final['trace_targets']).name, 'static_variables.txt')
         self.assertEqual(set(Path(final['trace_targets']).read_text().splitlines()), {'Arm.Phase', 'Feed'})
         self.assertEqual(set(final['unresolved_types']), {'Arm.Phase'})
+        self.assert_delivery(final, 'final', ['Feed', 'Arm.Phase'], final['configuration'], gaps=True)
         with Path(final['member_type_template']).open(encoding='utf-8-sig') as f:
             rows = list(csv.DictReader(f))
         self.assertEqual([(r['结构类型'], r['成员'], r['地址数']) for r in rows], [('ExternalJob', 'Phase', '1')])
         selection = (self.out / 'static_variables.txt').read_bytes()
-        review = (self.out / 'scope_results.json').read_bytes()
+        review = (self.out / 'evidence/scope_results.json').read_bytes()
 
         supplement = self.root / 'member_types.csv'
         supplement.write_text('结构类型,成员,数据类型\nExternalJob,Phase,UINT\n')
@@ -62,8 +80,9 @@ class SetupDeliveryOrderTests(unittest.TestCase):
         self.assertEqual(complete['next_action'], 'deliver_results')
         self.assertTrue(complete['configuration_complete'])
         self.assertEqual(complete['configured_variables'], 2)
+        self.assert_delivery(complete, 'final', ['Feed', 'Arm.Phase'], complete['configuration'])
         self.assertEqual((self.out / 'static_variables.txt').read_bytes(), selection)
-        self.assertEqual((self.out / 'scope_results.json').read_bytes(), review)
+        self.assertEqual((self.out / 'evidence/scope_results.json').read_bytes(), review)
         self.assertFalse(Path(final['configuration']).exists())
         self.assertFalse((self.out / 'missing_member_types.csv').exists())
 
@@ -78,5 +97,5 @@ class SetupDeliveryOrderTests(unittest.TestCase):
         self.assertEqual((final['static_variables'], final['configured_variables']), (1, 0))
         self.assertEqual(Path(final['trace_targets']).read_text().splitlines(), ['Arm.Cursor'])
         self.assertTrue(Path(final['member_type_template']).is_file())
-        with (self.out / 'capture_context.csv').open(encoding='utf-8-sig') as f:
+        with (self.out / 'evidence/capture_context.csv').open(encoding='utf-8-sig') as f:
             self.assertEqual([r['步序变量'] for r in csv.DictReader(f)], ['Arm.Cursor'])

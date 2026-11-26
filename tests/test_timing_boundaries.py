@@ -89,11 +89,11 @@ class TimingBoundaryTests(unittest.TestCase):
             result = generate(xml, out, scope_results=plan)
             self.assertEqual([r['name'] for r in result['channels']], ['Press'])
             self.assertFalse(result['coverage_complete'])
-            with (out / 'optional_variables.csv').open(encoding='utf-8-sig', newline='') as stream:
+            with (out / 'evidence/optional_variables.csv').open(encoding='utf-8-sig', newline='') as stream:
                 options = list(csv.DictReader(stream))
             self.assertEqual([r['步序变量'] for r in options], ['SensorExchange'])
             self.assertIn('独立计时依据', options[0]['原因'])
-            reviewed = out / 'scope_results.json'
+            reviewed = out / 'evidence/scope_results.json'
             published = json.loads(reviewed.read_bytes())
             unresolved = next(d for d in published['decisions'] if d['name'] == 'SensorExchange')
             self.assertEqual(unresolved['legacy_boundaries'], claims[1]['boundaries'])

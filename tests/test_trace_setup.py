@@ -153,7 +153,8 @@ class TraceSetupTests(unittest.TestCase):
         self.assertIsNone(report['configuration'])
         self.assertEqual(set(report['unresolved_types']), {'Flags', 'States[3]', 'Unknown'})
         self.assertEqual({p.name for p in self.out.iterdir()}, {'static_variables.txt', 'workflow_status.json',
-                                                               'unresolved_types.csv'})
+                                                               'evidence'})
+        self.assertEqual([p.name for p in (self.out / 'evidence').iterdir()], ['unresolved_types.csv'])
         self.assertEqual(set(Path(report['trace_targets']).read_text().splitlines()), {'Flags', 'States[3]', 'Unknown'})
         rebuilt = generate(self.source, self.out, 'Unknown', default_type='DINT', force=True)
         self.assertEqual(rebuilt['status'], 'done')
@@ -189,7 +190,7 @@ class TraceSetupTests(unittest.TestCase):
         args = {'reference': ref, 'choose_available': True}
         first = generate(self.source, self.out, **args)
         self.assertEqual(first['status'], 'scope_review_pending')
-        inventory = json.loads((self.out / 'step_variable_discovery.json').read_bytes())
+        inventory = json.loads((self.out / 'evidence/step_variable_discovery.json').read_bytes())
         scope = self.root / 'scope.json'
         scope.write_text(json.dumps({'inventory_sha256': inventory['inventory_sha256'], 'decisions': [
             {'name': r['name'], 'role': 'uncertain', 'reason': '独立地址可核对', 'basis': ['t1']}
@@ -244,7 +245,7 @@ class TraceSetupTests(unittest.TestCase):
             + ' '.join(f'CASE {n} OF 2: IF Ready THEN {n}:=8; END_IF; 8: {n}:=2; END_CASE;' for n in names)
             + '</ST></BodyContent></Program>')
         generate(self.source, self.out)
-        inventory = json.loads((self.out / 'step_variable_discovery.json').read_bytes())
+        inventory = json.loads((self.out / 'evidence/step_variable_discovery.json').read_bytes())
         old = []
         for n in names:
             old.append({'name': n, 'role': 'component_sequence', 'basis': ['t1'], 'reason': '机械动作',

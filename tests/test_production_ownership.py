@@ -41,7 +41,7 @@ class ProductionOwnershipTests(unittest.TestCase):
         xml = root / 'fixture.xml'
         xml.write_text(project('<GlobalVars>' + ''.join(globals_) + '</GlobalVars>', fb, program))
         generate(xml, root / 'run')
-        data = json.loads((root / 'run/step_variable_discovery.json').read_bytes())
+        data = json.loads((root / 'run/evidence/step_variable_discovery.json').read_bytes())
         return {r['identity']: r for r in data['candidates']}
 
     @staticmethod

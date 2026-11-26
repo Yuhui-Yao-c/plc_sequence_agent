@@ -23,7 +23,7 @@ class CoordinationScopeTests(unittest.TestCase):
             source.write_text(project('<GlobalVars>' + fields + '</GlobalVars>', '<Program name="Packing">' +
                                       ''.join(section('Logic' + str(i), c, i) for i, c in enumerate(bodies)) + '</Program>'))
             generate(source, root / 'out')
-            report = json.loads((root / 'out/step_variable_discovery.json').read_bytes())
+            report = json.loads((root / 'out/evidence/step_variable_discovery.json').read_bytes())
             return {row['identity']: row for row in report['candidates']}
 
     def test_parent_must_start_independently_recurring_children_then_park(self):

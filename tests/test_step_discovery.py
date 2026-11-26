@@ -35,7 +35,7 @@ class StepDiscoveryTests(unittest.TestCase):
     def prepare(self, xml):
         self.source.write_text(xml, encoding='utf-8')
         result = generate(self.source, self.out)
-        return result, json.loads((self.out / 'step_variable_discovery.json').read_text(encoding='utf-8'))
+        return result, json.loads((self.out / 'evidence/step_variable_discovery.json').read_text(encoding='utf-8'))
 
     @staticmethod
     def scope(inventory, names):
@@ -88,13 +88,15 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertEqual(initial['preview_configured_variables'], 1)
         self.assertEqual(Path(initial['trace_targets']).read_text().splitlines(), ['Cursor'])
         self.assertIn('Cursor:INT', preview.read_text(encoding='utf-8-sig'))
-        scope = self.out / 'scope_results.json'
+        scope = self.out / 'evidence/scope_review_input.json'
         scope.write_text(json.dumps(self.scope(inventory, {'Cursor'})))
         note = self.out / '现场笔记.txt'
         note.write_text('现场补充', encoding='utf-8')
-        original = {f.name: f.read_bytes() for f in self.out.iterdir()}
+        def snapshot():
+            return {f.relative_to(self.out): f.read_bytes() for f in self.out.rglob('*') if f.is_file()}
+        original = snapshot()
         self.assertEqual(generate(self.source, self.out), initial)
-        self.assertEqual(scope.read_bytes(), original[scope.name])
+        self.assertEqual(scope.read_bytes(), original[scope.relative_to(self.out)])
 
         replace = Path.replace
         def simulate_locked_status(source, destination):
@@ -103,17 +105,18 @@ class StepDiscoveryTests(unittest.TestCase):
             return replace(source, destination)
         with patch.object(Path, 'replace', simulate_locked_status), self.assertRaisesRegex(PermissionError, 'locked status'):
             generate(self.source, self.out, scope_results=scope)
-        self.assertEqual({f.name: f.read_bytes() for f in self.out.iterdir()}, original)
+        self.assertEqual(snapshot(), original)
         self.assertEqual(set(self.root.iterdir()), {self.source, self.out})
 
         final = generate(self.source, self.out, scope_results=scope)
         self.assertFalse(preview.exists())
-        self.assertFalse(Path(initial['trace_targets']).exists())
+        self.assertEqual(initial['trace_targets'], final['trace_targets'])
         self.assertEqual(Path(final['trace_targets']).read_text().splitlines(), ['Cursor'])
         self.assertEqual(final['static_variables'], 1)
         self.assertEqual(generate(self.source, self.out, scope_results=scope), final)
         self.assertEqual(generate(self.source, self.out), final)
-        self.assertEqual(note.read_bytes(), original[note.name])
+        self.assertEqual(note.read_bytes(), original[note.relative_to(self.out)])
+        self.assertEqual(scope.read_bytes(), original[scope.relative_to(self.out)])
         self.assertEqual(set(self.root.iterdir()), {self.source, self.out})
         Path(final['configuration']).write_bytes(b'edited')
         with self.assertRaisesRegex(ValueError, '缺失或已修改'):
@@ -137,7 +140,7 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertTrue(all(e['target'] == 'Valve' for e in rows['Left.K']['effects']))
         self.assertEqual(self.finish(inv, {'Left.K'})['channels'][0]['name'], 'Left.K')
         self.assertTrue(list(self.out.glob('*.trace')))
-        self.assertEqual(json.loads((self.out/'scope_results.json').read_bytes())['inventory_sha256'],
+        self.assertEqual(json.loads((self.out/'evidence/scope_results.json').read_bytes())['inventory_sha256'],
                          inv['inventory_sha256'])
 
     def test_legacy_pending_status_requires_the_same_recomputed_evidence(self):
@@ -149,11 +152,20 @@ class StepDiscoveryTests(unittest.TestCase):
                                          + '<resource><task name="Clock"><pouInstance name="Line"/></task></resource></project>')
         marker = self.out / 'workflow_status.json'
         legacy = {k:v for k,v in status.items() if k not in {'request_sha256', 'artifact_sha256', 'trace_targets',
-                  'trace_target_count', 'preview_configuration', 'preview_configured_variables', 'preview_unresolved_types'}}
+                  'trace_targets_stage', 'trace_target_count', 'preview_configuration', 'preview_configured_variables',
+                  'preview_unresolved_types', 'next_action'}}
         legacy['version'] = '14.0.0'
-        for later_file in ('optional_variables.csv', 'capture_context.csv', Path(status['trace_targets']).name,
-                           Path(status['preview_configuration']).name):
-            (self.out / later_file).unlink()  # Absent in the earlier pending fixture.
+        legacy['static_variables'] = 0
+        legacy['discovery'] = 'step_variable_discovery.json'
+        audit = self.out / 'evidence'
+        for artifact in audit.iterdir():
+            if artifact.name in ('optional_variables.csv', 'capture_context.csv'):
+                artifact.unlink()  # Absent in the earlier pending fixture.
+            else:
+                artifact.rename(self.out / artifact.name)
+        audit.rmdir()
+        (self.out / 'static_variables.txt').write_bytes(b'')
+        Path(status['preview_configuration']).unlink()
         marker.write_text(json.dumps(dict(legacy, inventory_sha256='different')))
         with self.assertRaisesRegex(ValueError, '候选证据'):
             self.finish(inventory, {'Line.K'})
@@ -376,7 +388,7 @@ class StepDiscoveryTests(unittest.TestCase):
         result = self.finish(inv, {'AxisX', 'Lane', 'Ticket'})
         self.assertEqual({c['name'] for c in result['channels']}, {'AxisX','Lane','Ticket'})
         self.assertEqual(result['scope_uncertain'], 0)
-        decision = json.loads((self.out/'scope_results.json').read_bytes())['decisions']
+        decision = json.loads((self.out/'evidence/scope_results.json').read_bytes())['decisions']
         self.assertEqual(next(r for r in decision if r['name']=='Ticket')['gated_by'], ['axisx'])
         self.assertEqual(result['status'], 'done')
         with Path(result['configuration']).open(encoding='utf-8-sig', newline='') as f:
@@ -423,7 +435,7 @@ class StepDiscoveryTests(unittest.TestCase):
         result = self.finish(inv, {'Head.Mark'})
         self.assertEqual({c['name'] for c in result['channels']}, {'Head.Mark'})
         self.assertEqual(result['retained_variables'], [])
-        self.assertIn('Drive.Mark', (self.out / 'optional_variables.csv').read_text(encoding='utf-8-sig'))
+        self.assertIn('Drive.Mark', (self.out / 'evidence/optional_variables.csv').read_text(encoding='utf-8-sig'))
 
     def test_registered_slot_in_own_unit_with_foreign_array_and_program(self):
         var = '<Variable name="{}"><Type><TypeName>ARRAY[0..5] OF INT</TypeName></Type></Variable>'
@@ -509,10 +521,10 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertTrue(config.name.endswith('_partial.csv'))
         with config.open(encoding='utf-8-sig', newline='') as f:
             self.assertEqual(next(r[5:] for r in csv.reader(f) if r[:1] == ['Index']), ['Pack:INT'])
-        with (self.out/'capture_context.csv').open(encoding='utf-8-sig', newline='') as f:
+        with (self.out/'evidence/capture_context.csv').open(encoding='utf-8-sig', newline='') as f:
             contexts = {(r['步序变量'],r['外层执行条件']) for r in csv.DictReader(f)}
         self.assertEqual(contexts, {('A.Position','A.Mode=4'), ('B.Position','B.Mode=4'), ('Pack','')})
-        with (self.out/'optional_variables.csv').open(encoding='utf-8-sig', newline='') as f:
+        with (self.out/'evidence/optional_variables.csv').open(encoding='utf-8-sig', newline='') as f:
             self.assertEqual([(r['步序变量'],r['用途']) for r in csv.DictReader(f)], [('Warm','设备服务')])
         self.assertEqual(generate(self.source, self.out), result)
 
@@ -542,7 +554,7 @@ class StepDiscoveryTests(unittest.TestCase):
         path.write_text(json.dumps(scope))
         result = generate(self.source, self.out, scope_results=path)
         self.assertEqual(result['configured_variables'], 1)
-        with (self.out/'capture_context.csv').open(encoding='utf-8-sig', newline='') as f:
+        with (self.out/'evidence/capture_context.csv').open(encoding='utf-8-sig', newline='') as f:
             boundary, = csv.DictReader(f)
         self.assertEqual((boundary['外层执行条件'], boundary['生产动作或等待']), ('Mode=3','移至取料位'))
         self.assertIn('AtPart', boundary['写入条件'])
@@ -569,7 +581,7 @@ class StepDiscoveryTests(unittest.TestCase):
         path.write_text(json.dumps(scope))
         result = generate(self.source,self.out,scope_results=path)
         self.assertEqual([r['name'] for r in result['channels']], ['P.Cell.Cursor'])
-        with (self.out/'optional_variables.csv').open(encoding='utf-8-sig',newline='') as f:
+        with (self.out/'evidence/optional_variables.csv').open(encoding='utf-8-sig',newline='') as f:
             self.assertEqual([r['步序变量'] for r in csv.DictReader(f)], ['P.Bench.Cursor'])
 
     def test_feedback_proof_uses_only_parsed_operands(self):
@@ -666,7 +678,7 @@ class StepDiscoveryTests(unittest.TestCase):
         first, inv = self.prepare('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'+array('A')+
                                   array('B')+'</GlobalVars><Program name="P"><BodyContent><ST>'+code+
                                   '</ST></BodyContent></Program></Project>')
-        self.assertEqual((first['static_variables'], first['sequence_variables']), (0,1))
+        self.assertEqual((first['static_variables'], first['sequence_variables']), (1,1))
         scope = self.scope(inv, {'A[0]'})
         scope['decisions'][0]['dedicated_step_array'] = True
         invalid = copy.deepcopy(scope)
@@ -678,7 +690,7 @@ class StepDiscoveryTests(unittest.TestCase):
         final = generate(self.source, self.out, scope_results=path)
         self.assertEqual((final['sequence_variables'],final['referenced_step_slots'],final['configured_variables']), (1,1,1))
         self.assertEqual({c['name'] for c in final['channels']}, {'A[0]'})
-        with (self.out/'optional_variables.csv').open(encoding='utf-8-sig', newline='') as f:
+        with (self.out/'evidence/optional_variables.csv').open(encoding='utf-8-sig', newline='') as f:
             self.assertEqual([(r['步序变量'],r['用途']) for r in csv.DictReader(f)], [('A[2]','仅固定引用')])
-        group, = json.loads((self.out/'step_variable_discovery.json').read_bytes())['step_arrays']
+        group, = json.loads((self.out/'evidence/step_variable_discovery.json').read_bytes())['step_arrays']
         self.assertEqual((group['array'],group['bounds'],group['referenced_slots']), ('A',[0,3],['A[2]']))

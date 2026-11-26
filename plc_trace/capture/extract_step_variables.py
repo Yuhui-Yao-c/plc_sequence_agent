@@ -31,8 +31,10 @@ from plc_trace.capture.plcopen_tasks import (
     ProgramWrites, Routine, is_task_declaration, sampling_task, task_declaration, validated_task_name,
 )
 from plc_trace.capture.station_scope import at_path, declaration
+from plc_trace.capture.setup_migration import can_migrate_pending
 from plc_trace.capture.setup_output import (
-    SCOPE_ACTIONS, legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files, verify_scope_upgrade,
+    SCOPE_ACTIONS, artifact_name, legacy_pending, matches_request, publish, read_status, recorded_artifact,
+    select_run_dir, verify_files, verify_scope_upgrade,
 )
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
@@ -655,9 +657,14 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         'capture_format': capture_format, 'task_name': task_name, 'every_n_cycles': every_n_cycles,
         'default_type': default_type, 'reference_sha256': reference_sha,
     }, sort_keys=True).encode()).hexdigest()
+    def compatible_pending(status, path):
+        return can_migrate_pending(status, path, source=source, digest=digest, automatic=automatic,
+                                   capture_format=capture_format, task_name=task_name,
+                                   every_n_cycles=every_n_cycles, reference_sha=reference_sha)
+
     out = Path(out)
     if choose_available:
-        out = select_run_dir(out.parent.resolve() / out.name, request)
+        out = select_run_dir(out.parent.resolve() / out.name, request, compatible=compatible_pending)
     out = out.resolve()
     if (any(p and p.is_relative_to(out) for p in (source_input, source, reference, Path.cwd()))
             or (force and member_types and member_types.is_relative_to(out))
@@ -665,6 +672,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
     with lock_run_dir(out):
         pending = None
+        migrating = False
         upgrading_scope = None
         previous_scope_sha = None
         scope_bytes = Path(scope_results).read_bytes() if scope_results is not None else None
@@ -675,12 +683,15 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             status = read_status(out)
             if status.get('mode') != 'trace_setup':
                 raise ValueError('输出目录属于其他任务，请使用空目录')
-            if member_types and member_types.parent == out and member_types.name in status.get('artifact_sha256', {}):
+            hashes = status.get('artifact_sha256', {})
+            if (member_types and member_types.is_relative_to(out)
+                    and member_types.relative_to(out).as_posix() in hashes):
                 raise ValueError('请在单独的成员类型 CSV 副本中填写已核实的声明，保留工作流产物')
             if not force:
                 legacy = (not choose_available and scope_bytes is not None
                           and legacy_pending(status, source, out, digest, task_name, every_n_cycles))
-                if not matches_request(status, out, request) and not legacy:
+                migrating = compatible_pending(status, out)
+                if not matches_request(status, out, request) and not legacy and not migrating:
                     raise ValueError('源码、程序版本或采集选项与已有任务不同，请指定空目录或显式 --force 重建')
                 if not legacy:
                     verify_files(out, status)
@@ -693,20 +704,21 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                     verified_members[key] = declaration['type']
                     member_sources[key] = declaration['source_sha256']
                     new_keys.discard(key)
+                scope_key = recorded_artifact(status, 'scope_results.json')
                 submitted = scope_bytes is not None and hashlib.sha256(scope_bytes).hexdigest() not in (
-                    status.get('scope_input_sha256'), status.get('artifact_sha256', {}).get('scope_results.json'))
+                    status.get('scope_input_sha256'), hashes.get(scope_key))
                 completing_scope = submitted and status['status'] in SCOPE_ACTIONS
                 if submitted and not completing_scope:
                     if not status.get('legacy_timing_reviews'):
                         raise ValueError('已有任务已结束，范围判断与已提交结果不同，请核对后显式重建')
-                    upgrading_scope = json.loads((out / 'scope_results.json').read_bytes())
-                if not new_keys and not completing_scope and not upgrading_scope:
+                    upgrading_scope = json.loads((out / scope_key).read_bytes())
+                if not new_keys and not completing_scope and not upgrading_scope and not migrating:
                     return status
                 pending = status
-                if not completing_scope and not upgrading_scope and 'scope_results.json' in status.get('artifact_sha256', {}):
+                if not completing_scope and not upgrading_scope and scope_key in hashes:
                     previous_scope_sha = status.get('scope_input_sha256')
                     if scope_bytes is None:
-                        scope_bytes = (out / 'scope_results.json').read_bytes()
+                        scope_bytes = (out / scope_key).read_bytes()
         source_format = detect_source_format(source)
         before = source.stat()
         scan = _SourceScan(matcher, source_format, case_sensitive)
@@ -752,7 +764,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             if isinstance(decisions, dict) and decisions.get('activation_sha256', evidence_sha) != evidence_sha:
                 raise ValueError('启动依据与本次工程重算结果不同，请按本轮证据复核')
             if pending and (pending.get('inventory_sha256') != inventory['inventory_sha256']
-                            or pending.get('capture_format') != capture_format):
+                            or pending.get('capture_format') != capture_format
+                            or (migrating and pending.get('activation_sha256') != evidence_sha)):
                 raise ValueError('重算的候选证据或采集格式与待复核目录不同，请重新准备')
             if scope_results is not None and decisions is None:
                 raise ValueError('用途判断 JSON 为空')
@@ -844,8 +857,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             task = sampling_task(scan.tasks, scan.program_writes, channels, template.find('./TraceConfiguration'),
                                  task_name=task_name, every_n_cycles=every_n_cycles)
         preview = discovery_status in SCOPE_ACTIONS
-        targets = 'trace_targets_preview.txt' if preview else 'static_variables.txt'
-        files = {'static_variables.txt': b'', targets: ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
+        targets = 'static_variables.txt'
+        files = {targets: ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
         if unresolved:
             files['unresolved_types.csv'] = _csv_bytes(('变量', '类型问题'), sorted(unresolved.items()))
         member_template = None
@@ -865,6 +878,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             exported = verify_config(files[config], capture_format, configurable)
         delivery = {
             'trace_targets': str(out / targets), 'trace_target_count': len(ordered),
+            'trace_targets_stage': 'preview' if preview else 'final',
             'member_type_template': str(member_template) if member_template else None,
             'member_types_sha256': member_sha or (pending or {}).get('member_types_sha256'),
             'verified_member_types': [{'owner': owner, 'member': member, 'type': kind,
@@ -885,7 +899,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,
             'pattern': matcher.single_pattern if matcher else None,
             'patterns': matcher.patterns if matcher else [], 'capture_format': capture_format, **task,
-            'static_variables': len(final_channels), 'channels': [] if preview else ordered,
+            'static_variables': len(ordered), 'channels': [] if preview else ordered,
             'configuration_complete': not preview and bool(config) and exported == set(channels),
             'dynamic_variables': sorted(scan.dynamic.values(), key=_sort_key),
             'unresolved_types': {} if preview else unresolved, 'parse_issues': scan.parse_issues,
@@ -895,7 +909,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             admissions = Counter(d['admission'] for d in roles)
             source_confirmed = {d['name'].casefold() for d in roles if d['admission'] == 'captured'}
             reference_selected = final_channels.keys() & required.keys()
-            report.update(selection_mode='automatic', discovery='step_variable_discovery.json',
+            report.update(selection_mode='automatic', discovery=artifact_name('step_variable_discovery.json'),
                           sequence_variables=len(sequences), referenced_step_slots=len(slots), optional_variables=len(optional),
                           confirmed_production_variables=admissions['captured'],
                           legacy_timing_reviews=sum(bool(d.get('legacy_boundaries')) for d in roles),
@@ -915,7 +929,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             report['unproven_candidates'] = len(inventory['candidates']) - eligible - resolved_singles
             if rechecks:
                 review_file = 'scope_recheck.json'
-                report.update(scope_recheck=str(out / review_file), scope_recheck_count=len(rechecks),
+                report.update(scope_recheck=str(out / artifact_name(review_file)), scope_recheck_count=len(rechecks),
                               proposed_target_count=len(chosen) + len(recovered),
                               review_reason='未入选的地址仍有具体工步证据，请逐项复核并在本目录重交完整的用途判断')
                 files[review_file] = json.dumps({'inventory_sha256': inventory['inventory_sha256'],
@@ -929,7 +943,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             source_limits = {k: v for k,v in limits.items() if k != 'adapter_counts' and v}
             report['coverage'] = {
                 'reference_sha256': reference_sha, 'reference_variables': len(required),
-                'reference_missing_from_list': sorted(required[k] for k in required.keys() - final_channels.keys()),
+                'reference_missing_from_list': sorted(required[k] for k in required.keys() - channels.keys()),
                 'reference_missing_from_config': sorted(required[k] for k in required.keys() - final_exported),
                 'reference_recovered': [] if preview else list(recovered.values()),
                 'unresolved_reference_rows': reference_gaps,
@@ -967,6 +981,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         if member_types and fingerprint(member_types) != member_sha:
             raise ValueError('成员类型表在执行期间发生变化，请重新运行')
         report['request_sha256'] = request
+        files = {artifact_name(name): data for name, data in files.items()}
         report['artifact_sha256'] = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
         if scope_bytes is not None:
             report['scope_input_sha256'] = previous_scope_sha or hashlib.sha256(scope_bytes).hexdigest()

@@ -25,7 +25,7 @@ class ScopeRecheckRunTests(unittest.TestCase):
 
             first = run()
             self.assertEqual(first['status'], 'scope_review_pending')
-            inventory = json.loads((output / 'step_variable_discovery.json').read_bytes())
+            inventory = json.loads((output / 'evidence/step_variable_discovery.json').read_bytes())
             decisions = neutral(inventory)
             review.write_text(json.dumps(decisions))
 
@@ -36,7 +36,7 @@ class ScopeRecheckRunTests(unittest.TestCase):
                     {'name': row['name'], 'reason': '受控动作待核', 'write': 't1'}]
 
             with patch('plc_trace.capture.scope_recheck.scope_recheck', side_effect=countercheck):
-                foreign = output / 'scope_recheck.json'
+                foreign = output / 'evidence/scope_recheck.json'
                 foreign.write_text('现场补充说明')
                 with self.assertRaisesRegex(ValueError, '已有其他文件'):
                     run(scope_results=review)
@@ -53,7 +53,9 @@ class ScopeRecheckRunTests(unittest.TestCase):
                 self.assertFalse(pending['coverage_complete'])
                 self.assertIsNone(pending['configuration'])
                 self.assertEqual(pending['configured_variables'], 0)
-                self.assertEqual((output / 'static_variables.txt').read_text(), '')
+                self.assertEqual(pending['static_variables'], len(names))
+                self.assertEqual(pending['trace_targets_stage'], 'preview')
+                self.assertEqual(Path(pending['trace_targets']), output / 'static_variables.txt')
                 self.assertCountEqual(Path(pending['trace_targets']).read_text().splitlines(), names)
                 self.assertEqual(pending['preview_configured_variables'], 1)
                 self.assertEqual(list(pending['preview_unresolved_types']), ['Drive.Cursor'])
@@ -76,8 +78,9 @@ class ScopeRecheckRunTests(unittest.TestCase):
                 self.assertEqual((final['static_variables'], final['configured_variables']), (2, 1))
                 self.assertEqual(final['out'], first['out'])
                 self.assertFalse(queue.exists())
-                self.assertFalse(Path(pending['trace_targets']).exists())
+                self.assertEqual(pending['trace_targets'], final['trace_targets'])
+                self.assertEqual(final['trace_targets_stage'], 'final')
                 self.assertFalse(Path(pending['preview_configuration']).exists())
                 self.assertEqual(run(scope_results=review), final)
-                self.assertEqual(run(scope_results=output / 'scope_results.json'), final)
+                self.assertEqual(run(scope_results=output / 'evidence/scope_results.json'), final)
                 self.assertFalse((root / 'setup_2').exists())

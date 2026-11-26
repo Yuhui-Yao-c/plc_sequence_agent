@@ -42,7 +42,7 @@ class CoverageTests(unittest.TestCase):
         self.xml.write_text(xml)
         out = self.root/'run'
         generate(self.xml, out, **options)
-        return out, json.loads((out/'step_variable_discovery.json').read_bytes())
+        return out, json.loads((out/'evidence/step_variable_discovery.json').read_bytes())
 
     def merge(self, out, scope, **options):
         reviews = self.root/'roles.json'
@@ -57,7 +57,7 @@ class CoverageTests(unittest.TestCase):
         out, inv = self.prepare(sysmac(variables, [('Cell',body)]), reference=reference)
         first = json.loads((out/'workflow_status.json').read_bytes())
         self.assertEqual((first['static_variables'], first['trace_target_count'], first['preview_configured_variables']),
-                         (0, 4, 1))
+                         (4, 4, 1))
         self.assertEqual(set(Path(first['trace_targets']).read_text().splitlines()), set(names))
         self.assertIn('Known:INT', Path(first['preview_configuration']).read_text(encoding='utf-8-sig'))
         final = self.merge(out, neutral(inv), reference=reference)
@@ -70,7 +70,7 @@ class CoverageTests(unittest.TestCase):
                          [('Job','Phase','','2'),('Transfer','Phase','','1')])
         supplement = self.root/'verified.csv'
         supplement.write_text('结构类型,成员,数据类型\nJob,Phase,UINT\nTransfer,Phase,DINT\n')
-        complete = generate(self.xml,self.root/'completed',scope_results=out/'scope_results.json',member_types=supplement,reference=reference)
+        complete = generate(self.xml,self.root/'completed',scope_results=out/'evidence/scope_results.json',member_types=supplement,reference=reference)
         self.assertTrue(complete['configuration_complete'])
         self.assertIsNone(complete['member_type_template'])
         self.assertEqual({r['name']:r['type'] for r in complete['channels']},
@@ -89,7 +89,7 @@ class CoverageTests(unittest.TestCase):
                          {'Left.Stage':'UINT','Right.Stage':'UINT','Other.Stage':None,'Left.Index[1]':None})
         reference.write_text('变量,类型\nLeft.Stage,UINT\nRight.Stage,DINT\n')
         with self.assertRaisesRegex(ValueError,'冲突'):
-            generate(self.xml,self.root/'conflict',scope_results=out/'scope_results.json',reference=reference)
+            generate(self.xml,self.root/'conflict',scope_results=out/'evidence/scope_results.json',reference=reference)
         self.assertFalse((self.root/'conflict/workflow_status.json').exists())
 
     def test_explicit_pattern_exports_known_subset_and_rejects_a_conflicting_real_declaration(self):
@@ -140,7 +140,7 @@ class CoverageTests(unittest.TestCase):
             self.xml.write_text(xml)
             folder = self.root/owner
             generate(self.xml,folder)
-            inv=json.loads((folder/'step_variable_discovery.json').read_bytes())
+            inv=json.loads((folder/'evidence/step_variable_discovery.json').read_bytes())
             for role,use in [('component_sequence','detail'),('component_sequence','service'),('non_sequence','unresolved')]:
                 review=neutral(inv)
                 review['decisions'][0].update(role=role,use=use,basis=['t1','t2'])
@@ -159,7 +159,7 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(status['channels'], [])
         self.assertEqual(status['configured_variables'], 0)
         self.assertFalse(status['coverage_complete'])
-        with (out/'optional_variables.csv').open(encoding='utf-8-sig') as f:
+        with (out/'evidence/optional_variables.csv').open(encoding='utf-8-sig') as f:
             self.assertEqual({r['步序变量'] for r in csv.DictReader(f)}, {'Token[0]', 'Token[3]', 'Pin', 'Limit'})
         pin=next(r for r in inv['candidates'] if r['name']=='Pin')
         self.assertIn('Launch',pin['entry_writes'][0]['scope'])
@@ -176,7 +176,7 @@ class CoverageTests(unittest.TestCase):
                 self.xml.write_text(xml)
                 out=self.root/fmt
                 self.assertEqual(generate(self.xml,out)['status'],'scope_review_pending')
-                inv=json.loads((out/'step_variable_discovery.json').read_bytes())
+                inv=json.loads((out/'evidence/step_variable_discovery.json').read_bytes())
                 row=next(r for r in inv['candidates'] if r['name']=='Token')
                 self.assertEqual(row['eligibility'],'distributed_write')
                 self.assertEqual(row['transitions'],[])
@@ -185,15 +185,15 @@ class CoverageTests(unittest.TestCase):
                     self.assertIn('Execute',pair['dispatch']['scope'])
                 s=self.merge(out,neutral(inv))
                 self.assertEqual(s['channels'], [])
-                with (out / 'optional_variables.csv').open(encoding='utf-8-sig') as f:
+                with (out / 'evidence/optional_variables.csv').open(encoding='utf-8-sig') as f:
                     self.assertEqual([r['步序变量'] for r in csv.DictReader(f)], ['Token'])
                 ref = self.known(['Token'])
-                checked = generate(self.xml, self.root / (fmt + '-known'), scope_results=out / 'scope_results.json',
+                checked = generate(self.xml, self.root / (fmt + '-known'), scope_results=out / 'evidence/scope_results.json',
                                    reference=ref)
                 self.assertEqual([a['name'] for a in checked['channels']], ['Token'])
-                with (Path(checked['out']) / 'capture_context.csv').open(encoding='utf-8-sig') as f:
+                with (Path(checked['out']) / 'evidence/capture_context.csv').open(encoding='utf-8-sig') as f:
                     self.assertEqual({(r['写前步值'],r['写后步值']) for r in csv.DictReader(f)},{('','4'),('','7')})
-                replay=generate(self.xml,self.root/(fmt+'2'),scope_results=out/'scope_results.json')
+                replay=generate(self.xml,self.root/(fmt+'2'),scope_results=out/'evidence/scope_results.json')
                 self.assertEqual(s['channels'],replay['channels'])
 
     def test_same_name_local_in_other_program_cannot_supply_dispatch_values(self):
@@ -248,7 +248,7 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(s['coverage']['reference_missing_from_config'],['Rack[8]'])
         recovered,=s['coverage']['reference_recovered']
         self.assertEqual((recovered['name'],recovered['type']),('Rack[2]','DINT'))
-        with (out/'capture_context.csv').open(encoding='utf-8-sig') as f:
+        with (out/'evidence/capture_context.csv').open(encoding='utf-8-sig') as f:
             r=next(r for r in csv.DictReader(f) if r['步序变量']=='Rack[2]')
         self.assertEqual((r['写前步值'],r['写后步值'],r['动作佐证']),('','','reference'))
 

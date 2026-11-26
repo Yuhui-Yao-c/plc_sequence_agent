@@ -34,7 +34,7 @@ class PrivateSourceUseTests(unittest.TestCase):
         src = root / 'cell.xml'
         src.write_text(project('<GlobalVars>'+variable('A','INT')+variable('B','INT')+'</GlobalVars>', fb, host))
         generate(src, root / 'out')
-        inventory = json.loads((root / 'out' / 'step_variable_discovery.json').read_bytes())
+        inventory = json.loads((root / 'out' / 'evidence/step_variable_discovery.json').read_bytes())
         return {row['name']:row for row in inventory['candidates']}
 
     def test_private_launch_and_completion_correlate_to_concrete_invocation(self):

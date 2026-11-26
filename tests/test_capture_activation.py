@@ -33,14 +33,14 @@ class ActivationTests(unittest.TestCase):
             required.write_text(reference + '\n')
             options['reference'] = required
         preview = generate(source, out, **options)
-        inventory = json.loads((out / 'step_variable_discovery.json').read_bytes())
+        inventory = json.loads((out / 'evidence/step_variable_discovery.json').read_bytes())
         decisions = neutral(inventory)
         if review:
             review(decisions, xml)
         form = root / 'review.json'
         form.write_text(json.dumps(decisions))
         final = generate(source, out, scope_results=form, **options)
-        roles = {r['name']: r for r in json.loads((out / 'scope_results.json').read_bytes())['decisions']}
+        roles = {r['name']: r for r in json.loads((out / 'evidence/scope_results.json').read_bytes())['decisions']}
         return preview, final, roles
 
     def test_only_closed_private_storage_can_be_pruned_at_its_actual_initial_value(self):

@@ -32,7 +32,7 @@ class ActionObligationTests(unittest.TestCase):
             source = base/'machine.xml'
             source.write_text(project(device, '<GlobalVars>' + ''.join(fields) + '</GlobalVars>', program))
             generate(source, base/'run')
-            inventory = json.loads((base/'run/step_variable_discovery.json').read_bytes())
+            inventory = json.loads((base/'run/evidence/step_variable_discovery.json').read_bytes())
         return next(r for r in inventory['candidates'] if r['identity'] == 'position')
 
     def test_connected_stages_can_use_direct_or_complementary_feedback(self):

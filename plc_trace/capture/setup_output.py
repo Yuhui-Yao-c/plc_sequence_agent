@@ -1,6 +1,7 @@
 """Select, verify and publish an entrance-two capture run."""
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,6 +12,53 @@ SCOPE_ACTIONS = {
     'scope_review_pending': 'review_scope',
     'scope_recheck_pending': 'recheck_scope',
 }
+
+
+EVIDENCE_FILES = frozenset({
+    'capture_context.csv', 'optional_variables.csv', 'scope_candidates.jsonl', 'scope_results.json',
+    'scope_recheck.json', 'step_array_coverage.csv', 'step_variable_discovery.json', 'unresolved_types.csv',
+})
+ROOT_FILES = {'static_variables.txt', 'missing_member_types.csv', 'workflow_status.json'}
+_VENDOR_FILE = re.compile(r'.+_trace_config(?:_preview)?(?:_partial)?\.(?:csv|trace)')
+
+
+def artifact_name(basename):
+    return f'evidence/{basename}' if basename in EVIDENCE_FILES else basename
+
+
+def recorded_artifact(status, basename):
+    """Read a saved result using the manifest of the run that produced it."""
+    key = artifact_name(basename)
+    return key if key in status.get('artifact_sha256', {}) else basename
+
+
+def _valid_artifact(name, *, legacy):
+    if not isinstance(name, str):
+        return False
+    if name.startswith('evidence/'):
+        return not legacy and name[len('evidence/'):] in EVIDENCE_FILES
+    if not name or any(c in name for c in '/\\:\x00'):
+        return False
+    return (name in ROOT_FILES or bool(_VENDOR_FILE.fullmatch(name))
+            or legacy and (name in EVIDENCE_FILES or name == 'trace_targets_preview.txt'))
+
+
+def _recorded_path(name, status, out):
+    legacy = 'trace_targets_stage' not in status
+    if name == 'workflow_status.json' or not _valid_artifact(name, legacy=legacy):
+        raise ValueError(f'已有采集配置包含无效的产物路径：{name}')
+    path = out / name
+    if _VENDOR_FILE.fullmatch(name) and str(path) not in (
+            status.get('preview_configuration'), status.get('configuration')):
+        raise ValueError(f'已有采集配置包含未登记的厂商文件：{name}')
+    _check_parent(path, out)
+    return path
+
+
+def _check_parent(path, out):
+    parent = path.parent
+    if parent != out and (not parent.is_dir() or parent.is_symlink() or parent.resolve() != out / parent.name):
+        raise ValueError(f'采集证据目录缺失或路径无效：{path.parent}')
 
 
 def read_status(out):
@@ -39,9 +87,10 @@ def legacy_pending(status, source, out, digest, task_name, every_n_cycles):
             and task == task_name and cycles == every_n_cycles and bool(status.get('inventory_sha256')))
 
 
-def select_run_dir(base, request):
+def select_run_dir(base, request, *, compatible=None):
     """Prefer an existing matching run, even if an earlier numbered slot is free."""
     occupied = set()
+    compatible_pending = []
     stem = os.path.normcase(base.name)
     entries = base.parent.iterdir() if base.parent.is_dir() else ()
     for path in entries:
@@ -58,11 +107,16 @@ def select_run_dir(base, request):
         else:
             continue
         if not path.is_symlink() and path.is_dir():
-            if matches_request(read_status(path), path, request):
+            status = read_status(path)
+            if matches_request(status, path, request):
                 return path
+            if compatible and compatible(status, path):
+                compatible_pending.append((index, path))
             if not any(path.iterdir()):
                 continue
         occupied.add(index)
+    if compatible_pending:
+        return min(compatible_pending)[1]
     index = 1
     while index in occupied:
         index += 1
@@ -71,20 +125,31 @@ def select_run_dir(base, request):
 
 def verify_files(out, status):
     hashes = status.get('artifact_sha256', {})
+    legacy = 'trace_targets_stage' not in status
     required = {'static_variables.txt'}
     state = status.get('status')
     if state not in SCOPE_ACTIONS.keys() | {'needs_review', 'done', 'done_with_review'}:
         raise ValueError('已有采集配置的工作流状态无效，请核对后显式重建')
     if status.get('selection_mode') == 'automatic':
-        required.update(('step_variable_discovery.json', 'scope_candidates.jsonl'))
-        required.update(('optional_variables.csv', 'capture_context.csv'))
+        required.update(('step_variable_discovery.json', 'scope_candidates.jsonl',
+                         'optional_variables.csv', 'capture_context.csv'))
+        if not legacy:
+            required.add('step_array_coverage.csv')
         if state != 'scope_review_pending' and any(status.get(k) for k in
                 ('scope_candidates', 'single_write_candidates', 'distributed_write_candidates')):
             required.add('scope_results.json')
     if state == 'scope_recheck_pending':
-        required.update(('scope_recheck.json', 'scope_results.json', 'trace_targets_preview.txt'))
-        if status.get('scope_recheck') != str(out / 'scope_recheck.json') or status.get('configuration'):
+        required.update(('scope_recheck.json', 'scope_results.json'))
+        if legacy:
+            required.add('trace_targets_preview.txt')
+        queue = 'scope_recheck.json' if legacy else artifact_name('scope_recheck.json')
+        if status.get('scope_recheck') != str(out / queue) or status.get('configuration'):
             raise ValueError('范围补核目录的状态与交付文件不一致，请核对后显式重建')
+    if not legacy:
+        required = {artifact_name(name) for name in required}
+        stage = 'preview' if state in SCOPE_ACTIONS else 'final'
+        if status.get('trace_targets_stage') != stage or status.get('trace_targets') != str(out / 'static_variables.txt'):
+            raise ValueError('已有步序清单的阶段或交付路径与任务状态不一致，请核对后显式重建')
     for field in ('configuration', 'preview_configuration', 'trace_targets', 'member_type_template'):
         if not status.get(field) and not (field == 'configuration' and state in {'done', 'done_with_review'}):
             continue
@@ -95,9 +160,8 @@ def verify_files(out, status):
     if not isinstance(hashes, dict) or not required.issubset(hashes):
         raise ValueError('已有采集配置缺少文件校验记录，请显式重建')
     for name, expected in hashes.items():
-        path = out / name
-        if (Path(name).name != name or path.is_symlink() or not path.is_file()
-                or fingerprint(path) != expected):
+        path = _recorded_path(name, status, out)
+        if path.is_symlink() or not path.is_file() or fingerprint(path) != expected:
             raise ValueError(f'已有采集配置文件缺失或已修改：{name}。请核对后显式重建')
 
 
@@ -123,52 +187,13 @@ def publish(out, files, *, force, completing):
         stage = Path(temporary) / 'ready'
         stage.mkdir()
         for name, contents in files.items():
-            (stage / name).write_bytes(contents)
+            if not _valid_artifact(name, legacy=False):
+                raise ValueError(f'无效的采集产物路径：{name}')
+            staged = stage / name
+            staged.parent.mkdir(exist_ok=True)
+            staged.write_bytes(contents)
         if completing:
-            # Keep user files and the run directory. Commit workflow_status.json last.
-            backup = Path(temporary) / 'rollback'
-            backup.mkdir()
-            changed = []
-            owned = {'static_variables.txt', 'scope_candidates.jsonl', 'step_variable_discovery.json',
-                     'workflow_status.json', 'scope_results.json', 'capture_context.csv',
-                     'step_array_coverage.csv', 'unresolved_types.csv', 'optional_variables.csv',
-                     'missing_member_types.csv', 'trace_targets_preview.txt', 'scope_recheck.json'}
-            try:
-                previous = read_status(out)
-                old_files = previous.get('artifact_sha256', {})
-                for key in ('preview_configuration', 'configuration'):
-                    configuration = Path(previous.get(key) or '')
-                    if configuration.parent == out and configuration.name in old_files:
-                        owned.add(configuration.name)
-                for name in (old_files.keys() & owned) - files.keys():
-                    old = out / name
-                    if old.is_symlink() or not old.is_file() or fingerprint(old) != old_files[name]:
-                        raise ValueError(f'待更新的采集产物缺失或已修改：{old}')
-                    old.replace(backup / name)
-                    changed.append(name)
-                for name in files:
-                    target = out / name
-                    if target.is_symlink() or (target.exists() and not target.is_file()):
-                        raise ValueError(f'目标位置已有其他文件，请核对：{target}')
-                    if target.is_file():
-                        if fingerprint(target) == fingerprint(stage / name):
-                            continue
-                        if name not in owned:
-                            raise ValueError(f'目标位置已有其他文件，请核对：{target}')
-                        if name in {'capture_context.csv', 'step_array_coverage.csv', 'unresolved_types.csv',
-                                    'missing_member_types.csv', 'optional_variables.csv', 'scope_recheck.json'} and name not in old_files:
-                            raise ValueError(f'目标位置已有其他文件，请核对：{target}')
-                        shutil.copy2(target, backup / name)
-                    (stage / name).replace(target)
-                    changed.append(name)
-            except BaseException:
-                for name in reversed(changed):
-                    saved = backup / name
-                    if saved.exists():
-                        saved.replace(out / name)
-                    else:
-                        (out / name).unlink()
-                raise
+            _update_run(out, files, stage, Path(temporary) / 'rollback')
             return
         previous = _fresh_output(out, force)
         try:
@@ -178,3 +203,61 @@ def publish(out, files, *, force, completing):
             if previous and not out.exists():
                 Path(previous).rename(out)
             raise
+
+
+def _update_run(out, files, stage, backup):
+    # Only files recorded in this run may be retired. Preserve raw input and user notes.
+    previous = read_status(out)
+    old_files = previous.get('artifact_sha256', {})
+    historical_pending = ('artifact_sha256' not in previous and 'request_sha256' not in previous
+                          and previous.get('status') == 'scope_review_pending')
+    backup.mkdir()
+    evidence = out / 'evidence'
+    created_evidence = False
+    changed = []
+    try:
+        if (stage / 'evidence').is_dir():
+            if evidence.is_symlink() or (evidence.exists() and not evidence.is_dir()):
+                raise ValueError(f'采集证据目录的目标位置无效：{evidence}')
+            if not evidence.exists():
+                evidence.mkdir()
+                created_evidence = True
+        for name in sorted(old_files.keys() - files.keys()):
+            old = _recorded_path(name, previous, out)
+            if old.is_symlink() or not old.is_file() or fingerprint(old) != old_files[name]:
+                raise ValueError(f'待更新的采集产物缺失或已修改：{old}')
+            saved = backup / name
+            saved.parent.mkdir(exist_ok=True)
+            old.replace(saved)
+            changed.append(name)
+        # Put the marker last so a failed update never advertises new results.
+        for name in sorted(files, key=lambda key: key == 'workflow_status.json'):
+            target = out / name
+            _check_parent(target, out)
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                raise ValueError(f'目标位置已有其他文件，请核对：{target}')
+            if target.is_file():
+                digest = fingerprint(target)
+                if name in old_files and digest != old_files[name]:
+                    raise ValueError(f'待更新的采集产物缺失或已修改：{target}')
+                if name not in old_files and name != 'workflow_status.json':
+                    # Only the original list remains at the same path in pre-manifest runs.
+                    if not (historical_pending and name == 'static_variables.txt'):
+                        raise ValueError(f'目标位置已有其他文件，请核对：{target}')
+                if digest == fingerprint(stage / name):
+                    continue
+                saved = backup / name
+                saved.parent.mkdir(exist_ok=True)
+                shutil.copy2(target, saved)
+            (stage / name).replace(target)
+            changed.append(name)
+    except BaseException:
+        for name in reversed(changed):
+            saved = backup / name
+            if saved.exists():
+                saved.replace(out / name)
+            else:
+                (out / name).unlink()
+        if created_evidence:
+            evidence.rmdir()
+        raise

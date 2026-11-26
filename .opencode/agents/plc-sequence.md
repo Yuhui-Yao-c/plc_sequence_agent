@@ -61,15 +61,15 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 **执行**
 
-按当前 `workflow_status.json` 的 `next_action` 在同一轮执行下一步。
+按当前 `workflow_status.json` 的 `next_action` 在同一轮执行下一步。`trace_targets` 始终指向 `static_variables.txt`，阶段取自 `trace_targets_stage`。
 
-1. 收到 `review_scope`（状态 `scope_review_pending`），保存返回的 `out`，立即读取候选与源码台账，按[采集配置](../skills/plc-trace-setup/SKILL.md)完成各实例的用途判断。首轮 `trace_targets` 和 `preview_configuration` 供内部复核，可能包含握手、维护流程等备选地址。遇到缺失成员类型时保留缺口，直接继续判断。用户已提供核实声明时，可一并使用。
-2. 按原采集选项和实际 `out` 提交完整的 `--scope-results`，读取本次返回的状态。有独立清单时各轮沿用同一 `--reference`。收到 `recheck_scope`（状态 `scope_recheck_pending`），读取 `scope_recheck.json`，核对具体作业、写点和负责计时的地址。将修订判断另存，在同一目录继续提交。只有仍缺决定作业归属的现场证据时，才交付已核实的证据、可用的预配置，并针对该作业说明仍需核对的现场事实。成员类型只在写入相应厂商通道时使用。
-3. 收到 `deliver_results` 时，从正式清单和配置取交付数。显式模式按规则提取完整路径和固定下标后，直接核对正式输出。
+1. 收到 `review_scope`（状态 `scope_review_pending`），保存返回的 `out`，立即读取候选与源码台账，按[采集配置](../skills/plc-trace-setup/SKILL.md)完成各实例的用途判断。在 `preview` 阶段，清单和预配置可能含握手或维护流程等候选。将完整判断保存至运行目录的 `evidence/scope_review_input.json` 后继续提交。遇到缺失成员类型时保留缺口，直接继续判断。用户已提供核实声明时，可一并使用。
+2. 按原采集选项和实际 `out` 提交完整的 `--scope-results`，读取本次返回的状态。有独立清单时各轮沿用同一 `--reference`。收到 `recheck_scope`（状态 `scope_recheck_pending`），读取 `evidence/scope_recheck.json`，核对具体作业、写点和负责计时的地址。将完整判断的修订写回 `evidence/scope_review_input.json`，在同一目录继续提交。只有现有源码仍不足以决定作业归属时，才向用户指出具体待核作业与现场事实，并将当前清单标为待核。成员类型只在写入相应厂商通道时使用。
+3. 收到 `deliver_results` 时，核对 `trace_targets_stage=final`，从同一地址清单和正式配置取交付数。显式模式按规则提取完整路径和固定下标后，直接核对正式输出。
 
 **验收**
 
-先交付 `trace_targets` 指向的正式 `static_variables.txt` 和可写入的厂商配置。自动发现同时交付 `capture_context.csv` 中的动作证据。报告正式地址总数、`configured_variables` 和具体缺口。部分通道可写时，提供 `configuration` 指向的部分配置。可写通道为零时，仍交付完整地址清单并说明原因。Sysmac 的 `TaskName`、`SamplePeriod`、`SamplingInterval` 按实际 CSV 报告。说明 `task_name_source`，只有本轮有任务周期依据时才报告周期毫秒数。汇川报告选用任务、名义采样间隔和缓冲点数。配置样本数为 0。
+先交付 `trace_targets` 指向的正式 `static_variables.txt` 和可写入的厂商配置。需要核对动作时，指向 `evidence/capture_context.csv`。其余过程文件供续跑与复查。报告正式地址总数、`configured_variables` 和具体缺口。部分通道可写时，提供 `configuration` 指向的部分配置。可写通道为零时，仍交付完整地址清单并说明原因。Sysmac 的 `TaskName`、`SamplePeriod`、`SamplingInterval` 按实际 CSV 报告。说明 `task_name_source`，只有本轮有任务周期依据时才报告周期毫秒数。汇川报告选用任务、名义采样间隔和缓冲点数。配置样本数为 0。
 
 交付之后，若正式入选地址仍因缺失结构成员声明而无法写入 Sysmac CSV，在报告末尾一次列明受影响的地址数、去重后的成员和 `member_type_template`。用户需要补全 CSV 时，可提供相应声明，随后以原 `--out` 和 `--member-types` 更新配置。成员类型取自已核实声明。
 

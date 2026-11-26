@@ -33,7 +33,7 @@ class ProductionCountercheckTests(unittest.TestCase):
                                       ('</Program><Program name="Requester">' if separate else '') +
                                       section(work + extra) + '</Program>'))
             generate(source, root / 'out')
-            inventory = json.loads((root / 'out/step_variable_discovery.json').read_bytes())
+            inventory = json.loads((root / 'out/evidence/step_variable_discovery.json').read_bytes())
         rows = {r['name']:r for r in inventory['candidates']}
         decisions = [{'name': 'Main', 'admission': 'captured', 'boundaries': [{'write': rows['Main']['transitions'][0]['id']}]},
                      {'name': 'Cursor', 'admission': 'optional'}]

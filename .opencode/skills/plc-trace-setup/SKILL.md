@@ -10,7 +10,7 @@ compatibility: opencode
 
 从[主 Agent](../../agents/plc-sequence.md)收到工程和采集选项后运行 `python plc_cli.py "工程.xml" --trace-setup`，保存返回的 `out`。候选从本次源码发现。有人工起止表、已确认的地址清单或 Sysmac 通道表时，在各轮传入同一 `--reference`。用它核对默认清单和最终配置，可按精确地址补齐已知类型。
 
-1. 当 `next_action=review_scope`（`scope_review_pending`）时，在当前轮直接读取 `scope_candidates.jsonl` 和 `step_variable_discovery.json`，完成以下用途复核。`trace_targets_preview.txt` 及 `preview_configuration` 只展示候选的可配置情况，其中包含尚未判断用途的地址。即使 `preview_unresolved_types` 非空或预配置通道为零，也用现有 XML 继续检查调度、调用、实参和固定下标，确认每个工位主步、命令、工作区、并行子步或辅助流程的用途。用途复核期间将类型缺口留在台账。
+1. 当 `next_action=review_scope`（`scope_review_pending`）时，在当前轮直接读取 `evidence/scope_candidates.jsonl` 和 `evidence/step_variable_discovery.json`，完成以下用途复核。`trace_targets` 始终指向运行目录的 `static_variables.txt`。`trace_targets_stage=preview` 时，该文件列出当轮候选，`preview_configuration` 只含其中可写入的通道。即使 `preview_unresolved_types` 非空或预配置通道为零，也用现有 XML 继续检查调度、调用、实参和固定下标，确认每个工位主步、命令、工作区、并行子步或辅助流程的用途。用途复核期间将类型缺口留在台账。
 2. 为每个 `scope_required` 给出一项判断，再检查 `single_write` 中只写过一个出口的短流程，尤其是由调用方启动或收尾的子步。用该实例的写点和声明用途或步骤注释补录。保留未绑定、动态下标和未定位写点等证据缺口。
 3. 先判断地址在程序中如何使用。`role` 取 `station_auto`、`station_slot`、`component_sequence`、`auxiliary_sequence`、`uncertain` 或 `non_sequence`。命令号、计数、应答字也可能在几个数值间切换，核对谁读写它以及这些值控制什么。排除数据通道要引用它的迁移和受控读写、有说明的声明或另一写点。确认内部或辅助序列要引用本实例的迁移。
 4. 为工位角色引用本地址的全部声明及 `owner_scope` 内写点，并为每个声称的工位接口族在 `station_families` 填一个具体实例和周期说明。无说明时核对同一例程的其他阶段、写出或可写绑定。`station_slot` 还须提供同一具体数组和工位程序的 `interface_peer`。经证实专门存步的有界叶数组可在已确认实例上标 `dedicated_step_array: true` 并引用声明和迁移。其他仅固定引用或清零的槽位保留在备选清单。
@@ -39,7 +39,7 @@ compatibility: opencode
 
 对用途存疑的私有变量，检查 `activation` 的初值、同值写入、启动入口、未解析引用。对维护模式，可填 `service_evidence.kind=mode` 和 `gate`，核实启动、撤销及受控指令。后台设备服务用 `kind=equipment`，核实实际调用处的用途与被调指令。两种判断都填写 `purpose` 和 `operation`，每项用 `{"line": 物理XML行号, "text": "该行原文片段"}` 分别引用注释与可执行指令。缺少有效入口或父步启动证据时，在用途判断中注明缺口。缺少声明类型的地址仍按已有运行逻辑判断用途。外围路径写中文、变量带 Step 或位于功能块内部均不能决定其用途。
 
-将判断保存到实际运行目录的 `scope_review_input.json`，复制本轮的 `inventory_sha256` 和 `activation_sha256`。证据编号在各自的候选内查找。下例假定两条通道独立下料。上层等待两条通道均完成，`l1` 是其中一条通道的上层链接，`t2` 是下游确认收料后该通道推进的写点。
+将判断保存到实际运行目录的 `evidence/scope_review_input.json`，复制本轮的 `inventory_sha256` 和 `activation_sha256`。证据编号在各自的候选内查找。下例假定两条通道独立下料。上层等待两条通道均完成，`l1` 是其中一条通道的上层链接，`t2` 是下游确认收料后该通道推进的写点。
 
 ```json
 {
@@ -67,19 +67,19 @@ compatibility: opencode
 
 复核时还要从默认清单反向核对生产动作。同一地址受多种命令或模式驱动时，按调用条件分别查看写点。在回原、手动和生产共用步号的工程里，把所报动作落到该件生产任务实际执行的分支。对每个生产作业，沿使能、执行、反馈及步值推进查出哪个具体地址能记录起止时刻。若准备将候选归入内部细节，核实同一模式、同一工件、同一次作业由哪个已选地址覆盖。两个实例共用一种功能块时，逐一核对实参、使能及反馈。主程序在运行、命令已下发或同类地址已入选，都不能单独说明该实例的作业已有计时地址。
 
-复用首轮选项执行 `python plc_cli.py trace-setup --source "工程.xml" --out "本轮实际目录" --scope-results "本轮实际目录/scope_review_input.json"`。程序逐实例核验计时边界与上层关系。旧用途判断中缺少本轮所需计时依据的生产候选留待复核。
+复用首轮选项执行 `python plc_cli.py trace-setup --source "工程.xml" --out "本轮实际目录" --scope-results "本轮实际目录/evidence/scope_review_input.json"`。程序逐实例核验计时边界与上层关系。旧用途判断中缺少本轮所需计时依据的生产候选留待复核。
 
-当 `next_action=recheck_scope`（`scope_recheck_pending`）时，从状态字段 `scope_recheck` 打开本轮复核文件，逐项读取 `items` 中的地址、写点和具体原因。以同目录中工作流给出的 `scope_results.json` 为基础，将修订后的完整判断另存为 `scope_review_input.json`。对照本实例在该写点的实际动作和调用条件。能独立标记工件作业的，按上面的 `production` 协议提交其计时边界。支持原排除判断时，核对程序能验证的替代计时或排除依据，如父步发出同一请求并等待对应结果、同一父步接管内部子步操作的执行器、全部写步受已声明的服务模式约束，或本实例没有可执行入口。仅改写 `detail` 的理由仍需复核。用原 `--out` 和更新的完整 `--scope-results` 重新执行，再读实际状态。只有穷尽现有源码仍缺决定用途的证据时，才交付已核实的动作证据、可用的预配置，并报告剩余作业和缺少的现场事实。可在形成正式清单后统一处理缺类型的地址。项目名称、地址数量、兄弟实例的名称与旧版自动清单均不能代替本次证明。
+当 `next_action=recheck_scope`（`scope_recheck_pending`）时，从状态字段 `scope_recheck` 打开本轮复核文件，逐项读取 `items` 中的地址、写点和具体原因。以本轮工作流给出的 `evidence/scope_results.json` 为基础，将修订后的完整判断另存为 `evidence/scope_review_input.json`。对照本实例在该写点的实际动作和调用条件。能独立标记工件作业的，按上面的 `production` 协议提交其计时边界。支持原排除判断时，核对程序能验证的替代计时或排除依据，如父步发出同一请求并等待对应结果、同一父步接管内部子步操作的执行器、全部写步受已声明的服务模式约束，或本实例没有可执行入口。仅改写 `detail` 的理由仍需复核。用原 `--out` 和更新的完整 `--scope-results` 重新执行，再读实际状态。只有穷尽现有源码仍缺决定用途的证据时，才向用户指出具体待核作业，将当前地址标为待核，并询问决定该作业归属所需的现场事实。可在形成正式清单后统一处理缺类型的地址。项目名称、地址数量、兄弟实例的名称与旧版自动清单均不能代替本次证明。
 
 独立清单中若有本次未跳变的数组通道，核对同一数组实例的执行步、元素类型和声明上下界。即使程序未单独写出该下标，程序也可按独立清单精确补回有声明依据的地址。缺少声明或下标越界时，在 `coverage` 报告差集。
 
 ## 输出与验收
 
-- `static_variables.txt` 列出正式采集的生产计时地址和独立核验指定的具体步序地址。写入和分派分散时查看 `dispatch_writes` 的两处位置，写前值留空。`capture_context.csv` 记录每个已核实边界的动作、步值、命令/工况、完整导出条件及其解析情况、出处。表中写步示例是源码证据，现场 Trace 才提供实测时长。复现条件时可加采其中的命令、模式和反馈。
-- `optional_variables.csv` 给出备选地址、用途、理由、类型及出处。`step_array_coverage.csv` 给出专用数组边界。全量候选、其他出口、数据排除和解析范围保存在发现台账。
-- 核对 `workflow_status.json` 的 `static_variables`、`optional_variables`、`configured_variables` 和 `configuration_complete`。Sysmac 按声明类型生成配置，缺失的生产地址类型在 `unresolved_types.csv`。可写入部分配置时文件名含 `_partial`。已确认以 REAL/LREAL 存离散步值的通道沿用原类型。
+- 核对同一份 `static_variables.txt`。补核期间文件保留拟选地址与待核地址。进入 `trace_targets_stage=final` 后，文件列出正式采集的生产计时地址和独立核验指定的具体步序地址。写入和分派分散时查看 `dispatch_writes` 的两处位置，写前值留空。`evidence/capture_context.csv` 记录每个已核实边界的动作、步值、命令/工况、完整导出条件及其解析情况、出处。表中写步示例是源码证据，现场 Trace 才提供实测时长。复现条件时可加采其中的命令、模式和反馈。
+- `evidence/optional_variables.csv` 给出备选地址、用途、理由、类型及出处。`evidence/step_array_coverage.csv` 给出专用数组边界。全量候选、其他出口、数据排除和解析范围保存在发现台账。
+- 核对 `workflow_status.json` 的 `static_variables`、`optional_variables`、`configured_variables` 和 `configuration_complete`。Sysmac 按声明类型生成配置，缺失的生产地址类型在 `evidence/unresolved_types.csv`。可写入部分配置时文件名含 `_partial`。已确认以 REAL/LREAL 存离散步值的通道沿用原类型。
 - 汇川按源码任务、调度和可定位写点选择采样设置。`needs_review` 表示缺配置、部分配置或独立核验有缺口，查看 `coverage` 的逐地址差集、未核实条件与源码解析缺口。区分 `configuration_complete`（全部入选地址已实际写入）与 `coverage_complete`（本次输入可核验范围内没有剩余缺口）。无论状态，准确报告实际文件路径。若 `configuration` 已存在，同时交付该文件和 `trace_targets` 全部目标，列明已配置和缺失的数量。采集配置样本数为 0。
-- 收到 `next_action=deliver_results`，先给出全部正式地址和 `configuration` 指向的实际文件。自动发现同时交付动作证据。即使当前可写通道为零，也交付完整地址清单。报告 Sysmac 采样设置时，从生成的 CSV 分别读取 `TaskName`、`SamplePeriod`、`SamplingInterval`。核对任务来源，分频值须结合有依据的任务周期才能换算为时间。
-- 交付正式清单和可用配置后，若仍有入选地址缺少结构叶成员声明，再在报告末尾一次询问这些成员的数据类型，同时给出本轮 `member_type_template`。用户补充时，将核实声明另存为 `member_types.csv`，在原 `--out` 追加 `--member-types 本轮目录/member_types.csv`，复用已核验的用途判断。核实的成员适用于沿声明链定位到同一结构及标量成员的实例。
+- 收到 `next_action=deliver_results`，先给出全部正式地址和 `configuration` 指向的实际文件。核对动作边界时，引用本轮 `evidence/capture_context.csv`。即使当前可写通道为零，也交付完整地址清单。报告 Sysmac 采样设置时，从生成的 CSV 分别读取 `TaskName`、`SamplePeriod`、`SamplingInterval`。核对任务来源，分频值须结合有依据的任务周期才能换算为时间。
+- 交付正式清单和可用配置后，若仍有入选地址缺少结构叶成员声明，再在报告末尾一次询问这些成员的数据类型，同时给出本轮 `member_type_template`。用户补充时，在原 `--out` 追加 `--member-types 已核实成员.csv`，复用已核验的用途判断。核实的成员适用于沿声明链定位到同一结构及标量成员的实例。
 - 显式模式在源码字面引用中匹配地址，多个模式取并集。若现场要求加采从调用实参还原的完整实例路径，将指定的精确通道列入独立 `--reference`，在自动发现流程中据绑定证据核验，回读正式文件确认。
 - Sysmac 显式模式可用已核实的 `--default-type` 补齐缺失的根变量类型。
