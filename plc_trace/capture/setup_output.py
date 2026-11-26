@@ -7,7 +7,10 @@ from tempfile import TemporaryDirectory
 
 from plc_trace.runtime.workflow import _fresh_output, fingerprint
 
-PENDING_SCOPE_STATES = {'scope_review_pending', 'scope_recheck_pending'}
+SCOPE_ACTIONS = {
+    'scope_review_pending': 'review_scope',
+    'scope_recheck_pending': 'recheck_scope',
+}
 
 
 def read_status(out):
@@ -70,7 +73,7 @@ def verify_files(out, status):
     hashes = status.get('artifact_sha256', {})
     required = {'static_variables.txt'}
     state = status.get('status')
-    if state not in PENDING_SCOPE_STATES | {'needs_review', 'done', 'done_with_review'}:
+    if state not in SCOPE_ACTIONS.keys() | {'needs_review', 'done', 'done_with_review'}:
         raise ValueError('已有采集配置的工作流状态无效，请核对后显式重建')
     if status.get('selection_mode') == 'automatic':
         required.update(('step_variable_discovery.json', 'scope_candidates.jsonl'))

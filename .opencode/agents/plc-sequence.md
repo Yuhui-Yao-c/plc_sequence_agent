@@ -61,11 +61,17 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 **执行**
 
-免填模式收到 `scope_review_pending` 后，保存返回的 `out`。核对 `trace_targets` 和 `preview_configuration` 指向的实际文件，向用户提供首轮地址及已有的预配置，随后继续完成用途判断。按 [采集配置](../skills/plc-trace-setup/SKILL.md) 核验所有层级的具体步序，检查单向写回。说明默认入选地址负责哪项工位生产操作或等待、哪些写点给它计时。发现的握手、设备内部阶段、维护及用途未定地址保留在备选和证据台账。对照真实调用入口，检查同一功能块的不同实例，保留正常生产中承担独立工步的子步。提供了独立地址表或人工起止表时，各轮均传入同一 `--reference` 并核对实际配置的地址差集。以该 `out` 和首轮采集选项提交 `--scope-results`。合并后读取该目录的 `workflow_status.json`。若为 `scope_recheck_pending`，打开 `scope_recheck.json`，逐项检查被排出的动作和同一工况下负责计时的地址。按证据修订完整 `--scope-results` 后在同一目录续跑。尚待核实时报告具体缺口及预配置路径。范围复核结束后从正式文件读取默认地址、动作边界与备选清单。显式模式按规则提取完整路径和固定下标。核对类型、作用域及解析问题。生成配置后交付客户端导入，检查任务、触发、采样设置和通道容量。
+按当前 `workflow_status.json` 的 `next_action` 在同一轮执行下一步。
+
+1. 收到 `review_scope`（状态 `scope_review_pending`），保存返回的 `out`，立即读取候选与源码台账，按[采集配置](../skills/plc-trace-setup/SKILL.md)完成各实例的用途判断。首轮 `trace_targets` 和 `preview_configuration` 供内部复核，可能包含握手、维护流程等备选地址。遇到缺失成员类型时保留缺口，直接继续判断。用户已提供核实声明时，可一并使用。
+2. 按原采集选项和实际 `out` 提交完整的 `--scope-results`，读取本次返回的状态。有独立清单时各轮沿用同一 `--reference`。收到 `recheck_scope`（状态 `scope_recheck_pending`），读取 `scope_recheck.json`，核对具体作业、写点和负责计时的地址。将修订判断另存，在同一目录继续提交。只有仍缺决定作业归属的现场证据时，才交付已核实的证据、可用的预配置，并针对该作业说明仍需核对的现场事实。成员类型只在写入相应厂商通道时使用。
+3. 收到 `deliver_results` 时，从正式清单和配置取交付数。显式模式按规则提取完整路径和固定下标后，直接核对正式输出。
 
 **验收**
 
-核对 `static_variables.txt` 的地址数、状态文件的已配置数和缺类型明细，再交付可用的 `<源码名>_trace_config.trace` 或 `.csv`。汇川配置报告任务名、写入覆盖数、名义采样间隔和缓冲点数。若多个任务写入不同通道，说明整份记录使用哪个任务的节拍。`needs_review` 时直接交付 `configuration` 指向的部分配置和 `trace_targets` 指向的全部入选地址，列出两者的数量。若只有地址清单，说明缺失的具体类型或采样任务。Sysmac 遇外部结构缺失时，一并交付 `member_type_template`，依据完整工程核实成员声明后，再对同一运行目录传 `--member-types`。步值范围不能作为数据类型依据。配置采样数为 0，现场导出的实测记录可进入入口一。
+先交付 `trace_targets` 指向的正式 `static_variables.txt` 和可写入的厂商配置。自动发现同时交付 `capture_context.csv` 中的动作证据。报告正式地址总数、`configured_variables` 和具体缺口。部分通道可写时，提供 `configuration` 指向的部分配置。可写通道为零时，仍交付完整地址清单并说明原因。Sysmac 的 `TaskName`、`SamplePeriod`、`SamplingInterval` 按实际 CSV 报告。说明 `task_name_source`，只有本轮有任务周期依据时才报告周期毫秒数。汇川报告选用任务、名义采样间隔和缓冲点数。配置样本数为 0。
+
+交付之后，若正式入选地址仍因缺失结构成员声明而无法写入 Sysmac CSV，在报告末尾一次列明受影响的地址数、去重后的成员和 `member_type_template`。用户需要补全 CSV 时，可提供相应声明，随后以原 `--out` 和 `--member-types` 更新配置。成员类型取自已核实声明。
 
 ## 输出与续跑
 

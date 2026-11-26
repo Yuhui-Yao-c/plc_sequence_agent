@@ -32,7 +32,7 @@ from plc_trace.capture.plcopen_tasks import (
 )
 from plc_trace.capture.station_scope import at_path, declaration
 from plc_trace.capture.setup_output import (
-    PENDING_SCOPE_STATES, legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files, verify_scope_upgrade,
+    SCOPE_ACTIONS, legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files, verify_scope_upgrade,
 )
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
@@ -695,7 +695,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                     new_keys.discard(key)
                 submitted = scope_bytes is not None and hashlib.sha256(scope_bytes).hexdigest() not in (
                     status.get('scope_input_sha256'), status.get('artifact_sha256', {}).get('scope_results.json'))
-                completing_scope = submitted and status['status'] in PENDING_SCOPE_STATES
+                completing_scope = submitted and status['status'] in SCOPE_ACTIONS
                 if submitted and not completing_scope:
                     if not status.get('legacy_timing_reviews'):
                         raise ValueError('已有任务已结束，范围判断与已提交结果不同，请核对后显式重建')
@@ -843,12 +843,14 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             template = ET.parse(RESOURCE_ROOT / 'templates' / 'inovance_trace.xml').getroot()
             task = sampling_task(scan.tasks, scan.program_writes, channels, template.find('./TraceConfiguration'),
                                  task_name=task_name, every_n_cycles=every_n_cycles)
-        preview = discovery_status in PENDING_SCOPE_STATES
+        preview = discovery_status in SCOPE_ACTIONS
         targets = 'trace_targets_preview.txt' if preview else 'static_variables.txt'
         files = {'static_variables.txt': b'', targets: ''.join(c['name'] + '\n' for c in ordered).encode('utf-8')}
         if unresolved:
             files['unresolved_types.csv'] = _csv_bytes(('变量', '类型问题'), sorted(unresolved.items()))
-        if member_gaps:
+        member_template = None
+        if member_gaps and not preview:
+            member_template = out / 'missing_member_types.csv'
             files['missing_member_types.csv'] = _csv_bytes(MEMBER_COLUMNS, member_gaps)
         config, exported = None, set()
         configurable = [c for c in ordered if c['name'] not in unresolved]
@@ -863,7 +865,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             exported = verify_config(files[config], capture_format, configurable)
         delivery = {
             'trace_targets': str(out / targets), 'trace_target_count': len(ordered),
-            'member_type_template': str(out / 'missing_member_types.csv') if member_gaps else None,
+            'member_type_template': str(member_template) if member_template else None,
             'member_types_sha256': member_sha or (pending or {}).get('member_types_sha256'),
             'verified_member_types': [{'owner': owner, 'member': member, 'type': kind,
                                        'source_sha256': member_sources[owner, member]}
@@ -877,6 +879,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         report = {
             'version': __version__, 'mode': 'trace_setup',
             'status': discovery_status or ('done' if config and len(exported) == len(ordered) else 'needs_review'),
+            'next_action': SCOPE_ACTIONS.get(discovery_status, 'deliver_results'),
             'out': str(out), 'configuration': str(out / config) if config and not preview else None,
             'configured_variables': len(final_exported), **delivery,
             'source': str(source), 'source_sha256': digest, 'source_format': source_format,

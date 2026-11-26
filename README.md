@@ -2,7 +2,7 @@
 
 本项目通过 OpenCode 完成两项任务。入口一分析 PLC 源码和实测 Trace，生成中文步序采集表。入口二从源码自动发现步序变量或按指定模式提取变量，生成采集通道配置。
 
-当前简化版为 **18.5.0**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
+当前简化版为 **18.5.1**，维护分支为 `trace-only`。运行 `python plc_cli.py --version` 查询本地版本。版本记录、分支用途和升级规则见 [版本与分支管理](docs/VERSIONING.md)。
 
 ## 启动
 
@@ -75,7 +75,7 @@ python plc_cli.py trace-setup --source "source/包mylar/PLC程序.xml" --pattern
 
 Trace 分析支持 TwinCAT Scope `.trace` 和 Sysmac 导出表、分卷目录，时长取同一连续采样段内、进入和离开起始步均有观测的停留中位数。源码原注释优先进入 A 档，其余行由 Agent 按本步证据完成 B 档。
 
-`workflow_status.json` 的 `out` 记录实际运行目录。入口二收到 `scope_review_pending` 后，在该目录写入 `scope_results.json`，以同一组采集选项和 `--out`、`--scope-results` 合并。如果返回 `scope_recheck_pending`，读取 `scope_recheck.json` 中的具体地址和证据，对照其写点、执行条件和计时归属，修正完整用途判断后在同一目录再次提交。此阶段交付的是预配置，正式配置须等范围复核结束。用途复核和补齐成员类型都在这个目录完成。已有部分配置时，保留程序给出的类型模板，将核实结果另存为 `member_types.csv`，复用原 `--out` 并传 `--member-types 本轮目录/member_types.csv`。程序读取本轮已核验的用途判断，刷新可交付文件。若本轮报告的 `legacy_timing_reviews` 大于零，说明部分历史判断缺少独立计时依据。对这些地址补判，将完整结果另存，再用同一 `--out` 和新的 `--scope-results` 合并，保留已核验判断及工位接口族。要重新独立判定时，可指定新输出根目录，或用完整命令在原目录显式 `--force` 归档重建。旧版已完成目录作为历史结果保留。旧版待复核任务可显式指定原目录续跑，程序重新核对源码、采集设置及候选指纹。
+`workflow_status.json` 的 `out` 记录实际运行目录。入口二返回的 `next_action` 指定当前要做的工作。`review_scope` 要求 OpenCode 在当前轮读候选台账，完成用途判断，将输入另存为 `scope_review_input.json`，按相同采集选项和实际 `--out` 提交 `--scope-results`。未知的成员类型只影响厂商配置能写入的通道。若下一步为 `recheck_scope`，读取 `scope_recheck.json` 中的具体地址和证据，对照其写点、执行条件和计时归属，修正完整用途判断后在同一目录再次提交。`deliver_results` 表示可以交付本轮结果。先提供正式地址清单、动作依据及已写入的配置。可导出通道为零时也交付清单。有入选地址仍欠结构成员声明时，才在交付末尾列出对应成员。用途复核和补齐成员类型都在这个目录完成。需要更新配置时，保留程序给出的类型模板，将核实结果另存为 `member_types.csv`，复用原 `--out` 并传 `--member-types 本轮目录/member_types.csv`。程序读取本轮已核验的用途判断，刷新可交付文件。若本轮报告的 `legacy_timing_reviews` 大于零，说明部分历史判断缺少独立计时依据。对这些地址补判，将完整结果另存，再用同一 `--out` 和新的 `--scope-results` 合并，保留已核验判断及工位接口族。要重新独立判定时，可指定新输出根目录，或用完整命令在原目录显式 `--force` 归档重建。旧版已完成目录作为历史结果保留。已有请求指纹的待核任务使用创建该目录的版本续跑。升级后另起本版任务。对于没有请求指纹的早期首轮目录，程序支持在显式提交用途判断时重新核验兼容性。
 
 入口二在 `workflow_status.json` 中分别报告以下数量。
 
