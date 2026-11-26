@@ -817,9 +817,13 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
                 export_rows = {r['identity']: r for r in inventory['candidates'] if r['identity'] in provisional
                                and r['eligibility'] in {'scope_required', 'single_write', 'distributed_write'}}
             elif rechecks:
-                targets_to_review = {r['name'].casefold() for r in rechecks}
-                export_rows = {r['identity']: r for r in inventory['candidates']
-                               if r['identity'] in chosen or r['identity'] in targets_to_review}
+                reasons = {r['name'].casefold(): r.get('kind') for r in rechecks}
+                export_rows = {}
+                for row in inventory['candidates']:
+                    key = row['identity']
+                    if key in chosen or (key in reasons and not (
+                            reasons[key] == 'same_bound_operation' and execution.workstations.commands.private_protocol(row))):
+                        export_rows[key] = row
             for key, record in export_rows.items():
                 name = record['name']
                 site = record['transitions'][0] if record['transitions'] else record['dispatch_writes'][0]['write']

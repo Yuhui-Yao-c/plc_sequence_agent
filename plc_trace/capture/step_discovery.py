@@ -10,6 +10,7 @@ from plc_trace.analysis.candidate_filter import glob_regex
 from plc_trace.analysis.successor_graph import _st_tokens_with_spans
 from plc_trace.capture.capture_use import timing_use
 from plc_trace.capture.coverage import protect_channels
+from plc_trace.capture.scope_recheck import verify_private_boundaries
 from plc_trace.capture.station_scope import dependent_writes, family, required_cursors, same_station_array, writer_context
 from plc_trace.source.source_expressions import source_condition
 
@@ -424,6 +425,8 @@ def scope_selection(inventory, decisions, required_channels=(), *, execution=Non
         reviewed[key]['gated_by'] = parents
     roles = list(reviewed.values())
     protect_channels(inventory, roles, required_channels, execution=execution)
+    if execution and execution.workstations.commands.owners:
+        verify_private_boundaries(inventory, roles, execution.workstations.commands, required_channels)
     for decision in roles:
         key = decision['name'].casefold()
         if decision['admission'] == 'retained' and key in eligible:

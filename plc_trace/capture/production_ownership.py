@@ -25,9 +25,8 @@ def _linear_span(writes, first, last):
     return path
 
 
-def _read_matches(use, wait, exit_write):
+def matches_terminal_read(use, wait):
     return (use.get('kind') == 'parent_exit' and use.get('value') == wait['child_value']
-            and use.get('to') == exit_write['to']
             and (use.get('target') or '').casefold() == wait['selector'].casefold()
             and use.get('scope') == wait['scope'] and use.get('network') == wait['network']
             and use.get('section_line') == wait['source_line'] and use.get('write_offset') == wait['offset'])
@@ -138,7 +137,7 @@ def enclosed_child(row, rows, launches):
             or (exit_write.get('offset'), exit_write.get('source_line')) != (wait['offset'], wait['source_line'])):
         return None
     reads = [use for use in uses if use['kind'] != 'dispatch']
-    if not reads or not all(_read_matches(use, wait, exit_write) for use in reads):
+    if not reads or not all(matches_terminal_read(use, wait) and use.get('to') == exit_write['to'] for use in reads):
         return None
     dispatches = [use for use in uses if use['kind'] == 'dispatch']
     if not dispatches or not all(_accounted_dispatch(use, row, exit_write) for use in dispatches):

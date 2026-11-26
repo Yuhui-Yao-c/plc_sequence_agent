@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from plc_trace.analysis.boundary_logic import IDENT, symbol
 from plc_trace.capture.action_obligations import action_obligation
+from plc_trace.capture.command_interface import CommandInterfaces
 from plc_trace.capture.coverage import array_storage
 from plc_trace.capture.station_scope import writer_context
 
@@ -79,6 +80,8 @@ class WorkstationInterfaces:
         witnessed_arrays.discard(None)
         self.channels = {r['identity'] for r in declared if r['sequence_witness'] or r.get('dispatch_writes')
                          or r['transitions'] and array_storage(r) in witnessed_arrays}
+        self.commands = CommandInterfaces(rows)
+        self.channels.update(self.commands.owners)
         self.by_caller = defaultdict(dict)
         self.chart_scopes = defaultdict(set)
         self.chart_outputs = defaultdict(set)
@@ -87,10 +90,10 @@ class WorkstationInterfaces:
         self.qualified = set()
         if not self.channels:
             return
-        for row in declared:
+        for row in rows:
             if row['identity'] not in self.channels:
                 continue
-            station = row['identity'].rpartition('.')[0]
+            station = self.commands.owners.get(row['identity'], row['identity'].rpartition('.')[0])
             hosts = defaultdict(set)
             for site in _writes(row):
                 caller = _call_scope(site)

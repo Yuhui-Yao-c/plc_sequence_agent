@@ -40,7 +40,7 @@ def _indexed_feedback(expr):
     return sorted(paths) if all(matches) and len({m[1] for m in matches}) == 1 else None
 
 
-def _only_arrival(row, rows):
+def arrival_only(row, rows):
     """A passive readiness cursor, sampled by a multi-party AND at one parent write."""
     writes, links = row['transitions'], row['control_links']
     if (not writes or row['effects'] or len(links) != 2
@@ -166,7 +166,7 @@ def coordination_only(row, rows, boundaries):
     """Do not overturn a separate verified operation in another branch or mode."""
     if not boundaries:
         return None
-    barrier = _only_arrival(row, rows)
+    barrier = arrival_only(row, rows)
     if barrier:
         return barrier
     writes = {w['id']:w for w in row['transitions']}

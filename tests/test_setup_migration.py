@@ -94,6 +94,16 @@ class SetupMigrationTests(unittest.TestCase):
         self.assertTrue((self.out / 'evidence/scope_results.json').is_file())
         self.assertEqual(self.run_setup(), resumed)
 
+    def test_19_0_1_pending_canonical_run_resumes_in_place(self):
+        old = self.run_setup()
+        marker = self.out / 'workflow_status.json'
+        marker.write_text(json.dumps(dict(old, version='19.0.1', request_sha256='old pipeline')))
+        new = self.run_setup()
+        self.assertEqual(new['out'], str(self.out))
+        self.assertEqual(new['trace_targets_stage'], 'preview')
+        self.assertEqual(new['inventory_sha256'], old['inventory_sha256'])
+        self.assertFalse(self.out.with_name('setup_2').exists())
+
     def test_only_compatible_requests_and_unfinished_flat_18_5_1_runs_are_migrated(self):
         old = restore_flat_layout(self.out, self.run_setup(task_name='Run'))
         request = dict(source=self.source, digest=old['source_sha256'], automatic=True, capture_format='auto',

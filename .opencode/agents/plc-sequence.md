@@ -63,7 +63,7 @@ python plc_cli.py "source/工程/PLC程序.xml" --trace-setup -output "outputs"
 
 按当前 `workflow_status.json` 的 `next_action` 在同一轮执行下一步。`trace_targets` 始终指向 `static_variables.txt`，阶段取自 `trace_targets_stage`。
 
-1. 收到 `review_scope`（状态 `scope_review_pending`），保存返回的 `out`，立即读取候选与源码台账，按[采集配置](../skills/plc-trace-setup/SKILL.md)完成各实例的用途判断。首轮先核对工程声明的工位自动步及其实际写点。完整候选在证据目录中，逐项检查其他工位及并行作业的计时边界。将完整判断保存至运行目录的 `evidence/scope_review_input.json` 后继续提交。遇到缺失成员类型时保留缺口，直接继续判断。用户已提供核实声明时，可一并使用。
+1. 收到 `review_scope`（状态 `scope_review_pending`），保存返回的 `out`，立即读取候选与源码台账，按[采集配置](../skills/plc-trace-setup/SKILL.md)完成各实例的用途判断。首轮核对工位自动步的实际写点。外部结构缺少叶声明时，沿命令号的分派、工位实参及受控设备找到记录动作的地址。完整候选在证据目录中，逐项检查其他工位及并行作业的计时边界。将完整判断保存至运行目录的 `evidence/scope_review_input.json` 后继续提交。遇到缺失成员类型时保留缺口，直接继续判断。用户已提供核实声明时，可一并使用。
 2. 按原采集选项和实际 `out` 提交完整的 `--scope-results`，读取本次返回的状态。有独立清单时各轮沿用同一 `--reference`。收到 `recheck_scope`（状态 `scope_recheck_pending`），读取 `evidence/scope_recheck.json`，核对具体作业、写点和负责计时的地址。将完整判断的修订写回 `evidence/scope_review_input.json`，在同一目录继续提交。只有现有源码仍不足以决定作业归属时，才向用户指出具体待核作业与现场事实，并将当前清单标为待核。成员类型只在写入相应厂商通道时使用。
 3. 收到 `deliver_results` 时，核对 `trace_targets_stage=final`，从同一地址清单和正式配置取交付数。显式模式按规则提取完整路径和固定下标后，直接核对正式输出。
 
