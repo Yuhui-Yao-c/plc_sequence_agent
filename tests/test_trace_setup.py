@@ -176,6 +176,104 @@ class TraceSetupTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '其他任务'):
             generate(self.source, other, 'Step[1]', force=True)
 
+    def test_add_verified_members_to_same_reviewed_run_and_retire_partial_configuration(self):
+        names = ['Left.Phase', 'Right.Phase', 'Known']
+        self.sysmac('<GlobalVars>' + ''.join(
+            f'<Variable name="{n}"><Type><TypeName>{t}</TypeName></Type></Variable>'
+            for n, t in [('Left', 'Carrier'), ('Right', 'Feeder'), ('Known', 'INT')])
+            + '</GlobalVars><Program name="Work"><BodyContent><ST>'
+            + ' '.join(f'CASE {n} OF 1: {n}:=4; 4: {n}:=1; END_CASE;' for n in names)
+            + '</ST></BodyContent></Program>')
+        ref = self.root / 'verified_targets.txt'
+        ref.write_text('\n'.join(names))
+        args = {'reference': ref, 'choose_available': True}
+        first = generate(self.source, self.out, **args)
+        self.assertEqual(first['status'], 'scope_review_pending')
+        inventory = json.loads((self.out / 'step_variable_discovery.json').read_bytes())
+        scope = self.root / 'scope.json'
+        scope.write_text(json.dumps({'inventory_sha256': inventory['inventory_sha256'], 'decisions': [
+            {'name': r['name'], 'role': 'uncertain', 'reason': '独立地址可核对', 'basis': ['t1']}
+            for r in inventory['candidates'] if r['eligibility'] == 'scope_required']}))
+        partial = generate(self.source, self.out, scope_results=scope, **args)
+        self.assertEqual(partial['configured_variables'], 1)
+        self.assertFalse(Path(first['preview_configuration']).exists())
+        self.assertFalse(partial['configuration_complete'])
+        self.assertEqual(partial['reference_selected_variables'], 3)
+        self.assertEqual(partial['reference_only_variables'], 3)
+
+        supplement = self.out / 'member_types.csv'
+        supplement.write_text('结构类型,成员,数据类型\nCarrier,Phase,UINT\n')
+        second = generate(self.source, self.out, member_types=supplement, **args)
+        self.assertEqual(second['configured_variables'], 2)
+        self.assertEqual(second['out'], first['out'])
+        self.assertTrue(supplement.exists())
+        self.assertEqual(second['scope_input_sha256'], partial['scope_input_sha256'])
+        supplement.write_text('结构类型,成员,数据类型\nFeeder,Phase,DINT\n')
+        final = generate(self.source, self.out, member_types=supplement, **args)
+        self.assertEqual({c['name']: c['type'] for c in final['channels']},
+                         {'Left.Phase': 'UINT', 'Right.Phase': 'DINT', 'Known': 'INT'})
+        self.assertTrue(final['configuration_complete'])
+        self.assertEqual(list(self.out.glob('*trace_config*.csv')), [Path(final['configuration'])])
+        self.assertFalse((self.out / 'missing_member_types.csv').exists())
+        self.assertTrue(supplement.exists())
+        self.assertEqual(generate(self.source, self.out, scope_results=scope, **args), final)
+        self.assertFalse((self.root / 'setup_2').exists())
+        supplement.write_text('结构类型,成员,数据类型\nCarrier,Phase,LINT\n')
+        with self.assertRaisesRegex(ValueError, '冲突'):
+            generate(self.source, self.out, member_types=supplement, **args)
+        self.assertEqual(generate(self.source, self.out, **args), final)
+
+    def test_same_step_wait_in_a_reference_does_not_promote_its_child_release_state(self):
+        from plc_trace.capture.channel_reference import read_reference
+        phases = [{'identity': name, 'sequence_witness': True, 'transitions': [], 'control_links': [],
+                   'eligibility': 'scope_required'} for name in ('cell.phase', 'scan.phase', 'clamp.phase')]
+        files = self.root / 'timing.csv'
+        files.write_text('开始标签,结束标签\n'
+                         'Cell.Phase=7,Cell.Phase=7 AND Scan.Phase=100\n'
+                         'Scan.Phase=42 AND Clamp.Phase=3,Finished\n'
+                         'Cell.Phase=9,Clamp.Phase=4\n')
+        selected, _, unresolved = read_reference(files, phases)
+        self.assertEqual(set(selected), {'cell.phase', 'clamp.phase'})
+        self.assertEqual(unresolved, [{'row': 3, 'operands': ['clamp.phase', 'scan.phase']}])
+
+    def test_legacy_scope_can_be_upgraded_in_place_without_rewriting_other_judgments(self):
+        names = ['ClampProgress', 'FeedProgress']
+        self.sysmac('<GlobalVars>' + ''.join(
+            f'<Variable name="{n}"><Type><TypeName>INT</TypeName></Type></Variable>' for n in names)
+            + '</GlobalVars><Program name="Run"><BodyContent><ST>'
+            + ' '.join(f'CASE {n} OF 2: IF Ready THEN {n}:=8; END_IF; 8: {n}:=2; END_CASE;' for n in names)
+            + '</ST></BodyContent></Program>')
+        generate(self.source, self.out)
+        inventory = json.loads((self.out / 'step_variable_discovery.json').read_bytes())
+        old = []
+        for n in names:
+            old.append({'name': n, 'role': 'component_sequence', 'basis': ['t1'], 'reason': '机械动作',
+                        'use': 'production', 'boundaries': [{'action': '送料', 'write': 't1', 'via': 'signal:Ready'}]})
+        first = self.root / 'review.json'
+        review = {'inventory_sha256': inventory['inventory_sha256'], 'decisions': old}
+        first.write_text(json.dumps(review))
+        empty = generate(self.source, self.out, scope_results=first)
+        self.assertEqual((empty['status'], empty['legacy_timing_reviews'], empty['static_variables']),
+                         ('needs_review', 2, 0))
+        self.assertIsNone(empty['configuration'])
+        self.assertFalse(list(self.out.glob('*trace_config*.csv')))
+        old[-1]['timing_basis'] = {'scope': 'workstation', 'operation': '送料', 'boundary_write': 't1'}
+        first.write_text(json.dumps(review))
+        partial = generate(self.source, self.out, scope_results=first)
+        self.assertEqual((partial['legacy_timing_reviews'], partial['static_variables']), (1, 1))
+        original_config = Path(partial['configuration']).read_bytes()
+        old[0]['timing_basis'] = {'scope': 'workstation', 'operation': '夹紧', 'boundary_write': 't1'}
+        old[-1]['reason'] = '更改已有判断'
+        first.write_text(json.dumps(review))
+        with self.assertRaisesRegex(ValueError, '补判只能'):
+            generate(self.source, self.out, scope_results=first)
+        self.assertEqual(Path(partial['configuration']).read_bytes(), original_config)
+        old[-1]['reason'] = '机械动作'
+        first.write_text(json.dumps(review))
+        result = generate(self.source, self.out, scope_results=first)
+        self.assertEqual((result['static_variables'], result['legacy_timing_reviews']), (2, 0))
+        self.assertEqual(generate(self.source, self.out, scope_results=first), result)
+
     def test_shorthand_reuses_only_an_identical_source_options_and_program(self):
         import subprocess
         import sys

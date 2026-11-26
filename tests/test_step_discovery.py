@@ -14,6 +14,16 @@ from plc_trace.cli import _expand_trace_shorthand
 from tests.test_plcopen_trace_control import ladder, operand, port, program
 
 
+def timing_basis(action, write='t1', row=None):
+    basis = {'scope': 'workstation', 'operation': action, 'boundary_write': write}
+    if row:
+        parent = next((link for link in row['control_links'] if link['child'].casefold() == row['identity']), None)
+        if parent:
+            basis.update(scope='production_substep', parent_link=parent['id'],
+                         parent_relation='工装交接有独立到位条件，上层工位继续时才能结束该工装的交接阶段')
+    return basis
+
+
 class StepDiscoveryTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -45,7 +55,8 @@ class StepDiscoveryTests(unittest.TestCase):
                 via = next(('signal:' + signal for signal in ('Ready', 'ok', 'BufferFree')
                             if signal.casefold() in t.get('guard', '').casefold()), None)
                 if via or notes:
-                    item.update(use='production', boundaries=[{'action':'工装交接', 'write':t['id'],
+                    item.update(use='production', timing_basis=timing_basis('工装交接', t['id'], row),
+                                boundaries=[{'action':'工装交接', 'write':t['id'],
                                                                 'via':via or notes[-1]['id']}])
                 examples.setdefault(row['family'], {'example': row['name'], 'boundary': '此单元从接料到交出工件'})
             decisions.append(item)
@@ -172,6 +183,26 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertEqual([c['instance'] for c in rows[0]['transitions'][0]['binding']], ['outer', 'obj'])
         self.assertEqual(self.finish(inv, {'Z'})['channels'][0]['type'], 'INT')
 
+    def test_fb_child_start_and_wait_follow_the_same_bound_instance(self):
+        def var(name, typ):
+            return f'<Variable name="{name}"><Type><TypeName>{typ}</TypeName></Type></Variable>'
+
+        code = ('CASE Owner OF 1: Cursor:=10; Owner:=2; '
+                '2: IF Cursor=30 THEN Owner:=1; END_IF; END_CASE; '
+                'CASE Cursor OF 10: IF Ready THEN Cursor:=30; END_IF; 30: Cursor:=0; END_CASE;')
+        xml = ('<Project xmlns="www.iec.ch/public/TC65SC65BWG7TF10"><GlobalVars>'
+               +var('A','INT')+var('B','INT')+'</GlobalVars><FunctionBlock name="Unit"><InOutVars>'
+               +var('Owner','INT')+'</InOutVars><Vars>'+var('Cursor','INT')+'</Vars><BodyContent><ST>'
+               +code+'</ST></BodyContent></FunctionBlock><Program name="Site"><Vars>'
+               +var('Left','Unit')+var('Right','Unit')+'</Vars><BodyContent><ST>'
+               'Left(Owner:=A); Right(Owner:=B);</ST></BodyContent></Program></Project>')
+        _, inventory = self.prepare(xml)
+        for owner, child in [('A','Site.Left.Cursor'), ('B','Site.Right.Cursor')]:
+            row = next(r for r in inventory['candidates'] if r['name'] == child)
+            self.assertEqual({(l['kind'], l['parent'], l['parent_step'], l['child'], l['child_value'])
+                              for l in row['control_links']},
+                             {('starts_child', owner, 1, child, 10), ('waits_for_child', owner, 2, child, 30)})
+
     def test_wired_fb_can_nominate_a_name_absent_from_all_comparisons(self):
         ref = '<interface><inOutVars><variable name="V"><type><INT/></type></variable></inOutVars></interface>'
         fb = '<pou name="Unit" pouType="functionBlock">'+ref+'<body><ST>CASE V OF 1: V:=4; 4: V:=1; END_CASE;</ST></body></pou>'
@@ -277,6 +308,22 @@ class StepDiscoveryTests(unittest.TestCase):
         row = scope_selection(inv,None)[0]['cell.phase']
         self.assertIn((170,900), {(t['from'],t['to']) for t in row['transitions']})
 
+    def test_plcopen_launch_and_completion_do_not_reverse_or_include_bypasses(self):
+        variables = ('Main', 'Worker', 'Decoy')
+        body = ('CASE Main OF 1: Worker:=10; Main:=2; '
+                '2: IF Worker=30 AND (Decoy=1 OR Skip) THEN Main:=1; END_IF; END_CASE; '
+                'CASE Worker OF 10: IF Ready THEN Worker:=30; END_IF; 30: Worker:=0; END_CASE; '
+                'CASE Decoy OF 1: Decoy:=2; 2: Decoy:=1; END_CASE;')
+        xml = ('<project><fileHeader productName="InoProShop"/><globalVars>'
+               +''.join(f'<variable name="{n}"><type><INT/></type></variable>' for n in variables)
+               +'</globalVars>'+program('Site','<body><ST>'+body+'</ST></body>')
+               +'<resource><task name="T"><pouInstance name="Site"/></task></resource></project>')
+        _, inventory = self.prepare(xml)
+        rows = {r['name']:r for r in inventory['candidates']}
+        self.assertEqual({(link['kind'],link['parent'],link['child']) for link in rows['Main']['control_links']},
+                         {('starts_child','Main','Worker'), ('waits_for_child','Main','Worker')})
+        self.assertEqual(rows['Decoy']['control_links'], [])
+
     def test_shared_links_have_unique_ids_within_each_candidate(self):
         d = Discovery()
         for n in ('P','A','B'):
@@ -351,7 +398,7 @@ class StepDiscoveryTests(unittest.TestCase):
         scope = self.scope(inv, {'Cursor[0]'})
         item = next(r for r in scope['decisions'] if r['name']=='Cursor[1]')
         item.update(role='component_sequence', basis=['d2','t1'], use='production',
-                    boundaries=[{'action':'工装内部交接', 'write':'t1', 'via':'d2'}])
+                    timing_basis=timing_basis('工装内部交接'), boundaries=[{'action':'工装内部交接', 'write':'t1', 'via':'d2'}])
         chosen, reviewed = scope_selection(inv, scope)
         self.assertEqual(set(chosen), {'cursor[0]', 'cursor[1]'})
         self.assertEqual(reviewed[1]['admission'], 'captured')
@@ -374,8 +421,9 @@ class StepDiscoveryTests(unittest.TestCase):
         self.assertEqual([d['text'] for d in rows['Head.Mark']['declarations']], ['装配单元', '位置'])
         self.assertEqual([d['text'] for d in rows['Drive.Mark']['declarations']], ['移送元件', '位置'])
         result = self.finish(inv, {'Head.Mark'})
-        self.assertEqual({c['name'] for c in result['channels']}, {'Head.Mark', 'Drive.Mark'})
-        self.assertEqual(result['retained_variables'], ['Drive.Mark'])
+        self.assertEqual({c['name'] for c in result['channels']}, {'Head.Mark'})
+        self.assertEqual(result['retained_variables'], [])
+        self.assertIn('Drive.Mark', (self.out / 'optional_variables.csv').read_text(encoding='utf-8-sig'))
 
     def test_registered_slot_in_own_unit_with_foreign_array_and_program(self):
         var = '<Variable name="{}"><Type><TypeName>ARRAY[0..5] OF INT</TypeName></Type></Variable>'
@@ -449,7 +497,7 @@ class StepDiscoveryTests(unittest.TestCase):
                 row.update(use='service', reason='上电准备步骤')
             else:
                 signal = 'Done' if row['name'] == 'Pack' else 'Arrived'
-                row.update(use='production', boundaries=[{'action':'等待工件到位','write':'t1','via':'signal:'+signal}])
+                row.update(use='production', timing_basis=timing_basis('等待工件到位'), boundaries=[{'action':'等待工件到位','write':'t1','via':'signal:'+signal}])
         path = self.root/'review.json'
         path.write_text(json.dumps(scope))
         result = generate(self.source, self.out, scope_results=path)
@@ -483,7 +531,7 @@ class StepDiscoveryTests(unittest.TestCase):
         scope = self.scope(inv, set())
         item = next(d for d in scope['decisions'] if d['name']=='Phase')
         proof = dict(action='移至取料位', write=write['id'], via=move['id'])
-        item.update(role='component_sequence', use='production', boundaries=[proof])
+        item.update(role='component_sequence', use='production', timing_basis=timing_basis('工件移送',write['id']), boundaries=[proof])
         for bad in (home['id'], 'signal:Mode', 'signal:Phase', 'signal:HomeOK', 'e999'):
             with self.subTest(via=bad), self.assertRaisesRegex(ValueError,'佐证'):
                 scope_selection(inv, {**scope, 'decisions':[{**item,'boundaries':[{**proof,'via':bad}]}]})
@@ -514,7 +562,7 @@ class StepDiscoveryTests(unittest.TestCase):
         for item in scope['decisions']:
             item.update(role='component_sequence')
             if item['name']=='P.Cell.Cursor':
-                item.update(use='production', boundaries=[dict(action='等待工件就绪',write='t1',via='signal:Ready')])
+                item.update(use='production', timing_basis=timing_basis('等待工件就绪'), boundaries=[dict(action='等待工件就绪',write='t1',via='signal:Ready')])
             else:
                 item.update(use='service',reason='校验台由设置模式启动')
         path = self.root/'roles.json'
@@ -531,7 +579,7 @@ class StepDiscoveryTests(unittest.TestCase):
         cursor.edge(1, 2, {'scope':'Cell','guard':"X=1 AND (Received OR @condition(Message='Arrived'))"})
         row = cursor.record()
         def accept(signal):
-            return timing_use(row,dict(use='production',boundaries=[
+            return timing_use(row,dict(use='production',timing_basis=timing_basis('接收工件结果'),boundaries=[
                 dict(action='接收工件结果',write='t1',via='signal:'+signal)]), True)
         self.assertEqual(accept('Received')['admission'], 'captured')
         for word in ('Arrived','Message','X','condition'):

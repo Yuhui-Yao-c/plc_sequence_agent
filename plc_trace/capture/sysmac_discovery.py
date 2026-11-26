@@ -131,6 +131,18 @@ class Bindings:
             kind, _ = self.scan._peel_type(self.scan.member(kind, _root(part))[0], part)
         return kind
 
+    def standard_loop_trigger(self, unit, instance, index, first, last):
+        """The concrete FOR domain must fit the declared standard trigger array."""
+        match = re.fullmatch(r'([^\W\d]\w*)\[([^\W\d]\w*)\]', instance)
+        if not match or match[2].casefold() != index.casefold() or not unit:
+            return False
+        types = {self.type_of(f'{match[1]}[{bound}]', unit) for bound in (first, last)}
+        if len(types) != 1:
+            return False
+        kind = (types.pop() or '').casefold()
+        return (kind in {'r_trig', 'f_trig'} and kind not in self.scan.units
+                and kind not in self.scan.type_bodies)
+
     def global_port(self, path, unit, calls):
         """Only a declared global or a chain of writable actuals can connect two different POUs."""
         if not fixed_path(path):
@@ -235,26 +247,30 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
     limits = Counter()
     unresolved_selectors = set()
 
+    def bound_site(scope, site, chain):
+        bound = {**site, 'scope': scope, **({'binding': chain} if chain else {})}
+        if chain and 'guard' in site:
+            gate = source_condition(site['guard'])
+            operating = source_condition(site.get('operating_guard') or 'TRUE')
+            for call in reversed(chain):
+                invoke = source_condition(call['guard'])
+                aliases = binding.members_at(call['type'], call['instance']) | call['reference_actuals']
+                gate = combine('and', invoke, _bound_guard(gate, aliases))
+                operating = combine('and', invoke, _bound_guard(operating, aliases))
+            bound.update(guard=gate.text(), operating_guard='' if operating == TRUE else operating.text(),
+                         guard_complete=site.get('guard_complete', False) and all(c['guard_complete'] for c in chain))
+        host = binding.unit(chain[0]['scope'] if chain else scope)
+        if host and host[0] == 'program':
+            bound['program'] = host[1]
+        return bound
+
     def records(var, scope, site, co_names=()):
         paths = ([(f'{scope}::{var}', None, 'SMC2 中缺少可核实的作用域及整数声明', [])] if grid
                  else binding.paths(var, binding.unit(scope)))
         for name, kind, issue, chain in paths:
             row = result.candidate(name)
             row.declared, row.type_issue = kind, issue
-            bound = {**site, 'scope': scope, **({'binding': chain} if chain else {})}
-            if chain and 'guard' in site:
-                gate = source_condition(site['guard'])
-                operating = source_condition(site.get('operating_guard') or 'TRUE')
-                for call in reversed(chain):
-                    invoke = source_condition(call['guard'])
-                    aliases = binding.members_at(call['type'], call['instance']) | call['reference_actuals']
-                    gate = combine('and', invoke, _bound_guard(gate, aliases))
-                    operating = combine('and', invoke, _bound_guard(operating, aliases))
-                bound.update(guard=gate.text(), operating_guard='' if operating == TRUE else operating.text(),
-                             guard_complete=site.get('guard_complete', False) and all(c['guard_complete'] for c in chain))
-            host = binding.unit(chain[0]['scope'] if chain else scope)
-            if host and host[0] == 'program':
-                bound['program'] = host[1]
+            bound = bound_site(scope, site, chain)
             if not grid and co_names:
                 peers = set()
                 for peer in co_names - {var.casefold()}:
@@ -263,6 +279,20 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                             peers.add(address.casefold())
                 bound['co_cursors'] = sorted(peers)
             yield row, bound
+
+    def control_links(scope, site, target, number, tests, previous, reads_target):
+        """Resolve both operands along one invocation, including nested FB instances."""
+        unit = binding.unit(scope)
+        for address, _, _, chain in binding.paths(target, unit):
+            for operand, value in tests:
+                for peer, _, _, calls in binding.paths(operand, unit):
+                    if chain != calls:
+                        continue
+                    location = bound_site(scope, site, chain)
+                    if not reads_target:
+                        yield peer, value, address, number, 'starts_child', location
+                    for step in previous:
+                        yield address, step, peer, value, 'waits_for_child', location
 
     # Either adapter may see the same ST instruction. Match its actual token within
     # the original XML fragment. Distinct instructions on one line keep separate IDs.
@@ -315,19 +345,20 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             row.edge(rel['from'], rel['to'], bound)
 
     # Retain locations and non-monitor instructions in the same executable ST
-    # branch. In an unsupported body accept only the parsed prefix before the
-    # first unsupported control statement; never flatten or resume after it.
+    # branch. A bounded loop can be masked only when its writes are localized;
+    # otherwise the structured parser stops at the first unsupported statement.
     for block in slices:
         if block.get('external_issue'):
             continue
         code = block['code']
-        available, loop_writes = code, set()
+        available, omissions = code, []
+        unit = binding.unit(block['scope'])
         if block.get('issue', '').startswith('ST unsupported flow FOR'):
-            available, loop_writes = isolate_counted_loops(code, allow_early_exit=on_transition is None)
-        first_omitted = len(code)
-        if loop_writes:
+            available, _ = isolate_counted_loops(
+                code, allow_early_exit=on_transition is None, omissions=omissions,
+                trigger_type=lambda *args: binding.standard_loop_trigger(unit, *args))
+        if omissions:
             limits['counted_loop_contents_omitted'] += 1
-            first_omitted = next(i for i, (a, b) in enumerate(zip(code, available)) if a != b)
         parser = STParser(available, condition_parser=source_condition, strict=False, retain_source=True)
         try:
             parser.seq()
@@ -369,7 +400,14 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                             'guard':gate.text(),'guard_complete':False,'limit':'前序循环的效果未经求值'})
         states = defaultdict(set)
         entries = []
-        unit = binding.unit(block['scope'])
+        def uncertain_write(path, offset):
+            # CASE reads its selector on entry. Earlier CASEs and earlier
+            # sibling arms cannot mutate it between this arm and this write.
+            key = path.casefold()
+            arm = max((start for kind, _, start, var in parser.frames.get(offset, ())
+                       if kind == 'case' and var.casefold() == key), default=-1)
+            return any(arm < start < offset and loop_may_write(key, writes) for start, writes in omissions)
+
         def same_type(lhs, rhs):
             kind = binding.type_of(lhs, unit) if unit else None
             return bool(kind and kind.upper() in INTEGER_BOUNDS and kind == binding.type_of(rhs, unit))
@@ -387,7 +425,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                     read_inputs.update(_guard_signals(rhs))
             reset_inputs.intersection_update(read_inputs)
         for lhs, rhs, condition, offset, note in statements:
-            if not fixed_path(lhs) or (offset >= first_omitted and loop_may_write(lhs, loop_writes)):
+            if not fixed_path(lhs) or uncertain_write(lhs, offset):
                 continue
             gate = combine('and', outer, condition)
             anchors = {a.args[0].casefold() for a in comparisons(gate) if a.kind == 'eq'}
@@ -416,7 +454,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
             if any(start <= offset < end for start, end in regions.get(lhs.casefold(), ())):
                 site['case_selector'] = lhs
                 site['other_condition'] = bool(_conditions(gate, lhs.casefold()))
-            current = []
+            current = set()
             for key, step in src:
                 if key != lhs.casefold():
                     continue
@@ -428,7 +466,7 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                         continue
                     if destination == step:
                         continue
-                    current.append((key, step))
+                    current.add(step)
                     states[key].add(step)
                     if on_transition is None:
                         chain = bound.get('binding', ())
@@ -453,17 +491,20 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                             bound = dict(bound, comment=native[-1]['comment'])
                         on_transition(row.name, step, destination, bound)
                     row.edge(step, destination, bound)
-            if number is not None and (unit := binding.unit(block['scope'])) and unit[0] == 'program':
-                target = scan.sysmac_channel(lhs, unit)[0]
-                if lhs.casefold() not in anchors:external_writer(lhs,rhs,gate,site)
-                for other, value in src:
-                    if other == lhs.casefold() or (offset >= first_omitted and loop_may_write(other, loop_writes)):
-                        continue
-                    reference = scan.sysmac_channel(other, unit)[0]
-                    location = {**site, 'scope': block['scope']}
-                    result.possible_links.append((reference, value, target, number, 'starts_child', location))
-                    for _, step in current:
-                        result.possible_links.append((target, step, reference, value, 'waits_for_child', location))
+            if number is not None and unit and not grid:
+                if lhs.casefold() not in anchors:
+                    external_writer(lhs, rhs, gate, site)
+                if on_transition is None:
+                    # Pair operands only within the same concrete invocation. Reading a
+                    # child's completion to advance its parent does not start the parent.
+                    selectors = required_cursors(gate) - {lhs.casefold()}
+                    if current:
+                        selectors.difference_update(required_cursors(operating))
+                    tests = [(other, value) for other, value in src if other in selectors and
+                             not uncertain_write(other, offset)]
+                    if tests:
+                        result.possible_links.extend(control_links(block['scope'], site, lhs, number, tests,
+                                                                   current, lhs.casefold() in anchors))
             if not current and (reset_inputs or rhs.strip().upper() in ('TRUE', 'FALSE')):
                 entries.append((src, lhs, rhs, site))
         for src, lhs, rhs, site in entries:

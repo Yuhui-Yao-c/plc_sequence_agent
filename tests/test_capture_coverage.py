@@ -33,6 +33,11 @@ class CoverageTests(unittest.TestCase):
         self.root = Path(tmp.name)
         self.xml = self.root/'工序.xml'
 
+    def known(self, addresses, file_name='known.txt'):
+        path = self.root / file_name
+        path.write_text('\n'.join(addresses))
+        return path
+
     def prepare(self, xml, **options):
         self.xml.write_text(xml)
         out = self.root/'run'
@@ -48,13 +53,14 @@ class CoverageTests(unittest.TestCase):
         variables = [('Arm','Job'), ('Rack','ARRAY[1..3] OF Job'), ('Buffer','Transfer'), ('Known','INT')]
         names = ['Arm.Phase', 'Rack[2].Phase', 'Buffer.Phase', 'Known']
         body = ' '.join(f'CASE {n} OF 1: {n}:=4; 4: {n}:=1; END_CASE;' for n in names)
-        out, inv = self.prepare(sysmac(variables, [('Cell',body)]))
+        reference = self.known(names)
+        out, inv = self.prepare(sysmac(variables, [('Cell',body)]), reference=reference)
         first = json.loads((out/'workflow_status.json').read_bytes())
         self.assertEqual((first['static_variables'], first['trace_target_count'], first['preview_configured_variables']),
                          (0, 4, 1))
         self.assertEqual(set(Path(first['trace_targets']).read_text().splitlines()), set(names))
         self.assertIn('Known:INT', Path(first['preview_configuration']).read_text(encoding='utf-8-sig'))
-        final = self.merge(out, neutral(inv))
+        final = self.merge(out, neutral(inv), reference=reference)
         self.assertEqual((final['status'],final['configured_variables'],final['static_variables']), ('needs_review',1,4))
         self.assertFalse(Path(first['preview_configuration']).exists())
         self.assertEqual(set(Path(final['trace_targets']).read_text().splitlines()), set(names))
@@ -64,7 +70,7 @@ class CoverageTests(unittest.TestCase):
                          [('Job','Phase','','2'),('Transfer','Phase','','1')])
         supplement = self.root/'verified.csv'
         supplement.write_text('结构类型,成员,数据类型\nJob,Phase,UINT\nTransfer,Phase,DINT\n')
-        complete = generate(self.xml,self.root/'completed',scope_results=out/'scope_results.json',member_types=supplement)
+        complete = generate(self.xml,self.root/'completed',scope_results=out/'scope_results.json',member_types=supplement,reference=reference)
         self.assertTrue(complete['configuration_complete'])
         self.assertIsNone(complete['member_type_template'])
         self.assertEqual({r['name']:r['type'] for r in complete['channels']},
@@ -73,7 +79,7 @@ class CoverageTests(unittest.TestCase):
 
     def test_reference_type_applies_only_to_instances_of_the_same_omitted_scalar_member(self):
         reference = self.root/'reference.csv'
-        reference.write_text('变量,类型\nLeft.Stage,UINT\n')
+        reference.write_text('变量,类型\nLeft.Stage,UINT\nRight.Stage,\nOther.Stage,\nLeft.Index[1],\n')
         addresses = ['Left.Stage','Right.Stage','Other.Stage','Left.Index[1]']
         xml = sysmac([('Left','Outer'),('Right','Outer'),('Other','Inner')], [('Line',' '.join(
             f'CASE {n} OF 1: {n}:=2; 2: {n}:=1; END_CASE;' for n in addresses))])
@@ -103,12 +109,13 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual((partial['configured_variables'],set(partial['unresolved_types'])),(2,{'Port.Child.Mark'}))
 
     def test_all_untyped_still_produces_the_entire_target_list_in_both_stages(self):
+        reference = self.known(['Arm.State'])
         out, inv = self.prepare(sysmac([('Arm','Interface')],[('Work','CASE Arm.State OF 0: Arm.State:=3; '
-                                                          '3: Arm.State:=0; END_CASE;')]))
+                                                          '3: Arm.State:=0; END_CASE;')]), reference=reference)
         first = json.loads((out/'workflow_status.json').read_bytes())
         self.assertIsNone(first['preview_configuration'])
         self.assertEqual(Path(first['trace_targets']).read_text().splitlines(),['Arm.State'])
-        final = self.merge(out,neutral(inv))
+        final = self.merge(out,neutral(inv),reference=reference)
         self.assertIsNone(final['configuration'])
         self.assertEqual(Path(final['trace_targets']).read_text().splitlines(),['Arm.State'])
         self.assertEqual(final['trace_target_count'],1)
@@ -127,7 +134,7 @@ class CoverageTests(unittest.TestCase):
                          {'West.Cursor[1].Phase':'DINT','East.Cursor[1].Phase':None,'West.Cursor[7].Phase':None})
         self.assertEqual(status['configured_variables'],1)
 
-    def test_renamed_production_cursor_survives_each_negative_role(self):
+    def test_negative_role_keeps_renamed_cursor_available_for_review_only(self):
         for name,owner in [('Amber','Bay'),('物件位置','左侧工艺')]:
             xml = sysmac([(name,'INT')], [(owner,f'CASE {name} OF 2: IF Ready THEN Grip:=TRUE; {name}:=5; END_IF; 5: {name}:=2; END_CASE;')])
             self.xml.write_text(xml)
@@ -138,7 +145,8 @@ class CoverageTests(unittest.TestCase):
                 review=neutral(inv)
                 review['decisions'][0].update(role=role,use=use,basis=['t1','t2'])
                 _, decisions=scope_selection(inv,review)
-                self.assertEqual([(a['name'],a['admission']) for a in decisions],[(name,'retained')])
+                expected = 'optional' if use == 'detail' else 'review'
+                self.assertEqual([(a['name'], a['admission']) for a in decisions], [(name, expected)])
 
     def test_short_array_and_external_start_survive_omitted_decisions(self):
         xml=sysmac([('Token','ARRAY[0..4] OF INT'),('Pin','INT'),('Limit','INT')],
@@ -148,11 +156,11 @@ class CoverageTests(unittest.TestCase):
                      ('Launch','IF Load THEN Pin:=2; END_IF;')])
         out,inv=self.prepare(xml)
         status=self.merge(out,neutral(inv))
-        self.assertEqual({r['name'] for r in status['channels']},{'Token[0]','Token[3]','Pin'})
-        self.assertEqual(status['configured_variables'],3)
+        self.assertEqual(status['channels'], [])
+        self.assertEqual(status['configured_variables'], 0)
         self.assertFalse(status['coverage_complete'])
         with (out/'optional_variables.csv').open(encoding='utf-8-sig') as f:
-            self.assertIn('Limit',{r['步序变量'] for r in csv.DictReader(f)})
+            self.assertEqual({r['步序变量'] for r in csv.DictReader(f)}, {'Token[0]', 'Token[3]', 'Pin', 'Limit'})
         pin=next(r for r in inv['candidates'] if r['name']=='Pin')
         self.assertIn('Launch',pin['entry_writes'][0]['scope'])
 
@@ -176,8 +184,14 @@ class CoverageTests(unittest.TestCase):
                     self.assertIn('Issue',pair['write']['scope'])
                     self.assertIn('Execute',pair['dispatch']['scope'])
                 s=self.merge(out,neutral(inv))
-                self.assertEqual([a['name'] for a in s['channels']],['Token'])
-                with (out/'capture_context.csv').open(encoding='utf-8-sig') as f:
+                self.assertEqual(s['channels'], [])
+                with (out / 'optional_variables.csv').open(encoding='utf-8-sig') as f:
+                    self.assertEqual([r['步序变量'] for r in csv.DictReader(f)], ['Token'])
+                ref = self.known(['Token'])
+                checked = generate(self.xml, self.root / (fmt + '-known'), scope_results=out / 'scope_results.json',
+                                   reference=ref)
+                self.assertEqual([a['name'] for a in checked['channels']], ['Token'])
+                with (Path(checked['out']) / 'capture_context.csv').open(encoding='utf-8-sig') as f:
                     self.assertEqual({(r['写前步值'],r['写后步值']) for r in csv.DictReader(f)},{('','4'),('','7')})
                 replay=generate(self.xml,self.root/(fmt+'2'),scope_results=out/'scope_results.json')
                 self.assertEqual(s['channels'],replay['channels'])
@@ -250,18 +264,59 @@ class CoverageTests(unittest.TestCase):
         self.assertIsNotNone(_data_use(row('Limits[3]','15',0,2,'累计时间设定')))
         self.assertIsNone(_data_use(row('Jaw','TRUE',0,2,'累计时间设定')))
 
+    def test_clean_case_arm_after_counted_loop_requires_localized_writes_and_fresh_dispatch(self):
+        body = ('CASE Mark OF 1: FOR Ix:=0 TO 2 DO Edges[Ix](CLK:=Sensors[Ix]); Mark:=9; END_FOR; '
+                'Mark:=3; 2: IF Ready THEN Mark:=4; END_IF; END_CASE; '
+                'IF Mode=2 THEN CASE Mark OF 9: IF Done THEN Mark:=12; END_IF; END_CASE; END_IF;')
+        for kind, trigger, end, shadow, recover in [
+                ('R_TRIG', 'CLK:=Sensors[Ix]', 2, '', True),
+                ('F_TRIG', 'CLK:=Sensors[Ix]', 2, '', True),
+                ('UserBlock', 'CLK:=Sensors[Ix]', 2, '', False),
+                ('R_TRIG', 'CLK:=Sensors[Ix]', 3, '', False),
+                ('R_TRIG', 'CLK:=Sensors[Ix], Q=>Other', 2, '', False),
+                ('R_TRIG', 'CLK:=Detect(Sensors[Ix])', 2, '', False),
+                ('R_TRIG', 'CLK:=Sensors[Ix]', 2, '<FunctionBlock name="R_TRIG"/>', False)]:
+            with self.subTest(kind=kind, trigger=trigger, end=end, shadow=shadow):
+                code = body.replace('CLK:=Sensors[Ix]', trigger).replace('TO 2', f'TO {end}')
+                source = sysmac([('Mark', 'INT'), ('Edges', f'ARRAY[0..2] OF {kind}')], [('Press', code)])
+                self.xml.write_text(source.replace('</Project>', shadow + '</Project>'))
+                from plc_trace.capture.extract_step_variables import _SourceScan
+                from plc_trace.capture.sysmac_discovery import discover
+                scan = _SourceScan(None, 'omron_iec61131_10', False)
+                scan.read(self.xml)
+                found = discover(self.xml, scan)
+                row = found.candidates.get('mark')
+                writes = {(t['from'], t['to']): t for t in row.sites.values()} if row else {}
+                self.assertNotIn((1, 3), writes)
+                self.assertNotIn((1, 9), writes)
+                self.assertEqual((2, 4) in writes, recover)
+                self.assertEqual((9, 12) in writes, recover)
+                if recover:
+                    write = writes[9, 12]
+                    self.assertFalse(write['guard_complete'])
+                    self.assertIn('Mode=2', write['guard'])
+                    self.assertIn('Done', write['guard'])
+
+    def test_unresolved_indexed_call_with_spaces_remains_opaque(self):
+        from plc_trace.capture.step_discovery import isolate_counted_loops
+
+        body = 'FOR Ix:=1 TO 3 DO Worker [Ix] (); END_FOR; CASE Mark OF 5: Mark:=6; END_CASE;'
+        self.assertEqual(isolate_counted_loops(body), (body, set()))
+
     def test_dynamic_selector_is_reported_even_when_the_static_channel_is_configured(self):
+        ref = self.known(['A'])
         out,inv=self.prepare(sysmac([('A','INT'),('Rack','ARRAY[0..8] OF INT')],
                     [('Line','CASE A OF 2: A:=7; 7: A:=2; END_CASE; '
-                             'CASE Rack[i] OF 1: Rack[i]:=2; 2: Rack[i]:=1; END_CASE;')]))
-        s=self.merge(out,neutral(inv))
+                             'CASE Rack[i] OF 1: Rack[i]:=2; 2: Rack[i]:=1; END_CASE;')]),reference=ref)
+        s=self.merge(out,neutral(inv),reference=ref)
         self.assertIn('Line::ST::rack[i]',s['coverage']['source_limits']['unresolved_selectors'])
         self.assertTrue(s['configuration_complete'])
         self.assertFalse(s['coverage_complete'])
 
     def test_corrupt_serialization_cannot_replace_pending_run(self):
         xml=sysmac([('A','INT'),('B','INT')],[('P','CASE A OF 2: A:=5; 5: A:=2; END_CASE; CASE B OF 3: B:=7; 7: B:=3; END_CASE;')])
-        out,inv=self.prepare(xml)
+        ref = self.known(['A', 'B'])
+        out,inv=self.prepare(xml,reference=ref)
         before=(out/'workflow_status.json').read_bytes()
         for damaged in ('drop','rename','type','duplicate'):
             def writer(channels,task):
@@ -269,9 +324,9 @@ class CoverageTests(unittest.TestCase):
                 return raw.replace(b',B:INT', {'drop':b'','rename':b',C:INT','type':b',B:SINT','duplicate':b',A:INT'}[damaged])
             with self.subTest(damaged=damaged), patch('plc_trace.capture.extract_step_variables._sysmac_config',writer):
                 with self.assertRaisesRegex(ValueError,'配置回读'):
-                    self.merge(out,neutral(inv))
+                    self.merge(out,neutral(inv),reference=ref)
                 self.assertEqual((out/'workflow_status.json').read_bytes(),before)
-        self.assertEqual(self.merge(out,neutral(inv))['configured_variables'],2)
+        self.assertEqual(self.merge(out,neutral(inv),reference=ref)['configured_variables'],2)
 
     def test_native_trace_requires_sample_and_configuration_addresses_to_match(self):
         from plc_trace.paths import RESOURCE_ROOT

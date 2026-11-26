@@ -5,7 +5,7 @@ from functools import lru_cache
 
 from lxml import etree
 
-from plc_trace.analysis.boundary_logic import IDENT, integer, symbol
+from plc_trace.analysis.boundary_logic import IDENT, constrained_states, integer, symbol
 from plc_trace.analysis.fb_transport import bindings, interface
 from plc_trace.analysis.successor_graph import STParser, WireBody, pins, tag, text, _st_tokens_with_spans
 from plc_trace.capture.extract_step_variables import _executable_text
@@ -235,14 +235,13 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
                 site['global_reads'] = sorted(s for s in _guard_signals(item['operating_guard'])
                                               if re.split(r'[.\[]', s, 1)[0] not in ci.types.locals.get(item['program'], {}))
         candidate.edge(item['from'], item['to'], site)
-        for other, conditions in item['numeric_conditions'].items():
-            if other.casefold() not in names or other.casefold() == key:
-                continue
-            peer = resolve(other.casefold(), item).name
-            for condition in conditions:
-                if condition['operator'] == '=' and re.fullmatch(r'-?\d+', condition['value']):
-                    result.possible_links.append((candidate.name, item['from'], peer, int(condition['value']),
-                                                  'waits_for_child', site))
+        if others and on_transition is None:
+            # A comparison enabling the whole routine, or one that an alternative
+            # arm bypasses, does not establish a wait at this production step.
+            waited = required - required_cursors(source_condition(item['operating_guard'] or 'TRUE'))
+            for other, value in constrained_states(source_condition(item['guard']), waited):
+                peer = resolve(other, item).name
+                result.possible_links.append((candidate.name, item['from'], peer, value, 'waits_for_child', site))
     for (key, step), commands in ci.commands.items():
         for item in commands:
             candidate = resolve(key, item)
@@ -255,6 +254,10 @@ def discover(source, scan, *, on_transition=None, on_unresolved=None, on_entry=N
     if on_transition is None:
         for key, value, item in ci.external_writes:
             candidate = resolve(key, item)
+            for other, step in item['controllers']:
+                if other in names and other != key:
+                    parent = resolve(other, item).name
+                    result.possible_links.append((parent, step, candidate.name, value, 'starts_child', _site(item)))
             if value in candidate.dispatches or (len(candidate.edges) == 1 and any(a == value for a, _ in candidate.edges)):
                 resolve(key, item, writer=True).external_write(value, _site(item))
     # Use only witnessed control writes for automatic routing. Initialisation,

@@ -8,7 +8,7 @@ import io
 import json
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +32,7 @@ from plc_trace.capture.plcopen_tasks import (
 )
 from plc_trace.capture.station_scope import at_path, declaration
 from plc_trace.capture.setup_output import (
-    legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files,
+    legacy_pending, matches_request, publish, read_status, select_run_dir, verify_files, verify_scope_upgrade,
 )
 from plc_trace.source.smc2_source import iter_networks
 from plc_trace.source.source_format import detect_source_format
@@ -645,39 +645,60 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         'source': str(source), 'source_sha256': digest, 'pipeline': pipeline_fingerprint(),
         'patterns': matcher.patterns if matcher else [], 'case_sensitive': case_sensitive,
         'capture_format': capture_format, 'task_name': task_name, 'every_n_cycles': every_n_cycles,
-        'default_type': default_type, 'reference_sha256': reference_sha, 'member_types_sha256': member_sha,
+        'default_type': default_type, 'reference_sha256': reference_sha,
     }, sort_keys=True).encode()).hexdigest()
     out = Path(out)
     if choose_available:
         out = select_run_dir(out.parent.resolve() / out.name, request)
     out = out.resolve()
-    if (any(p and p.is_relative_to(out) for p in (source_input, source, reference, member_types, Path.cwd()))
+    if (any(p and p.is_relative_to(out) for p in (source_input, source, reference, Path.cwd()))
+            or (force and member_types and member_types.is_relative_to(out))
             or PROJECT_ROOT.is_relative_to(out)):
         raise ValueError('采集配置输出须使用独立目录，与源码和程序分开')
     with lock_run_dir(out):
         pending = None
+        upgrading_scope = None
+        previous_scope_sha = None
         scope_bytes = Path(scope_results).read_bytes() if scope_results is not None else None
+        member_sources = {key: member_sha for key in verified_members}
         if out.exists() and not out.is_dir():
             raise ValueError('输出路径须为目录')
         if out.exists() and any(out.iterdir()):
             status = read_status(out)
             if status.get('mode') != 'trace_setup':
                 raise ValueError('输出目录属于其他任务，请使用空目录')
+            if member_types and member_types.parent == out and member_types.name in status.get('artifact_sha256', {}):
+                raise ValueError('请在单独的成员类型 CSV 副本中填写已核实的声明，保留工作流产物')
             if not force:
                 legacy = (not choose_available and scope_bytes is not None
                           and legacy_pending(status, source, out, digest, task_name, every_n_cycles))
                 if not matches_request(status, out, request) and not legacy:
                     raise ValueError('源码、程序版本或采集选项与已有任务不同，请指定空目录或显式 --force 重建')
-                if scope_bytes is not None and status.get('status') == 'scope_review_pending':
-                    if not legacy:
-                        verify_files(out, status)
-                    pending = status
-                else:
+                if not legacy:
                     verify_files(out, status)
-                    if scope_bytes is not None and hashlib.sha256(scope_bytes).hexdigest() not in (
+                previous_members = status.get('verified_member_types', [])
+                new_keys = set(verified_members)
+                for declaration in previous_members:
+                    key = declaration['owner'], declaration['member']
+                    if verified_members.get(key, declaration['type']) != declaration['type']:
+                        raise ValueError(f'补录声明与已核实成员类型冲突：{key[0]}.{key[1]}')
+                    verified_members[key] = declaration['type']
+                    member_sources[key] = declaration['source_sha256']
+                    new_keys.discard(key)
+                if status['status'] != 'scope_review_pending' and scope_bytes is not None:
+                    if hashlib.sha256(scope_bytes).hexdigest() not in (
                             status.get('scope_input_sha256'), status['artifact_sha256'].get('scope_results.json')):
-                        raise ValueError('已有任务已结束，范围判断与已提交结果不同，请核对后显式重建')
+                        if not status.get('legacy_timing_reviews'):
+                            raise ValueError('已有任务已结束，范围判断与已提交结果不同，请核对后显式重建')
+                        upgrading_scope = json.loads((out / 'scope_results.json').read_bytes())
+                completing_scope = scope_bytes is not None and status['status'] == 'scope_review_pending'
+                if not new_keys and not completing_scope and not upgrading_scope:
                     return status
+                pending = status
+                if not completing_scope and not upgrading_scope and 'scope_results.json' in status.get('artifact_sha256', {}):
+                    previous_scope_sha = status.get('scope_input_sha256')
+                    if scope_bytes is None:
+                        scope_bytes = (out / 'scope_results.json').read_bytes()
         source_format = detect_source_format(source)
         before = source.stat()
         scan = _SourceScan(matcher, source_format, case_sensitive)
@@ -730,6 +751,8 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             sequences, roles = scope_selection(inventory, decisions, required, execution=execution)
             inventory['decisions'] = roles
             families = decisions.get('station_families', []) if decisions is not None else []
+            if upgrading_scope:
+                verify_scope_upgrade(upgrading_scope, roles, families)
             inventory['station_families'] = families
             inventory['reference_sites'] = discovered.reference_sites
             slots, arrays = array_coverage(inventory, sequences, roles, discovered.reference_sites)
@@ -825,7 +848,10 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         delivery = {
             'trace_targets': str(out / targets), 'trace_target_count': len(ordered),
             'member_type_template': str(out / 'missing_member_types.csv') if member_gaps else None,
-            'member_types_sha256': member_sha,
+            'member_types_sha256': member_sha or (pending or {}).get('member_types_sha256'),
+            'verified_member_types': [{'owner': owner, 'member': member, 'type': kind,
+                                       'source_sha256': member_sources[owner, member]}
+                                      for (owner, member), kind in sorted(verified_members.items())],
         }
         if preview:
             delivery.update(preview_configuration=str(out / config) if config else None,
@@ -847,22 +873,28 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
             'sample_count': 0,
         }
         if automatic:
+            admissions = Counter(d['admission'] for d in roles)
+            source_confirmed = {d['name'].casefold() for d in roles if d['admission'] == 'captured'}
+            reference_selected = final_channels.keys() & required.keys()
             report.update(selection_mode='automatic', discovery='step_variable_discovery.json',
                           sequence_variables=len(sequences), referenced_step_slots=len(slots), optional_variables=len(optional),
-                          confirmed_production_variables=sum(d['admission'] == 'captured' for d in roles),
+                          confirmed_production_variables=admissions['captured'],
+                          legacy_timing_reviews=sum(bool(d.get('legacy_boundaries')) for d in roles),
+                          reviewed_candidates=len(roles), scope_admission_counts=dict(sorted(admissions.items())),
+                          reference_selected_variables=len(reference_selected),
+                          reference_only_variables=len(reference_selected - source_confirmed),
                           scope_candidates=eligible, single_write_candidates=single_writes, distributed_write_candidates=distributed,
                           inventory_sha256=inventory['inventory_sha256'],
                           activation_sha256=evidence_sha,
                           scope_policy=inventory['scope_policy'], station_family_count=len(families),
-                          scope_excluded=sum(r['admission'] == 'excluded' for r in roles),
-                          scope_uncertain=sum(r['admission'] == 'review' for r in roles))
+                          scope_excluded=admissions['excluded'], scope_uncertain=admissions['review'])
             retained = [d['name'] for d in roles if d['admission'] == 'retained']
             report['retained_variables'] = retained
             resolved = {d['name'].casefold() for d in roles if d['admission'] not in ('review', 'retained')}
             resolved_singles = sum(r['eligibility'] == 'single_write' and r['identity'] in resolved
                                    for r in inventory['candidates'])
             report['unproven_candidates'] = len(inventory['candidates']) - eligible - resolved_singles
-            if decisions is not None and not chosen:
+            if decisions is not None and not final_channels:
                 report['review_reason'] = '本轮未确认可独立计时的生产动作，请查备选清单和源码证据'
             files['step_array_coverage.csv'] = _csv_bytes(
                 ('具体数组', '声明下界', '声明上界', '声明行', '执行步实例', '有引用无独立跳步的槽位'),
@@ -911,7 +943,7 @@ def generate(source, out, pattern=None, *, capture_format='auto', task_name=None
         report['request_sha256'] = request
         report['artifact_sha256'] = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
         if scope_bytes is not None:
-            report['scope_input_sha256'] = hashlib.sha256(scope_bytes).hexdigest()
+            report['scope_input_sha256'] = previous_scope_sha or hashlib.sha256(scope_bytes).hexdigest()
         files['workflow_status.json'] = json.dumps(report, ensure_ascii=False, indent=2).encode('utf-8')
         publish(out, files, force=force, completing=pending is not None)
         return report

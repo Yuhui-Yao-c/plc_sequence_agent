@@ -1,4 +1,4 @@
-"""Project-independent retention of concrete state cursors and verification of exclusions."""
+"""Source evidence for broad discovery and review of production timing channels."""
 import re
 from collections import defaultdict
 
@@ -7,6 +7,17 @@ from plc_trace.capture.station_scope import writer_context
 from plc_trace.analysis.boundary_logic import substitute
 from plc_trace.analysis.fb_transport import required_signals
 from plc_trace.source.source_expressions import source_condition
+
+
+def _service_mode(note):
+    # A positive mode selector can be documented with an explicit 0/1 legend.
+    # Reject ambiguous or inverted descriptions instead of interpreting the signal name.
+    legend = re.search(r'0\s*[:：=是]?\s*(?:屏蔽|禁用|关闭)[\s,，、/]*1\s*[:：=是]?\s*(?:启用|使能|开启)', note)
+    label = note[:legend.start()] if legend else note
+    return bool(re.search(r'手动模式|维护模式|维修模式|调试模式|标定模式|'
+                          r'\b(?:manual|maintenance|service|commissioning|calibration) mode\b', label, re.I)
+                and not re.search(r'非|退出|禁用|关闭|屏蔽|自动|未|'
+                                  r'\b(?:not|exit|disabled|auto|off)\b', label, re.I))
 
 
 def service_isolation(row, declarations):
@@ -23,9 +34,7 @@ def service_isolation(row, declarations):
     for gate in sorted(gates or ()):
         for declaration in declarations(gate):
             note = declaration.get('text', '')
-            if (declaration['path'].casefold() == gate and
-                re.search(r'手动模式|维护模式|维修模式|调试模式|\b(?:manual|maintenance|service|commissioning) mode\b',
-                          note, re.I) and not re.search(r'非|退出|禁用|屏蔽|自动|\b(?:not|exit|disabled|auto)\b', note, re.I)):
+            if declaration['path'].casefold() == gate and _service_mode(note):
                 return {'guard': gate, 'line': declaration['line'], 'declaration': declaration['text']}
     return None
 
@@ -135,7 +144,7 @@ def _job_observations(row, jobs):
 
 def _covered_transaction(row, jobs):
     """Prove a single request/result exchange with at most a final acknowledgement.
-    A further intermediate stage needs its own channel, even inside the same parent job.
+    A further intermediate stage prevents equating the two intervals.
     """
     writes = row['transitions']
     if (not row.get('request_inputs') or row['control_links'] or not all(t.get('guard_complete') for t in writes) or
@@ -239,110 +248,113 @@ def _parent_entries(row):
 
 def _parent_context(row, rows, execution):
     launches = _parent_entries(row)
-    missing, modes = set(), []
+    missing, modes, inspected, only_service = set(), [], False, True
     for link in launches:
         value = link['parent_step']
         parent = rows.get(link['parent'].casefold())
         if parent is None:
             missing.add(f"{link['parent']}={value}")
             continue
-        incoming = [s for s in parent['transitions'] if s['to']==value]
-        if value==parent.get('activation',{}).get('initial',0) or any(s['value']==value for s in parent.get('entry_writes',())):
+        incoming = [s for s in parent['transitions'] if s['to'] == value]
+        if (value == parent.get('activation', {}).get('initial', 0)
+                or any(s['value'] == value for s in parent.get('entry_writes', ()))):
             return None, []
         if not incoming:
             missing.add(f"{link['parent']}={value}")
             continue
         signals = set.intersection(*(required_signals(source_condition(s['guard'])) for s in incoming))
-        for signal,positive in sorted(signals):
-            if positive and execution:
-                for decl in execution.declarations(signal):
-                    if decl['path'].casefold()==signal and decl.get('text'):
-                        modes.append({'channel':parent['name'],'step':value,'guard':signal,'declaration':decl['text'],
-                                      'declaration_line':decl['line'],'incoming':[s['id'] for s in incoming]})
-    reason = '启动依赖父步 ' + '、'.join(sorted(missing)) + '，其写入来源尚未定位' if missing else None
-    return reason, modes
+        gated = False
+        for signal, positive in sorted(signals):
+            if not positive or not execution:
+                continue
+            for decl in execution.declarations(signal):
+                if decl['path'].casefold() != signal or not decl.get('text'):
+                    continue
+                modes.append({'channel': parent['name'], 'step': value, 'guard': signal,
+                              'declaration': decl['text'], 'declaration_line': decl['line'],
+                              'incoming': [s['id'] for s in incoming]})
+                gated |= _service_mode(decl['text']) and all(s.get('guard_complete') for s in incoming)
+        inspected = True
+        only_service &= gated
+    if inspected and not only_service:
+        return None, modes
+    if missing:
+        return '启动依赖父步 ' + '、'.join(sorted(missing)) + '，其写入来源尚未定位', modes
+    if inspected:
+        return '所有已定位启动入口均受有工程声明的手动、维护或标定模式约束', modes
+    return None, modes
 
 
 def protect_channels(inventory, roles, required=(), *, execution=None):
-    """Apply source obligations after review. Only positive production parents can cover a child."""
+    """Check reviewed dispositions. Only explicitly requested channels bypass timing review."""
     rows = {r['identity']: r for r in inventory['candidates']}
+    by_name = {d['name'].casefold(): d for d in roles}
     required = set(required)
-    for decision in roles:
-        key=decision['name'].casefold()
-        row=rows[key]
+    for key, row in rows.items():
+        if key in by_name:
+            continue
+        if row['eligibility'] == 'distributed_write':
+            basis, reason = [], '本实例有分段写入和按值分派，写前步值及生产计时归属待核'
+        elif row['eligibility'] == 'single_write':
+            basis = [row['transitions'][0]['id']]
+            reason = '本实例有单向写步，生产计时归属待核'
+        else:
+            continue
+        decision = {'name': row['name'], 'role': 'uncertain', 'use': 'unresolved',
+                    'admission': 'review', 'basis': basis, 'reason': reason}
+        roles.append(decision)
+        by_name[key] = decision
+
+    for key, decision in by_name.items():
+        row = rows[key]
         if proof := _inactive(row):
-            if key in required:
-                decision.update(admission='retained', activation_conflict=proof,
-                                retention_reason='独立核验要求采集，源码中未定位离开初值的写入')
+            decision.update(admission='optional', exclusion_evidence=proof)
+        elif decision['admission'] == 'captured':
+            if row.get('service_isolation'):
+                decision.update(admission='review', exclusion_evidence=row['service_isolation'],
+                                timing_review_reason='该地址的写步受已声明的设备服务模式约束')
             else:
-                decision.update(admission='optional', exclusion_evidence=proof)
-        elif decision['admission']=='captured':
-            reason, modes = _parent_context(row,rows,execution)
-            if reason:
-                decision.update(admission='retained',retention_reason=reason)
-            if modes:
-                decision['parent_entry_conditions']=modes
-    positive = [rows[d['name'].casefold()] for d in roles if d['admission'] == 'captured']
-    jobs = _job_ports(positive)
+                reason, modes = _parent_context(row, rows, execution)
+                if modes:
+                    decision['parent_entry_conditions'] = modes
+                if reason:
+                    decision.update(admission='review', timing_review_reason=reason)
+
+        if key in required and decision['admission'] != 'captured':
+            decision.update(admission='retained', retention_reason='独立核验输入指定该地址，源码有本实例写步')
+            if proof:
+                decision['activation_conflict'] = proof
+                decision['retention_reason'] += '，但未定位离开初值的入口'
+
+    jobs = _job_ports([rows[key] for key, d in by_name.items() if d['admission'] == 'captured'])
     request_writers = defaultdict(set)
     for row in rows.values():
         for effect in row.get('effects', ()):
             if effect.get('global_target') and str(effect.get('value')).upper() == 'TRUE':
                 request_writers[effect['global_target']].add(row['identity'])
-    obligations = source_obligations(inventory)
-    by_name = {d['name'].casefold(): d for d in roles}
-    for key, row in rows.items():
-        decision = by_name.get(key)
-        if row['eligibility'] == 'distributed_write':
-            reason = '同一实例有多个实际写入值，其他语句按这些值选择操作，写前值未证实'
-            item = {'name': row['name'], 'role': 'uncertain', 'use': 'unresolved', 'basis': [],
-                    'admission': 'retained', 'reason': reason, 'retention_reason': reason}
-            # An externally assigned identifier can dispatch outputs too. Keep an
-            # explicitly documented data mapping visible for review at its exact address.
-            for d in row['declarations']:
-                note = d.get('text', '')
-                if (key not in required and d['path'].casefold() == key and
-                    re.search(r'编号|编码|权限|序号|\b(?:identifier|access level|recipe number)\b', note, re.I) and
-                    not re.search(r'步|步骤|阶段|\b(?:state|step|phase|sequence)\b', note, re.I)):
-                    item.update(admission='review', basis=[d['id']], reason='声明为“' + note + '”，已有赋码和按值分派，尚缺按工步推进的证据')
-                    item.pop('retention_reason')
-                    break
-            roles.append(item)
+
+    for key, decision in by_name.items():
+        if decision['admission'] in ('captured', 'retained') or decision.get('exclusion_evidence'):
             continue
-        if key in required and row['eligibility'] in ('scope_required', 'single_write'):
-            obligations[key] = '独立核验输入确认了本地址，源码有实际写步'
-        if not decision and row['eligibility'] == 'single_write':
-            decision = {'name': row['name'], 'role': 'uncertain', 'use': 'unresolved',
-                        'admission': 'review', 'basis': [row['transitions'][0]['id']],
-                        'reason': '单向写入尚未核实用途，可按本实例写点复核'}
-            roles.append(decision)
-        if not decision or decision['admission'] in ('captured','retained') or decision.get('exclusion_evidence') or key not in obligations:
-            continue
-        # An independent reference takes precedence over every discretionary exclusion.
+        row = rows[key]
         proof = None
-        if key not in required:
-            if decision.get('use') == 'detail':
-                proof = _covered_transaction(row, jobs)
-                observations = _job_observations(row, jobs)
-                if observations:
-                    decision['parent_timing']=observations
-            elif decision.get('use') == 'service':
-                # A statically gated service can be verified against the source-mode
-                # declaration. Unguarded jobs with observable I/O keep their channel.
-                proof = row.get('service_isolation')
-                review = decision.get('service_evidence') or {}
-                another_request = any(request_writers[p] - {key} for p in row.get('request_inputs', ()))
-                if (not proof and execution and (review.get('kind') == 'mode' or
-                        decision['role'] == 'auxiliary_sequence' and not another_request)):
-                    proof = execution.cited_service(row,review)
-            elif decision['role'] == 'non_sequence':
-                if data_reason := _data_use(row):
-                    proof = {'reason': data_reason}
+        if decision.get('use') == 'detail':
+            if observations := _job_observations(row, jobs):
+                decision['parent_timing'] = observations
+            proof = _covered_transaction(row, jobs)
+        elif decision.get('use') == 'service':
+            proof = row.get('service_isolation')
+            claim = decision.get('service_evidence') or {}
+            other = any(request_writers[p] - {key} for p in row.get('request_inputs', ()))
+            if not proof and execution and (claim.get('kind') == 'mode' or
+                                            decision['role'] == 'auxiliary_sequence' and not other):
+                proof = execution.cited_service(row, claim)
+            if not proof:
+                decision.update(admission='review', timing_review_reason='设备服务用途尚未由本实例入口及执行指令证实')
+        elif decision['role'] == 'non_sequence':
+            if reason := _data_use(row):
+                proof = {'reason': reason}
+            else:
+                decision.update(admission='review', timing_review_reason='写步已有来源，仍缺本实例的数据用途证据')
         if proof:
             decision['exclusion_evidence'] = proof
-        else:
-            decision['admission'] = 'retained'
-            decision['retention_reason'] = obligations[key]
-            if decision.get('parent_timing'):
-                parents = sorted({e['channel'] for e in decision['parent_timing']})
-                decision['retention_reason'] += '。' + '、'.join(parents) + '发出请求并读取结果，保留本实例以区分独立完成或复位时间'

@@ -49,6 +49,7 @@ class SysmacRecordingTests(unittest.TestCase):
         path = self.root/'review.json'
         path.write_text(json.dumps({'inventory_sha256':started['inventory_sha256'],'decisions':[
             {'name':'Cursor','role':'component_sequence','basis':['t1'],'reason':'搅拌完成后推进','use':'production',
+             'timing_basis':{'scope':'workstation','operation':'物料搅拌','boundary_write':'t1'},
              'boundaries':[{'write':'t1','via':'signal:Mixed','action':'等待搅拌完成'}]}]}))
         config = configure(source, setup, scope_results=path)
         self.assertTrue(config['configuration_complete'])

@@ -80,8 +80,53 @@ def _supports(candidate, write, via, sites):
     return False
 
 
+def _reviewed_boundaries(candidate, boundaries):
+    name = candidate['name']
+    sites = {s['id']: s for group in ('effects', 'control_links', 'declarations') for s in candidate[group]}
+    writes = {s['id']: s for s in candidate['transitions']}
+    result = {}
+    for item in boundaries:
+        if not isinstance(item, dict) or not all(isinstance(item.get(k), str) and item[k].strip()
+                                                for k in ('write', 'action', 'via')):
+            raise ValueError(f'动作边界须填写 write、action 和 via：{name}')
+        wid, action, via = (item[k].strip() for k in ('write', 'action', 'via'))
+        if wid in result or wid not in writes or not _supports(candidate, writes[wid], via, sites):
+            raise ValueError(f'动作边界写点重复或佐证未落在该实例的对应阶段：{name} {wid} {via}')
+        result[wid] = {'action': action, 'write': wid, 'via': via}
+    return result
+
+
+def _timing_basis(candidate, claim, boundaries):
+    """Anchor the reviewed unit of work in its own transition, keeping caller evidence separate."""
+    name = candidate['name']
+    if not isinstance(claim, dict):
+        raise ValueError(f'生产工步须说明独立计时依据 timing_basis：{name}')
+    unknown = set(claim) - {'scope', 'operation', 'boundary_write', 'parent_relation', 'parent_link'}
+    if unknown:
+        raise ValueError(f'独立计时依据含无法识别的字段：{name} {", ".join(sorted(unknown))}')
+    scope, operation, write = (claim.get(field) for field in ('scope', 'operation', 'boundary_write'))
+    if (scope not in ('workstation', 'production_substep') or not isinstance(operation, str) or not operation.strip()
+            or not isinstance(write, str) or write not in boundaries):
+        raise ValueError(f'独立计时依据须指明工序、计时层级和本实例已核实的动作边界写点：{name}')
+    parent_links = {link['id'] for link in candidate['control_links'] if link['child'].casefold() == candidate['identity']}
+    if boundaries[write]['via'] in parent_links:
+        raise ValueError(f'上层启动或读取该子步仅能解释放行条件，须引用该实例自身的工步动作：{name} {write}')
+    result = {'scope': scope, 'operation': operation.strip(), 'boundary_write': write}
+    if scope == 'production_substep' or parent_links or 'parent_relation' in claim:
+        relation = claim.get('parent_relation')
+        if not isinstance(relation, str) or not relation.strip():
+            raise ValueError(f'须说明本地址相对上层工步独立计时的动作：{name}')
+        result['parent_relation'] = relation.strip()
+    if parent_links or 'parent_link' in claim:
+        parent = claim.get('parent_link')
+        if not isinstance(parent, str) or parent not in parent_links:
+            raise ValueError(f'上层关系须引用本实例作为子步的控制链接：{name}')
+        result['parent_link'] = parent
+    return result
+
+
 def timing_use(candidate, decision, sequence):
-    """Validate the semantic review against this concrete instance, independently of hierarchy."""
+    """Validate cursor evidence and the independent production interval it owns."""
     name = candidate['name']
     use = decision.get('use', 'unresolved')
     boundaries = decision.get('boundaries', [])
@@ -90,24 +135,20 @@ def timing_use(candidate, decision, sequence):
     if use in ('service', 'detail') and not sequence:
         raise ValueError(f'尚无执行步证据，请将采集用途标为待核：{name}')
     if use != 'production':
-        if boundaries:
+        if boundaries or 'timing_basis' in decision:
             raise ValueError(f'只有生产动作可指定计时边界：{name}')
-        return {'use': use, 'admission': 'review' if use == 'unresolved' else 'optional'}
-    if not sequence or not boundaries:
+        if use != 'unresolved' or 'legacy_boundaries' not in decision:
+            return {'use': use, 'admission': 'review' if use == 'unresolved' else 'optional'}
+        boundaries = decision['legacy_boundaries']
+    if not sequence or not isinstance(boundaries, list) or not boundaries:
         raise ValueError(f'默认采集须有真实执行步和具体生产动作边界：{name}')
-    sites = {s['id']: s for group in ('effects', 'control_links', 'declarations') for s in candidate[group]}
-    writes = {s['id']: s for s in candidate['transitions']}
-    result, seen = [], set()
-    for item in boundaries:
-        if not isinstance(item, dict) or not all(isinstance(item.get(k), str) and item[k].strip()
-                                                for k in ('write', 'action', 'via')):
-            raise ValueError(f'动作边界须填写 write、action 和 via：{name}')
-        wid, action, via = (item[k].strip() for k in ('write', 'action', 'via'))
-        if wid in seen or wid not in writes or not _supports(candidate, writes[wid], via, sites):
-            raise ValueError(f'动作边界写点重复或佐证未落在该实例的对应阶段：{name} {wid} {via}')
-        seen.add(wid)
-        result.append({'action': action, 'write': wid, 'via': via})
-    return {'use': use, 'admission': 'captured', 'boundaries': result}
+    evidence = _reviewed_boundaries(candidate, boundaries)
+    if 'timing_basis' not in decision:
+        # Old reviews proved a state change but did not adjudicate the timing unit.
+        return {'use': 'unresolved', 'admission': 'review', 'legacy_boundaries': list(evidence.values()),
+                'timing_review_reason': '已有本实例动作写点，尚缺生产工步独立计时依据'}
+    basis = _timing_basis(candidate, decision['timing_basis'], evidence)
+    return {'use': 'production', 'admission': 'captured', 'boundaries': list(evidence.values()), 'timing_basis': basis}
 
 
 def capture_lists(inventory, decisions, slots):
@@ -130,10 +171,11 @@ def capture_lists(inventory, decisions, slots):
                  if row['transitions'] else row['dispatch_writes'][0]['write'])
             proof = decision.get('exclusion_evidence') or {}
             inactive = proof.get('kind') == 'inactive_from_initial'
-            reason = proof.get('reason') or decision.get('reason', '待核对本实例的生产动作边界')
+            reason = proof.get('reason') or decision.get('timing_review_reason') or decision.get('reason', '待核对本实例的生产动作边界')
             if 'purpose' in proof and 'operation' in proof:
                 reason += f" 用途见 XML 行 {proof['purpose']['line']}，执行指令见行 {proof['operation']['line']}。"
-            optional.append((row['name'], '未定位可执行入口' if inactive else USES[decision.get('use', 'unresolved')],
+            use = 'unresolved' if admission == 'review' else decision.get('use', 'unresolved')
+            optional.append((row['name'], '未定位可执行入口' if inactive else USES[use],
                              row['type'] or '', t['scope'], t['source_line'], reason, ''))
     return primary, optional
 
@@ -162,12 +204,12 @@ def capture_context(primary, decisions):
                     evidence = f"{decision['retention_reason']}。分派读取位于 {read['scope']}，XML {read['source_line']}"
                     if read.get('st_line'):
                         evidence += f"，段内 ST {read['st_line']}"
-                    yield (row['name'], '待核，先采', site['scope'], site.get('operating_guard', ''),
+                    yield (row['name'], '独立核验指定', site['scope'], site.get('operating_guard', ''),
                            '', pair['value'], site.get('guard', ''), site.get('guard_complete', False),
                            site['source_line'], site.get('st_line', ''), '', 'distributed_write', evidence)
                 continue
             site = row['transitions'][0]
-            yield (row['name'], '待核，先采', site['scope'], site.get('operating_guard', ''),
+            yield (row['name'], '独立核验指定', site['scope'], site.get('operating_guard', ''),
                    site['from'], site['to'], site.get('guard', ''), site.get('guard_complete', False),
                    site['source_line'], site.get('st_line', ''), site['id'], 'retained', decision['retention_reason'])
         if decision['admission'] != 'captured':
@@ -178,6 +220,13 @@ def capture_context(primary, decisions):
         for boundary in decision['boundaries']:
             site = by_id[boundary['write']]
             source = _support_text(boundary['via'], site, references)
+            basis = decision['timing_basis']
+            if basis['boundary_write'] == site['id']:
+                source += '。独立计时工步：' + basis['operation']
+                if 'parent_relation' in basis:
+                    source += '。' + basis['parent_relation']
+                if 'parent_link' in basis:
+                    source += '。' + _support_text(basis['parent_link'], site, references)
             for entry in decision.get('parent_entry_conditions', ()):
                 source += (f"。父步 {entry['channel']}={entry['step']} 的可见入口含 {entry['guard']}"
                            f"（{entry['declaration']}，XML 行 {entry['declaration_line']}）")

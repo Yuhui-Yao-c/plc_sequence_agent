@@ -98,11 +98,10 @@ def read_reference(path, candidates):
                         x = _states(row[a]) if a < len(row) else {}
                         y = _states(row[b]) if b < len(row) else {}
                         varied = {k for k in x.keys() & y if x[k].isdisjoint(y[k])}
-                        for k in varied:
-                            add(k)
-                        if not varied and (x or y):
-                            changed = {k for k in x.keys() | y.keys() if x.get(k) != y.get(k)}
-                            loose.append((number, set(x) | set(y), changed))
+                        if len(varied) == 1:
+                            add(next(iter(varied)))
+                        elif x or y:
+                            loose.append((number, x, y, varied))
                         elif not x and not y:
                             cells = [str(row[j] or '') for j in (a,b) if j < len(row)]
                             if any(re.search(r'[=<>]', cell) for cell in cells):
@@ -124,19 +123,46 @@ def read_reference(path, candidates):
             if len(rows) and all(len(row)==1 for row in rows):
                 for row in rows:
                     add(row[0])
-    related = set().union(*(ops for _, ops, _ in loose)) if loose else set()
-    gates = {r['identity']: {name for guard in {t.get('operating_guard') for t in r['transitions']}
-                             if guard for name in _states(guard)}
-             for r in candidates if r['identity'] in related}
-    for number, operands, changed in loose:
-        supported = operands & (state | names.keys())
-        unknown = (changed - supported) if supported else operands
+    related = {key for _, x, y, _ in loose for side in (x, y) for key in side}
+    gates = {}
+    for candidate in candidates:
+        key = candidate['identity']
+        if key not in related:
+            continue
+        for write in candidate['transitions']:
+            site = key, write['from']
+            controls = set(_states(write.get('operating_guard')))
+            gates[site] = controls if site not in gates else gates[site] & controls
+    established = state | names.keys()
+    for number, x, y, varied in loose:
+        operands = x.keys() | y.keys()
+        supported = (varied or operands) & established
+        qualifiers = set()
         for key in supported:
-            unknown = unknown - gates.get(key, set())
+            steps = x.get(key, set()) | y.get(key, set())
+            common_gates = set.intersection(*(gates.get((key, step), set()) for step in steps))
+            qualifiers.update(common_gates - {key})
+        supported -= qualifiers
+        common = supported & x.keys() & y.keys()
+        if len(common) == 1:
+            # A held step can span a wait. An additional end predicate (even a
+            # child cursor with its own CASE) is evidence of release, not a second timer.
+            add(next(iter(common)))
+            continue
+        if common or varied:
+            unresolved.append({'row': number, 'operands': sorted(varied or common)})
+            continue
+        # A handoff may have different subjects at each end. Resolve each side
+        # independently; two plausible subjects on the same side need review.
+        unknown = set()
+        for side in (x, y):
+            choices = side.keys() & supported
+            if len(choices) == 1:
+                add(next(iter(choices)))
+            else:
+                unknown.update(choices or (side.keys() - qualifiers if supported else side.keys()))
         if unknown:
-            unresolved.append({'row':number, 'operands':sorted(unknown)})
-        for key in supported:
-            add(key)
+            unresolved.append({'row': number, 'operands': sorted(unknown)})
     if not names and not unresolved:
         raise ValueError(f'未读到步序地址或起止条件：{path.name}')
     return names, types, unresolved

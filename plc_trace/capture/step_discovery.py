@@ -55,20 +55,22 @@ def _sequence_witness(sites):
     return None
 
 
-def isolate_counted_loops(code, *, writer_locations=False, allow_early_exit=True):
+def isolate_counted_loops(code, *, writer_locations=False, allow_early_exit=True, trigger_type=None, omissions=None):
     """Omit balanced counted loops with only local control and assignments. Preserve offsets.
 
     The caller ignores transitions overlapping any storage the omitted code may write.
     Conditions depending on a loop result are still conditions, not evaluated facts.
     """
     tokens = list(_st_tokens_with_spans(code))
-    spans, touched = [], set()
-    depth = 0
+    spans, touched, local = [], set(), set()
+    depth, skip_until = 0, -1
     for i, (token, (start, end)) in enumerate(tokens):
+        if i < skip_until:
+            continue
         upper = token.upper()
         if upper == 'FOR':
             if depth == 0:
-                begin = start
+                begin, local = start, set()
             depth += 1
         if depth and upper in {'RETURN','JMP','GOTO'}:
             return code, set()
@@ -78,9 +80,25 @@ def isolate_counted_loops(code, *, writer_locations=False, allow_early_exit=True
             return code, set()
         if depth and not writer_locations and (upper in {'REF', 'REF='} or '^' in token):
             return code, set()
-        if depth and not writer_locations and token == '(' and i and re.fullmatch(IDENT, tokens[i-1][0]) and tokens[i-1][0].upper() not in {
+        previous = tokens[i-1][0] if i else ''
+        if depth and not writer_locations and token == '(' and (re.fullmatch(IDENT, previous) or previous.endswith(']')) and previous.upper() not in {
                 'IF', 'ELSIF', 'NOT', 'AND', 'OR', 'XOR', 'WHILE', 'DO', 'THEN'}:
-            return code, set()
+            # A standard edge detector with one input pin writes its own FB
+            # memory. Unknown calls, output mappings and computed arguments
+            # cannot be omitted as local writes.
+            loop = re.match(r'FOR\s+([^\W\d]\w*)\s*:=\s*(-?\d+)\s+TO\s+(-?\d+)\s+DO\b',
+                            code[begin:], re.I)
+            instance = tokens[i-1][0]
+            if (not trigger_type or depth != 1 or not loop or i < 2
+                    or tokens[i-2][0].upper() not in ('DO', 'THEN', 'ELSE', ';')
+                    or i + 5 >= len(tokens)
+                    or [item[0].upper() for item in tokens[i+1:i+3]] != ['CLK', ':=']
+                    or not re.fullmatch(IDENT, tokens[i+3][0])
+                    or [item[0] for item in tokens[i+4:i+6]] != [')', ';']
+                    or not trigger_type(instance, *loop.groups())):
+                return code, set()
+            local.add(_storage_region(instance))
+            skip_until = i + 5
         if depth and token == ':=' and not writer_locations:
             # The ST tokenizer separates commas in multidimensional subscripts.
             # Validate the whole lvalue, including its containing structure.
@@ -90,17 +108,20 @@ def isolate_counted_loops(code, *, writer_locations=False, allow_early_exit=True
             lhs = symbol(code[tokens[first][1][0]:start])
             if not re.fullmatch(IDENT, lhs):
                 return code, set()
-            touched.add(_storage_region(lhs))
+            local.add(_storage_region(lhs))
         if upper == 'END_FOR':
             depth -= 1
             if depth < 0:
                 return code, set()
             if not depth:
-                spans.append((begin, end))
+                spans.append((begin, end, local))
+                touched.update(local)
     if depth or not spans:
         return code, set()
     pieces, last = [], 0
-    for start, end in spans:
+    if omissions is not None:
+        omissions.extend((start, writes) for start, _, writes in spans)
+    for start, end, _ in spans:
         pieces.extend((code[last:start], re.sub(r'[^\r\n]', ' ', code[start:end])))
         last = end
     return ''.join(pieces) + code[last:], touched
@@ -478,7 +499,14 @@ def scope_index(inventory):
                     if site.get('binding'):
                         brief['call'] = [{k: x[k] for k in ('scope', 'instance', 'source_line')} for x in site['binding']]
                     examples.append(brief)
+        # A parent starting or reading this cursor matters even if its site is
+        # outside the brief host excerpts above. IDs resolve in the full ledger.
+        parents = defaultdict(lambda: defaultdict(list))
+        for link in row['control_links']:
+            if link['child'].casefold() == row['identity']:
+                parents[link['parent']][link['kind']].append(link['id'])
         yield {'name': row['name'], 'family': row['family'], 'eligibility': row['eligibility'], 'declarations': row['declarations'],
+               **({'parent_links': dict(parents)} if parents else {}),
                'type_issue': row['type_issue'], 'sequence_witness': row['sequence_witness'],
                'scheduled_writers': row.get('scheduled_writers', {}), 'evidence': examples,
                **({'activation': row['activation']} if 'activation' in row else {})}

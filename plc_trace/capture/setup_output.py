@@ -72,8 +72,7 @@ def verify_files(out, status):
         raise ValueError('已有采集配置的工作流状态无效，请核对后显式重建')
     if status.get('selection_mode') == 'automatic':
         required.update(('step_variable_discovery.json', 'scope_candidates.jsonl'))
-        if status.get('scope_policy') == 'production_timing':
-            required.update(('optional_variables.csv', 'capture_context.csv'))
+        required.update(('optional_variables.csv', 'capture_context.csv'))
         if state != 'scope_review_pending' and any(status.get(k) for k in
                 ('scope_candidates', 'single_write_candidates', 'distributed_write_candidates')):
             required.add('scope_results.json')
@@ -91,6 +90,23 @@ def verify_files(out, status):
         if (Path(name).name != name or path.is_symlink() or not path.is_file()
                 or fingerprint(path) != expected):
             raise ValueError(f'已有采集配置文件缺失或已修改：{name}。请核对后显式重建')
+
+
+def verify_scope_upgrade(previous, roles, families):
+    """A legacy timing claim can be reviewed in place without changing approved work."""
+    by_name = {r['name'].casefold(): r for r in roles}
+    fields = ('role', 'use', 'reason', 'basis', 'owner_scope', 'dedicated_step_array', 'interface_peer',
+              'service_evidence', 'boundaries', 'timing_basis')
+    for row in previous['decisions']:
+        key = row['name'].casefold()
+        if row.get('legacy_boundaries'):
+            continue
+        updated = by_name.get(key, {})
+        if (any(row.get(field) != updated.get(field) for field in fields)
+                or row['admission'] == 'captured' and updated.get('admission') != 'captured'):
+            raise ValueError(f'补判只能更新缺少独立计时依据的历史判断：{row["name"]}')
+    if any(family not in families for family in previous.get('station_families', ())):
+        raise ValueError('补判须保留已核实的工位变量族')
 
 
 def publish(out, files, *, force, completing):
@@ -111,9 +127,10 @@ def publish(out, files, *, force, completing):
             try:
                 previous = read_status(out)
                 old_files = previous.get('artifact_sha256', {})
-                preview = Path(previous.get('preview_configuration') or '')
-                if preview.parent == out and preview.name in old_files:
-                    owned.add(preview.name)
+                for key in ('preview_configuration', 'configuration'):
+                    configuration = Path(previous.get(key) or '')
+                    if configuration.parent == out and configuration.name in old_files:
+                        owned.add(configuration.name)
                 for name in (old_files.keys() & owned) - files.keys():
                     old = out / name
                     if old.is_symlink() or not old.is_file() or fingerprint(old) != old_files[name]:

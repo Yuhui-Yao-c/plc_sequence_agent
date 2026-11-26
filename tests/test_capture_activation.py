@@ -63,11 +63,16 @@ CASE Indexer OF 0: ; 7: IF Ready THEN Action:=TRUE; Indexer:=9; END_IF;
             ('retained', '<Vars accessSpecifier="private" retain="true">', '', '', True),
             ('shared', '<Vars>', '', '', True),
         ]
+        def review(decisions, xml):
+            for row in decisions['decisions']:
+                row.update(role='component_sequence', use='production',
+                           boundaries=[{'write': 't1', 'action': '等待夹紧到位', 'via': 'signal:Ready'}],
+                           timing_basis={'scope': 'workstation', 'operation': '夹紧工步', 'boundary_write': 't1'})
         for label, group, initial, extra, keep in scenarios:
             with self.subTest(label=label):
                 xml = project('<Program name="Cell">' + group + variable('Indexer', 'INT', initial) +
                               '</Vars>' + section(core) + extra + '</Program>')
-                preview, final, roles = self.run_project(xml)
+                preview, final, roles = self.run_project(xml, review)
                 self.assertEqual(preview['preview_configured_variables'], 1)
                 self.assertEqual(final['configured_variables'], int(keep))
                 proof = roles['Cell.Indexer'].get('exclusion_evidence', {})
@@ -102,31 +107,31 @@ CASE Cursor OF 0: ;
         caller = '<Program name="Cell"><Vars>'+variable('Left','Worker')+variable('Right','Worker')+'</Vars>'
         cases = [
             ('mode required', run, '', 'optional'),
-            ('automatic bypass', run.replace('Selected AND Button','(Selected AND Button) OR Work'), '', 'retained'),
-            ('other launch', run+'\nIF Work THEN Cursor:=6; END_IF;', '', 'retained'),
-            ('stop needs both', run.replace('NOT Selected OR Fault','NOT Selected AND Fault'), '', 'retained'),
-            ('overridden timer output', run.replace('Pulse(CLK', 'Delay.Q:=Work;\nPulse(CLK'), '', 'retained'),
+            ('automatic bypass', run.replace('Selected AND Button','(Selected AND Button) OR Work'), '', 'review'),
+            ('other launch', run+'\nIF Work THEN Cursor:=6; END_IF;', '', 'review'),
+            ('stop needs both', run.replace('NOT Selected OR Fault','NOT Selected AND Fault'), '', 'review'),
+            ('overridden timer output', run.replace('Pulse(CLK', 'Delay.Q:=Work;\nPulse(CLK'), '', 'review'),
             ('timer not evaluated every scan', run.replace('Delay(IN:=','IF Enabled THEN Delay(IN:=')
-             .replace('PT:=T#1S);','PT:=T#1S); END_IF;'), '', 'retained'),
-            ('unknown clock consumer', run.replace('Pulse(CLK', 'Other(IN:=Delay.Q);\nPulse(CLK'), '', 'retained'),
-            ('separate latch writer', run+'\nIF Work THEN Running:=TRUE; END_IF;', '', 'retained'),
-            ('latch may be written by reference', run+'\nOther(Output=>Running);', '', 'retained'),
-            ('escaped instance', run, 'PassByRef(Item:=Left);', 'retained'),
-            ('external latch write', run, 'Left.Running:=Work;', 'retained'),
-            ('external timer write', run, 'Left.Delay.Q:=Work;', 'retained'),
-            ('missing enabling latch', run.replace('IF Running THEN JawClose','IF Ready THEN JawClose'), '', 'retained'),
+             .replace('PT:=T#1S);','PT:=T#1S); END_IF;'), '', 'review'),
+            ('unknown clock consumer', run.replace('Pulse(CLK', 'Other(IN:=Delay.Q);\nPulse(CLK'), '', 'review'),
+            ('separate latch writer', run+'\nIF Work THEN Running:=TRUE; END_IF;', '', 'review'),
+            ('latch may be written by reference', run+'\nOther(Output=>Running);', '', 'review'),
+            ('escaped instance', run, 'PassByRef(Item:=Left);', 'review'),
+            ('external latch write', run, 'Left.Running:=Work;', 'review'),
+            ('external timer write', run, 'Left.Delay.Q:=Work;', 'review'),
+            ('missing enabling latch', run.replace('IF Running THEN JawClose','IF Ready THEN JawClose'), '', 'review'),
         ]
         for label, code, extra, expected in cases:
             with self.subTest(label=label):
                 xml = project(fb+section(code)+'</FunctionBlock>', caller+section('Left(); Right(); '+extra)+'</Program>')
                 _, final, roles = self.run_project(xml, review)
                 self.assertEqual(roles['Cell.Left.Cursor']['admission'], expected)
-                self.assertEqual(roles['Cell.Right.Cursor']['admission'], 'retained')
-                self.assertEqual(final['static_variables'], 1 if expected == 'optional' else 2)
+                self.assertEqual(roles['Cell.Right.Cursor']['admission'], 'review')
+                self.assertEqual(final['static_variables'], 0)
         retained = caller.replace('<Vars>', '<RetainVars>').replace('</Vars>', '</RetainVars>')
         _, _, roles = self.run_project(project(fb+section(run)+'</FunctionBlock>',
                                               retained+section('Left(); Right();')+'</Program>'), review)
-        self.assertEqual(roles['Cell.Left.Cursor']['admission'], 'retained')
+        self.assertEqual(roles['Cell.Left.Cursor']['admission'], 'review')
 
     def test_equipment_review_binds_authored_call_comment_and_executed_instruction(self):
         body = """CASE Position OF 0: IF Ready THEN Position:=3; END_IF;
@@ -147,9 +152,9 @@ CASE Cursor OF 0: ;
         right = "Message:='更新保养计数';\nRight();"
         for label, calls, admit in [
                 ('distinct callers', section(left)+section(right), 'optional'),
-                ('ambiguous call site', section(left+'\n'+right), 'retained'),
+                ('ambiguous call site', section(left+'\n'+right), 'review'),
                 ('production request reaches instance', section(left.replace('Left();','IF Work THEN Left(); END_IF;'))+
-                 section(right), 'retained')]:
+                 section(right), 'review')]:
             with self.subTest(label=label):
                 # Give separate sections their actual source identities, as in a controller export.
                 sections = calls.replace('<BodyContent>', '<BodyContent name="Diagnostics">', 1)
@@ -157,13 +162,13 @@ CASE Cursor OF 0: ;
                 xml = project(block, host+sections+'</Program>')
                 _, _, roles = self.run_project(xml, review)
                 self.assertEqual(roles['Cell.Left.Position']['admission'], admit)
-                self.assertEqual(roles['Cell.Right.Position']['admission'], 'retained')
+                self.assertEqual(roles['Cell.Right.Position']['admission'], 'review')
         # The same diagnostic instruction also occurs unconditionally in this POU.
         # A citation to that copy cannot justify removing the guarded production cursor.
         mixed = block.replace('CASE Position OF', 'SendFrame:=TRUE;\nCASE Position OF')
         scoped = host+section(left).replace('<BodyContent>', '<BodyContent name="Diagnostics">')+section(right)+'</Program>'
         _, _, roles = self.run_project(project(mixed, scoped), review)
-        self.assertEqual(roles['Cell.Left.Position']['admission'], 'retained')
+        self.assertEqual(roles['Cell.Left.Position']['admission'], 'review')
 
     def test_parent_context_requires_the_exact_child_write_and_retains_unknown_parent_sources(self):
         from plc_trace.capture.coverage import _parent_context
@@ -187,6 +192,36 @@ CASE Cursor OF 0: ;
         self.assertEqual(_parent_context({**row, 'control_links':[{**link, 'offset':53}]},
                                          {'parent':parent}, EngineeringDeclarations()), (None, []))
 
+    def test_parent_service_gate_must_cover_every_confirmed_route(self):
+        from plc_trace.capture.coverage import _parent_context, _service_mode
+
+        self.assertTrue(_service_mode('整机标定模式 0是屏蔽 1是启用'))
+        self.assertFalse(_service_mode('标定模式 0启用 1禁用'))
+        self.assertFalse(_service_mode('not in maintenance mode'))
+
+        def writer(offset, step, guard):
+            link = {'kind': 'starts_child', 'child': 'Cell.Mark', 'parent': 'Root', 'parent_step': step,
+                    'child_value': 7, 'guard': guard, 'source_line': 10, 'offset': offset}
+            event = {'section_line': 10, 'offset': offset, 'guard': guard, 'value': 7}
+            return link, event
+
+        links, starts = zip(writer(3, 15, 'Root=15'), writer(7, 32, 'Root=32'))
+        row = {'identity': 'cell.mark', 'control_links': links, 'activation': {'entries': starts, 'open_lines': []}}
+        parent = {'name': 'Root', 'transitions': [
+            {'id': 't1', 'to': 15, 'guard': 'Root=3 AND Switch', 'guard_complete': True},
+            {'id': 't2', 'to': 32, 'guard': 'Root=6 AND Switch', 'guard_complete': True}]}
+
+        class Declarations:
+            def declarations(self, symbol):
+                return [{'path': 'Switch', 'text': '标定模式', 'line': 4}] if symbol == 'switch' else []
+
+        check = lambda: _parent_context(row, {'root': parent}, Declarations())
+        self.assertIn('标定', check()[0])
+        parent['transitions'][1].update(guard='Root=6 AND (Switch OR Demand)')
+        self.assertIsNone(check()[0])
+        parent['transitions'].pop(0)
+        self.assertIsNone(check()[0])
+
     def test_explicit_idle_slot_is_recovered_only_in_the_witnessed_array_and_declared_bounds(self):
         body = 'CASE Used[1] OF 0: Used[1]:=4; 4: Used[1]:=0; END_CASE;'
         declared = lambda n: ('<variable name="'+n+'"><type><array><dimension lower="-1" upper="3"/>'
@@ -204,4 +239,4 @@ CASE Cursor OF 0: ;
                 recovered, = final['coverage']['reference_recovered']
                 self.assertEqual((recovered['name'], recovered['type']), ('Used[-1]', 'INT'))
                 self.assertIn('[-1, 3]', recovered['evidence'])
-                self.assertEqual(final['configured_variables'], 2)
+                self.assertEqual(final['configured_variables'], 1)
